@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -72,6 +73,102 @@ def create_app(services: Services | None = None) -> FastAPI:
         app.add_middleware(CORSMiddleware, allow_origins=svc.settings.cors_origins, allow_methods=["*"],
                            allow_headers=["*"])
     app.state.services = svc
+
+    # ------------------------------------------------------------------ audit trail (every change)
+    from ..security import audit as aud
+    alog = logging.getLogger("vmigrate.audit")
+
+    def _actor(auth: str | None, cookie_token: str | None) -> dict[str, Any] | None:
+        tok = auth.split(" ", 1)[1] if auth and auth.lower().startswith("bearer ") else cookie_token
+        return repo.user_for_token(token_hash(tok)) if tok else None
+
+    def _lookup_name(otype: str, oid: str) -> str | None:
+        """Name of an existing record, so updates/starts/deletes read well in the trail."""
+        try:
+            if otype == "endpoint":
+                r = repo.get_endpoint(oid)
+            elif otype in ("migration", "replica"):
+                r = repo.get_migration(oid)
+            elif otype == "execution":
+                x = repo.get_execution(oid)
+                r = repo.get_migration(x["migration_id"]) if x else None
+            elif otype == "pool":
+                r = repo.get_pool(oid)
+            elif otype == "schedule":
+                sc = repo.get_schedule(oid)
+                r = repo.get_migration(sc["migration_id"]) if sc else None
+            else:
+                return None
+            return (r or {}).get("name")
+        except Exception:  # noqa: BLE001 - best effort; deleted records have no name any more
+            return None
+
+    @app.middleware("http")
+    async def audit_mw(request: Request, call_next: Any) -> Any:
+        rid = uuid.uuid4().hex[:16]
+        method = request.method.upper()
+        watch = method in ("POST", "PUT", "PATCH", "DELETE")
+        body_raw = await request.body() if watch else b""
+        pre_name = None
+        if method == "DELETE":                     # the record is gone afterwards: read its name first
+            segs = [x for x in request.url.path.split("/") if x]
+            if len(segs) >= 2 and segs[0] in aud.COLLECTIONS:
+                pre_name = await run_in_threadpool(_lookup_name, aud.COLLECTIONS[segs[0]], segs[1])
+        response = await call_next(request)
+        response.headers["X-Request-Id"] = rid
+        route = getattr(request.scope.get("route"), "path", None)
+        if not route or route.startswith("/ui") or (not watch and route not in aud.AUDITED_GETS):
+            return response
+        resp_body = b""
+        if watch and response.status_code == 201 and "json" in response.headers.get("content-type", ""):
+            chunks = [c async for c in response.body_iterator]    # created objects: keep id + name
+            resp_body = b"".join(chunks)
+            from starlette.responses import Response as _R
+            response = _R(resp_body, status_code=201, headers=dict(response.headers), media_type="application/json")
+        try:
+            req = json.loads(body_raw) if body_raw else None
+        except ValueError:
+            req = None
+        try:
+            created = json.loads(resp_body) if resp_body else {}
+        except ValueError:
+            created = {}
+
+        def write() -> None:
+            u = _actor(request.headers.get("authorization"), request.query_params.get("access_token"))
+            action, otype = aud.describe(method, route)
+            params = dict(request.path_params)
+            oid = (list(params.values())[-1] if params else None) or (created.get("id") if isinstance(created, dict) else None)
+            name = None
+            for src in (req, created):
+                if isinstance(src, dict):
+                    name = name or src.get("name") or src.get("username") or src.get("deploy_name")
+            if not name and oid:
+                name = pre_name or _lookup_name(otype, str(oid))
+            actor = u["username"] if u else (req.get("username") if action == "auth.login" and isinstance(req, dict)
+                                             else "anonymous")
+            details: dict[str, Any] = {}
+            if params:
+                details["path_params"] = params
+            if isinstance(req, (dict, list)):
+                details["request"] = aud.redact(req)
+            if request.query_params:
+                details["query"] = aud.redact({k: v for k, v in request.query_params.items()})
+            repo.add_audit({
+                "actor": str(actor or "anonymous")[:128], "actor_id": u["id"] if u else None,
+                "actor_role": u["role"] if u else None,
+                "ip": request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+                      or (request.client.host if request.client else None),
+                "user_agent": (request.headers.get("user-agent") or "")[:256], "action": action,
+                "object_type": otype, "object_id": str(oid)[:128] if oid else None,
+                "object_name": str(name)[:256] if name else None, "project": u["project"] if u else None,
+                "method": method, "path": request.url.path[:512], "status": response.status_code,
+                "outcome": aud.outcome(response.status_code), "request_id": rid, "details": aud.clip(details)})
+        try:
+            await run_in_threadpool(write)
+        except Exception:  # noqa: BLE001 - never fail the user's request because auditing failed; log it loudly
+            alog.exception("could not write audit record for %s %s", method, request.url.path)
+        return response
 
     # ------------------------------------------------------------------ errors
     @app.exception_handler(PermissionError)
@@ -588,6 +685,140 @@ def create_app(services: Services | None = None) -> FastAPI:
                  p: Principal = Depends(viewer)) -> list[dict[str, Any]]:
         exec_scoped(xid, p)
         return repo.get_logs(xid, task_id, after, limit)
+
+    # ------------------------------------------------------------------ investigation: logs, events, bundle
+    def visible_migrations(p: Principal) -> list[dict[str, Any]] | None:
+        return None if p.role == "admin" else repo.list_migrations(p.project)
+
+    @app.get("/logs", tags=["logs"])
+    def search_logs(q: str | None = None, level: str | None = Query(None, description="comma list: ERROR,WARNING"),
+                    migration_id: str | None = None, execution_id: str | None = None,
+                    since: float | None = None, until: float | None = None, before_id: int | None = None,
+                    limit: int = Query(300, le=5000), p: Principal = Depends(viewer)) -> list[dict[str, Any]]:
+        """Run logs across executions, newest first, with the run and migration they belong to."""
+        if execution_id:
+            ids: list[str] | None = [exec_scoped(execution_id, p)["id"]]
+        elif migration_id:
+            scoped(repo.get_migration(migration_id), p, "migration")
+            ids = [x["id"] for x in repo.list_executions(migration_id)]
+        else:
+            vis = visible_migrations(p)
+            ids = None if vis is None else [x["id"] for mg in vis for x in repo.list_executions(mg["id"])]
+        rows = repo.search_logs(execution_ids=ids, levels=[x for x in (level or "").split(",") if x], q=q,
+                                since=since, until=until, before_id=before_id, limit=limit)
+        ex_cache: dict[str, Any] = {}
+        mig_cache: dict[str, Any] = {}
+        for r in rows:
+            x = ex_cache.get(r["execution_id"]) or ex_cache.setdefault(r["execution_id"], repo.get_execution(r["execution_id"]))
+            if x:
+                mg = mig_cache.get(x["migration_id"]) or mig_cache.setdefault(x["migration_id"], repo.get_migration(x["migration_id"]))
+                r["kind"], r["migration_id"] = x["kind"], x["migration_id"]
+                r["migration_name"] = mg["name"] if mg else None
+        return rows
+
+    @app.get("/events/history", tags=["logs"])
+    def event_history(type: str | None = Query(None, description="comma list of type prefixes, e.g. execution.,worker."),
+                      migration_id: str | None = None, since: float | None = None, until: float | None = None,
+                      before_id: int | None = None, limit: int = Query(300, le=5000),
+                      p: Principal = Depends(viewer)) -> list[dict[str, Any]]:
+        """Platform events (lifecycle, worker, schedule, requeue ...) newest first; non-streaming."""
+        if migration_id:
+            scoped(repo.get_migration(migration_id), p, "migration")
+            mids: list[str] | None = [migration_id]
+        else:
+            vis = visible_migrations(p)
+            mids = None if vis is None else [mg["id"] for mg in vis]
+        return repo.search_events(migration_ids=mids, types=[x for x in (type or "").split(",") if x], since=since,
+                                  until=until, before_id=before_id, limit=limit,
+                                  include_global=p.role == "admin" or not migration_id)
+
+    @app.get("/executions/{xid}/diagnostics", tags=["logs"])
+    def diagnostics(xid: str, p: Principal = Depends(viewer)) -> Any:
+        """One zip with everything needed to investigate a run. Secrets are never included."""
+        import io
+        import platform as _pf
+        import zipfile
+
+        from .. import __version__
+        from ..security.audit import redact
+        x = exec_scoped(xid, p)
+        mg = repo.get_migration(x["migration_id"]) or {}
+
+        def ep(eid: str | None) -> dict[str, Any] | None:
+            e = repo.get_endpoint(eid) if eid else None
+            if not e:
+                return None
+            return {k: e.get(k) for k in ("id", "name", "type", "region", "required_tags")} | {
+                "config": redact(e.get("config") or {}), "has_credentials": bool(e.get("secret_id"))}
+        logs = repo.get_logs(xid, None, 0, 1_000_000)
+        commit = None
+        try:
+            import subprocess as _sp
+            commit = _sp.run(["git", "-C", os.path.dirname(__file__), "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5).stdout.strip() or None
+        except Exception:  # noqa: BLE001
+            pass
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            def put(name: str, obj: Any) -> None:
+                z.writestr(name, obj if isinstance(obj, str) else json.dumps(obj, indent=2, default=str))
+            put("README.txt", f"Margarita diagnostics for execution {xid} ({x['kind']}, {x['status']}).\n"
+                              "Secrets are not included: endpoint configs are redacted, credentials omitted.\n")
+            put("execution.json", x)
+            put("tasks.json", repo.list_tasks(xid))
+            put("logs.txt", "\n".join(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(r['ts']))}Z {r['level']:<7} "
+                f"[{r.get('task_id') or '-'}] {r.get('logger') or ''} {r['message']}" for r in logs))
+            put("events.json", repo.get_events(after=0, execution_id=xid))
+            put("migration.json", {k: mg.get(k) for k in ("id", "name", "mode", "vm", "options", "created_at",
+                                                          "updated_at", "project")})
+            put("state.json", redact(mg.get("state") or {}))
+            put("endpoints.json", {"source": ep(mg.get("source_endpoint_id")), "target": ep(mg.get("target_endpoint_id"))})
+            put("workers.json", [{k: w.get(k) for k in ("id", "hostname", "region", "capabilities", "heartbeat_at",
+                                                         "current_execution")} for w in repo.list_workers()])
+            put("audit.json", repo.list_audit(object_id=x["migration_id"], limit=500)
+                + repo.list_audit(object_id=xid, limit=500))
+            put("versions.json", {"vmigrate": __version__, "commit": commit, "python": _pf.python_version(),
+                                  "platform": _pf.platform(), "generated_at": time.time(),
+                                  "generated_by": p.username})
+            if mg.get("mode") == "migration" and mg.get("state"):
+                try:
+                    put("report.md", render_markdown(MigrationState.from_dict(mg["state"])))
+                except Exception as e:  # noqa: BLE001
+                    put("report-error.txt", str(e))
+        name = f"margarita-diagnostics-{(mg.get('name') or 'run')}-{xid[:8]}.zip"
+        return StreamingResponse(iter([buf.getvalue()]), media_type="application/zip",
+                                 headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+    # ------------------------------------------------------------------ audit API (admin, read-only)
+    @app.get("/audit", tags=["audit"])
+    def audit_list(actor: str | None = None, action: str | None = None, object_type: str | None = None,
+                   object_id: str | None = None, outcome: str | None = None, q: str | None = None,
+                   since: float | None = None, until: float | None = None, before_id: int | None = None,
+                   limit: int = Query(200, le=2000), _: Principal = Depends(admin)) -> list[dict[str, Any]]:
+        rows = repo.list_audit(actor=actor, action=action, object_type=object_type, object_id=object_id,
+                               outcome=outcome, q=q, since=since, until=until, before_id=before_id, limit=limit)
+        return [{k: v for k, v in r.items() if k not in ("prev_hash",)} for r in rows]
+
+    @app.get("/audit/verify", tags=["audit"])
+    def audit_verify(_: Principal = Depends(admin)) -> dict[str, Any]:
+        return repo.verify_audit()
+
+    @app.get("/audit/export", tags=["audit"])
+    def audit_export(since: float | None = None, until: float | None = None, _: Principal = Depends(admin)) -> Any:
+        import csv
+        import io
+        rows = repo.list_audit(since=since, until=until, limit=10000)
+        out = io.StringIO()
+        cols = ["id", "ts", "time_utc", "actor", "actor_role", "ip", "action", "object_type", "object_id", "object_name",
+                "project", "method", "path", "status", "outcome", "request_id", "details", "hash"]
+        w = csv.DictWriter(out, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow({**r, "time_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r["ts"])),
+                        "details": json.dumps(r.get("details"), default=str)})
+        return StreamingResponse(iter([out.getvalue()]), media_type="text/csv",
+                                 headers={"Content-Disposition": 'attachment; filename="margarita-audit.csv"'})
 
     @app.post("/executions/{xid}/cancel", tags=["executions"])
     def cancel_exec(xid: str, p: Principal = Depends(operator)) -> dict[str, Any]:

@@ -11,10 +11,14 @@ Usage:
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
 
 from ...core.errors import ProviderError, TransientProviderError
 from ...core.retry import retry
+
+log = logging.getLogger("vmigrate.nutanix.api")
 
 V1 = "/PrismGateway/services/rest/v1"
 V2 = "/PrismGateway/services/rest/v2.0"
@@ -38,10 +42,15 @@ class PrismClient:
 
     def _req(self, method: str, url: str, **kw: Any) -> Any:
         def once() -> Any:
+            t0 = time.monotonic()
             try:
                 r = self.s.request(method, url, timeout=self.timeout, **kw)
             except self._requests.RequestException as e:
+                log.warning("Prism %s %s failed after %.1fs: %s", method, url, time.monotonic() - t0, e)
                 raise TransientProviderError(f"{method} {url}: {e}") from e
+            log.debug("Prism %s %s -> %s in %.2fs", method, url, r.status_code, time.monotonic() - t0)
+            if r.status_code >= 400:
+                log.warning("Prism %s %s -> HTTP %s: %s", method, url, r.status_code, r.text[:500])
             if r.status_code >= 500 or r.status_code == 429:
                 raise TransientProviderError(f"{method} {url}: HTTP {r.status_code} {r.text[:500]}")
             if r.status_code >= 400:

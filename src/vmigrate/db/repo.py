@@ -297,6 +297,129 @@ class Repo:
         with self.engine.connect() as c:
             return [_row(r) for r in c.execute(q.order_by(s.task_logs.c.id).limit(limit))]  # type: ignore[misc]
 
+    def search_logs(self, *, execution_ids: list[str] | None = None, levels: list[str] | None = None,
+                    q: str | None = None, since: float | None = None, until: float | None = None,
+                    before_id: int | None = None, limit: int = 500) -> list[dict[str, Any]]:
+        """Newest first. execution_ids=None means all executions (caller scopes by project)."""
+        t = s.task_logs
+        qq = select(t)
+        if execution_ids is not None:
+            if not execution_ids:
+                return []
+            qq = qq.where(t.c.execution_id.in_(execution_ids))
+        if levels:
+            qq = qq.where(t.c.level.in_([x.upper() for x in levels]))
+        if q:
+            qq = qq.where(t.c.message.ilike(f"%{q}%"))
+        if since:
+            qq = qq.where(t.c.ts >= since)
+        if until:
+            qq = qq.where(t.c.ts <= until)
+        if before_id:
+            qq = qq.where(t.c.id < before_id)
+        with self.engine.connect() as c:
+            return [_row(r) for r in c.execute(qq.order_by(t.c.id.desc()).limit(min(limit, 5000)))]  # type: ignore[misc]
+
+    def search_events(self, *, migration_ids: list[str] | None = None, types: list[str] | None = None,
+                      since: float | None = None, until: float | None = None, before_id: int | None = None,
+                      limit: int = 500, include_global: bool = True) -> list[dict[str, Any]]:
+        e = s.events
+        qq = select(e)
+        if migration_ids is not None:
+            cond = e.c.migration_id.in_(migration_ids) if migration_ids else None
+            if include_global:
+                g = e.c.migration_id.is_(None)
+                qq = qq.where(g if cond is None else (cond | g))
+            elif cond is None:
+                return []
+            else:
+                qq = qq.where(cond)
+        if types:
+            from sqlalchemy import or_
+            qq = qq.where(or_(*[e.c.type.like(f"{x}%") for x in types]))
+        if since:
+            qq = qq.where(e.c.ts >= since)
+        if until:
+            qq = qq.where(e.c.ts <= until)
+        if before_id:
+            qq = qq.where(e.c.id < before_id)
+        with self.engine.connect() as c:
+            return [_row(r) for r in c.execute(qq.order_by(e.c.id.desc()).limit(min(limit, 5000)))]  # type: ignore[misc]
+
+    # ------------------------------------------------------------------ audit (append-only, hash-chained)
+    def add_audit(self, row: dict[str, Any], *, attempts: int = 20) -> int:
+        """Append one audit row. The chain head row is advanced with compare-and-set, so concurrent
+        writers (API processes, conductor) never fork the chain on SQLite or Postgres."""
+        from ..security.audit import row_hash
+        row = {**row, "ts": row.get("ts") or time.time()}
+        for _ in range(attempts):
+            with self.engine.begin() as c:
+                head = c.execute(select(s.audit_head).where(s.audit_head.c.id == 1)).first()
+                if head is None:
+                    try:
+                        c.execute(insert(s.audit_head).values(id=1, hash="", last_id=0))
+                    except Exception:  # noqa: BLE001 - another writer created it
+                        pass
+                    continue
+                prev = head.hash
+                h = row_hash(prev, row)
+                r = c.execute(update(s.audit_head).where(s.audit_head.c.id == 1, s.audit_head.c.hash == prev)
+                              .values(hash=h))
+                if r.rowcount != 1:
+                    continue                                   # lost the race: retry on the new head
+                rid = c.execute(insert(s.audit_log).values(**row, prev_hash=prev, hash=h)).inserted_primary_key[0]
+                c.execute(update(s.audit_head).where(s.audit_head.c.id == 1).values(last_id=rid))
+                return int(rid)
+            time.sleep(0.01)
+        raise RuntimeError("audit: could not append after concurrent retries")
+
+    def list_audit(self, *, actor: str | None = None, action: str | None = None, object_type: str | None = None,
+                   object_id: str | None = None, outcome: str | None = None, q: str | None = None,
+                   since: float | None = None, until: float | None = None, before_id: int | None = None,
+                   limit: int = 200) -> list[dict[str, Any]]:
+        a = s.audit_log
+        qq = select(a)
+        for col, v in ((a.c.actor, actor), (a.c.object_type, object_type), (a.c.object_id, object_id),
+                       (a.c.outcome, outcome)):
+            if v:
+                qq = qq.where(col == v)
+        if action:
+            qq = qq.where(a.c.action.like(f"{action}%"))
+        if q:
+            from sqlalchemy import or_
+            qq = qq.where(or_(a.c.object_name.ilike(f"%{q}%"), a.c.path.ilike(f"%{q}%"), a.c.actor.ilike(f"%{q}%")))
+        if since:
+            qq = qq.where(a.c.ts >= since)
+        if until:
+            qq = qq.where(a.c.ts <= until)
+        if before_id:
+            qq = qq.where(a.c.id < before_id)
+        with self.engine.connect() as c:
+            return [_row(r) for r in c.execute(qq.order_by(a.c.id.desc()).limit(min(limit, 10000)))]  # type: ignore[misc]
+
+    def verify_audit(self) -> dict[str, Any]:
+        """Recompute the chain over the kept rows. ok=False names the first row that does not match."""
+        from ..security.audit import row_hash
+        a = s.audit_log
+        n, prev, first = 0, None, None
+        with self.engine.connect() as c:
+            for r in c.execute(select(a).order_by(a.c.id)):
+                row = dict(r._mapping)
+                if prev is not None and row["prev_hash"] != prev:
+                    return {"ok": False, "rows": n, "broken_at": row["id"], "reason": "row missing before this one"}
+                if row_hash(row["prev_hash"], row) != row["hash"]:
+                    return {"ok": False, "rows": n, "broken_at": row["id"], "reason": "row content was changed"}
+                first = first or row["id"]
+                prev, n = row["hash"], n + 1
+            head = c.execute(select(s.audit_head)).first()
+        if head is not None and n and head.hash != prev:
+            return {"ok": False, "rows": n, "broken_at": None, "reason": "newest rows were removed"}
+        return {"ok": True, "rows": n, "first_id": first}
+
+    def purge_audit(self, older_than: float) -> int:
+        with self.engine.begin() as c:
+            return int(c.execute(delete(s.audit_log).where(s.audit_log.c.ts < older_than)).rowcount or 0)
+
     def add_event(self, type_: str, payload: dict[str, Any], *, execution_id: str | None = None,
                   migration_id: str | None = None) -> None:
         with self.engine.begin() as c:

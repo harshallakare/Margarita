@@ -5,7 +5,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api, fmt, KIND_LABEL, subscribe, type Execution as Exec, type LogLine, type Migration, type Task } from "../api";
+import { api, download, fmt, KIND_LABEL, subscribe, type Execution as Exec, type LogLine, type Migration, type Task } from "../api";
 import { Bar, ErrorBox, Loading, Status, Toast, TransferBar, errText, useAuth, useLoad } from "../ui";
 
 const LIVE = ["pending", "queued", "running"];
@@ -122,6 +122,12 @@ export default function Execution() {
             {x.dry_run && <span className="tag">nothing is changed</span>}
             {x.cancel_requested && LIVE.includes(x.status) && <span className="pill warn">cancelling</span>}</div>
           <div className="sub mono">{x.id}{x.lease_owner ? ` · worker ${x.lease_owner}` : ""}{x.runs > 1 ? ` · attempt ${x.runs}` : ""}</div>
+        </div>
+        <div className="row">
+          <button className="btn" title="Tasks, logs with tracebacks, events, state, report, redacted endpoints, versions"
+                  onClick={() => download(`/executions/${x.id}/diagnostics`, `margarita-diagnostics-${x.id.slice(0, 8)}.zip`)
+                    .catch((e) => setErr(errText(e)))}>Download diagnostics</button>
+          {can("admin") && <Link className="btn ghost" to={`/audit?object_id=${x.migration_id}`}>Audit trail</Link>}
         </div>
         {can("operator") && <div className="row">
           {live && !x.cancel_requested && <button className="btn danger" onClick={async () => {

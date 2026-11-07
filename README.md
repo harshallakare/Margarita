@@ -309,6 +309,34 @@ refused.
   mounts are needed.
 - Both APIs were taken from their published source and are used as documented, not copied.
 
+## Logs, diagnostics and audit trail
+
+**Investigating a failure:**
+- **Logs page:** searches every run's log lines by level, text, migration and time. Failures carry the full
+  Python traceback (click the row) and the logger name. The **Platform events** tab lists run lifecycle,
+  worker, schedule and requeue events.
+- **Download diagnostics** (on any run's page, also `GET /executions/{id}/diagnostics`): one zip with the run,
+  its tasks, every log line, events, migration options and state, the report, the endpoints (config redacted,
+  credentials never included), workers and versions. Send this file when asking for help.
+- **More detail:** set `VMIGRATE_EXEC_LOG_LEVEL=DEBUG` in `/etc/margarita/margarita.env` and restart the
+  worker. Run logs then also record every Nutanix API call with status and timing. Calls that fail are always
+  logged as warnings, with the response text.
+- **Request ids:** every API response has an `X-Request-Id` header, and the matching audit entry stores it.
+- **Service logs:** `journalctl -u margarita-api -u margarita-conductor -u margarita-worker`.
+
+**Audit trail** (admins only: the Audit trail page and `GET /audit`):
+- **What's recorded:** every API call that changes something, on every record type (users, endpoints,
+  migrations, replicas, runs, schedules, pools, minions, enrollment). That includes refused attempts, logins
+  and failed logins. Each entry says who did it, role, IP, user agent, action, record and outcome. The
+  conductor's own actions (scheduled syncs, retention purges) appear as `system:conductor`. Downloading
+  diagnostics and exporting the audit log are recorded too.
+- **Secrets:** request bodies are stored with every password, key, token and credential replaced by `***`.
+- **Tamper evidence:** there's no API to edit or delete entries. Each entry holds a SHA-256 chained to the
+  previous one, and **Verify integrity** (`GET /audit/verify`) reports the first entry that was changed or
+  removed directly in the database.
+- **Retention:** entries older than `VMIGRATE_AUDIT_RETENTION_DAYS` (default 365; 0 keeps them forever) are
+  purged daily, and the purge itself is recorded. **Export CSV** (`GET /audit/export`) saves a copy first.
+
 ## Repository layout
 
 | Path | Contents | Status |

@@ -37,12 +37,15 @@ response is checked for the fields we use, so a mismatch fails loudly with the r
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ...core.errors import ProviderError, SafetyGateError, TransientProviderError
+
+log = logging.getLogger("vmigrate.nutanix.v4")
 
 PREFIX = "vmigrate-"
 CLUSTERS = "/api/clustermgmt/v4.0/config/clusters"
@@ -131,10 +134,15 @@ class PrismV4:
             headers["NTNX-Request-Id"] = str(uuid.uuid4())
         if etag:
             headers["If-Match"] = etag
+        t0 = time.monotonic()
         try:
             r = self.s.request(method, self.base + path, json=body, headers=headers, timeout=self.timeout)
         except Exception as e:  # noqa: BLE001
+            log.warning("Prism v4 %s %s failed after %.1fs: %s", method, path, time.monotonic() - t0, e)
             raise TransientProviderError(f"Prism v4 {method} {path}: {e}") from e
+        log.debug("Prism v4 %s %s -> %s in %.2fs", method, path, r.status_code, time.monotonic() - t0)
+        if r.status_code >= 400:
+            log.warning("Prism v4 %s %s -> HTTP %s: %s", method, path, r.status_code, r.text[:500])
         if r.status_code in (429,) or r.status_code >= 500:
             raise TransientProviderError(f"Prism v4 {method} {path}: HTTP {r.status_code} {r.text[:400]}")
         if r.status_code == 404 and method == "GET" and path == CLUSTERS:   # the v4 probe call

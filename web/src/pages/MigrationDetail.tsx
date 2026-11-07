@@ -59,7 +59,9 @@ export default function MigrationDetail() {
         <div>
           <div className="crumbs"><Link to="/migrations">Migrations</Link> /</div>
           <div className="row"><h1>{m.name}</h1><Status s={m.phase} /></div>
-          <div className="sub">{m.vm} · {ep(m.source_endpoint_id)?.name ?? "…"} → {ep(m.target_endpoint_id)?.name ?? "…"}</div>
+          <div className="sub">{m.vm} · {ep(m.source_endpoint_id)?.name ?? "…"} → {ep(m.target_endpoint_id)?.name ?? "…"}
+            {" · "}<Link to={`/logs?migration_id=${m.id}`}>logs</Link>
+            {can("admin") && <>{" · "}<Link to={`/audit?object_id=${m.id}`}>audit trail</Link></>}</div>
         </div>
         {can("operator") && (
           <div className="row">

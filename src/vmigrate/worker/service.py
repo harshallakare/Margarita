@@ -37,8 +37,8 @@ class DbLogHandler(logging.Handler):
     """Captures vmigrate.* log records into task_logs (tagged with the task the thread is running).
     Buffered; flushed every second / 50 records / at the end of the run."""
 
-    def __init__(self, svc: Services, xid: str):
-        super().__init__(logging.INFO)
+    def __init__(self, svc: Services, xid: str, level: int = logging.INFO):
+        super().__init__(level)
         self.svc, self.xid = svc, xid
         self.buf: list[dict[str, Any]] = []
         self.last = time.monotonic()
@@ -49,8 +49,11 @@ class DbLogHandler(logging.Handler):
             msg = record.getMessage()
         except Exception:  # noqa: BLE001
             msg = str(record.msg)
+        if record.exc_info and record.exc_info[1] is not None:
+            import traceback
+            msg += "\n" + "".join(traceback.format_exception(*record.exc_info))[-12000:]
         row = {"execution_id": self.xid, "task_id": getattr(dagmod.current, "task_id", None), "ts": record.created,
-               "level": record.levelname, "message": msg[:10000]}
+               "level": record.levelname, "message": msg[:20000], "logger": record.name[:128]}
         with self._l:
             self.buf.append(row)
             due = len(self.buf) >= 50 or time.monotonic() - self.last >= 1.0
@@ -135,11 +138,14 @@ class Worker:
 
         hb = threading.Thread(target=beat, name=f"lease-{xid[:8]}", daemon=True)
         hb.start()
-        handler = DbLogHandler(self.svc, xid)
+        # VMIGRATE_EXEC_LOG_LEVEL=DEBUG also records provider API call traces in the run log
+        lvl = logging.getLevelName(os.environ.get("VMIGRATE_EXEC_LOG_LEVEL", "INFO").upper())
+        lvl = lvl if isinstance(lvl, int) else logging.INFO
+        handler = DbLogHandler(self.svc, xid, lvl)
         vlog = logging.getLogger("vmigrate")
         vlog.addHandler(handler)
-        if vlog.level == logging.NOTSET or vlog.level > logging.INFO:
-            vlog.setLevel(logging.INFO)
+        if vlog.level == logging.NOTSET or vlog.level > lvl:
+            vlog.setLevel(lvl)
 
         last_cancel = [0.0, False]
 

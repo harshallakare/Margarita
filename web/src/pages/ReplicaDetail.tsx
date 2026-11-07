@@ -154,7 +154,9 @@ export default function ReplicaDetail() {
         <div>
           <div className="crumbs"><Link to="/replicas">Replicas</Link> /</div>
           <div className="row"><h1>{r.name}</h1><ConsistencyPill r={r} /></div>
-          <div className="sub">{r.vm} · {ep(r.source_endpoint_id)?.name ?? "…"} → {ep(r.target_endpoint_id)?.name ?? "…"} · keeps {r.options.retention ?? 3} restore points</div>
+          <div className="sub">{r.vm} · {ep(r.source_endpoint_id)?.name ?? "…"} → {ep(r.target_endpoint_id)?.name ?? "…"} · keeps {r.options.retention ?? 3} restore points
+            {" · "}<Link to={`/logs?migration_id=${r.id}`}>logs</Link>
+            {can("admin") && <>{" · "}<Link to={`/audit?object_id=${r.id}`}>audit trail</Link></>}</div>
         </div>
         {can("operator") && <div className="row">
           {active ? <>

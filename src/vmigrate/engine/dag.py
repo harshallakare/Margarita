@@ -339,7 +339,7 @@ class DagRunner:
                     else:
                         failed = True
                         rec.status, rec.error = TaskStatus.FAILED, f"{type(exc).__name__}: {exc}"
-                        log.error("task %s (%s) failed: %s", rec.id, rec.kind, rec.error)
+                        log.error("task %s (%s) failed: %s", rec.id, rec.kind, rec.error, exc_info=exc)
                         self._persist(rec, event="task.failed")
         final = {t.id: t for t in self.store.load_tasks()}
         if self.cancelled():

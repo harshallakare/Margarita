@@ -140,6 +140,19 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
   return (ct.includes("json") ? r.json() : r.text()) as Promise<T>;
 }
 
+/** Authenticated file download (diagnostics zip, CSV export, reports). */
+export async function download(path: string, filename: string): Promise<void> {
+  const t = token.get();
+  const r = await fetch(path, { headers: { Authorization: `Bearer ${t ?? ""}` } });
+  if (!r.ok) throw new Error(`download failed: HTTP ${r.status}`);
+  const url = URL.createObjectURL(await r.blob());
+  const a = Object.assign(document.createElement("a"), { href: url, download: filename });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export const api = {
   get: <T,>(p: string) => req<T>("GET", p),
   post: <T,>(p: string, b?: unknown) => req<T>("POST", p, b ?? {}),

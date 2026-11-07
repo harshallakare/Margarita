@@ -6,8 +6,10 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, NavLink, Route, Routes } from "react-router-dom";
 import { api, setUnauthorizedHandler, token, type Me } from "./api";
 import { AuthCtx, ErrorBox, Icon, roleAtLeast } from "./ui";
+import Audit from "./pages/Audit";
 import Endpoints from "./pages/Endpoints";
 import Execution from "./pages/Execution";
+import Logs from "./pages/Logs";
 import MigrationDetail from "./pages/MigrationDetail";
 import Migrations from "./pages/Migrations";
 import ReplicaDetail from "./pages/ReplicaDetail";
@@ -72,6 +74,8 @@ function App() {
             <NavLink to="/migrations"><Icon n="migrate" />Migrations</NavLink>
             <NavLink to="/endpoints"><Icon n="endpoint" />Endpoints</NavLink>
             <NavLink to="/replicas"><Icon n="replica" />Replicas</NavLink>
+            <NavLink to="/logs"><Icon n="logs" />Logs</NavLink>
+            {can("admin") && <NavLink to="/audit"><Icon n="audit" />Audit trail</NavLink>}
             <NavLink to="/settings"><Icon n="settings" />Settings</NavLink>
           </nav>
           <div className="side-foot">
@@ -91,6 +95,8 @@ function App() {
             <Route path="/executions/:id" element={<Execution />} />
             <Route path="/endpoints" element={<Endpoints />} />
             <Route path="/settings" element={<Settings />} />
+            <Route path="/logs" element={<Logs />} />
+            <Route path="/audit" element={<Audit />} />
             <Route path="*" element={<div className="empty"><h2>Not found</h2></div>} />
           </Routes>
         </main>

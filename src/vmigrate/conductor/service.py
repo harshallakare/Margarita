@@ -99,6 +99,8 @@ class Conductor:
                 repo.update_schedule(sch["id"], last_skip_reason=f"skipped at {time.strftime('%Y-%m-%d %H:%M', time.gmtime(now))}Z: {e}")
                 continue
             repo.update_schedule(sch["id"], last_execution_id=xid, last_skip_reason=None)
+            self.audit("replica.execute", "replica", mig["id"], mig["name"],
+                       {"schedule_id": sch["id"], "cron": sch["cron"], "execution_id": xid})
             repo.add_event("execution.created", {"dry_run": False, "by": f"schedule {sch['cron']}"},
                            execution_id=xid, migration_id=mig["id"])
             stats["scheduled"] += 1
@@ -165,6 +167,8 @@ class Conductor:
                 repo.remove_worker(w["id"])
         # 5) auto-provisioned worker pools: keep min_size members
         stats["minions"] = self.scale_pools()
+        # 6) audit retention (daily)
+        self.purge_audit()
         return stats
 
     def _requirements(self, ex: dict[str, Any]) -> Requirement | None:
@@ -185,6 +189,28 @@ class Conductor:
             if pl is not None and pl.get("region") and not req.region:
                 req.region = pl["region"]
         return req
+
+    def audit(self, action: str, otype: str, oid: str | None, name: str | None, details: dict[str, Any]) -> None:
+        """Actions the conductor takes on its own are part of the audit trail too."""
+        try:
+            self.repo.add_audit({"actor": "system:conductor", "actor_role": "system", "action": action,
+                                 "object_type": otype, "object_id": oid, "object_name": name, "outcome": "success",
+                                 "details": details})
+        except Exception:  # noqa: BLE001 - auditing must not stop scheduling
+            log.exception("audit write failed for %s", action)
+
+    def purge_audit(self, now: float | None = None) -> int:
+        """Daily: drop audit rows older than VMIGRATE_AUDIT_RETENTION_DAYS (default 365; 0 = keep forever)."""
+        import os as _os
+        now = now or time.time()
+        days = float(_os.environ.get("VMIGRATE_AUDIT_RETENTION_DAYS", "365"))
+        if days <= 0 or now - getattr(self, "_last_purge", 0) < 86400:
+            return 0
+        self._last_purge = now
+        n = self.repo.purge_audit(now - days * 86400)
+        if n:
+            self.audit("audit.purge", "audit", None, None, {"deleted_rows": n, "retention_days": days})
+        return n
 
     def scale_pools(self, now: float | None = None) -> int:
         """Auto-provisioned pools: create minions up to min_size (at most once a minute per pool)."""

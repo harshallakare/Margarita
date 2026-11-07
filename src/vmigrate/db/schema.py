@@ -144,8 +144,43 @@ task_logs = Table(
     Column("ts", Float, nullable=False),
     Column("level", String(10), nullable=False),
     Column("message", Text, nullable=False),
+    Column("logger", String(128), nullable=True),
 )
 Index("ix_task_logs_exec", task_logs.c.execution_id, task_logs.c.id)
+Index("ix_task_logs_ts", task_logs.c.ts)
+
+audit_log = Table(
+    "audit_log", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts", Float, nullable=False),
+    Column("actor", String(128), nullable=False),        # username, "system:conductor", or "anonymous"
+    Column("actor_id", String(32), nullable=True),
+    Column("actor_role", String(16), nullable=True),
+    Column("ip", String(64), nullable=True),
+    Column("user_agent", String(256), nullable=True),
+    Column("action", String(64), nullable=False),        # e.g. endpoint.create, replica.cutover, auth.login
+    Column("object_type", String(32), nullable=True),
+    Column("object_id", String(128), nullable=True),
+    Column("object_name", String(256), nullable=True),
+    Column("project", String(64), nullable=True),
+    Column("method", String(8), nullable=True),
+    Column("path", String(512), nullable=True),
+    Column("status", Integer, nullable=True),
+    Column("outcome", String(16), nullable=False),       # success | denied | failed
+    Column("request_id", String(64), nullable=True),
+    Column("details", JSON, nullable=True),              # redacted request body / context
+    Column("prev_hash", String(64), nullable=False),
+    Column("hash", String(64), nullable=False),
+)
+Index("ix_audit_ts", audit_log.c.ts)
+Index("ix_audit_object", audit_log.c.object_type, audit_log.c.object_id)
+
+audit_head = Table(                                      # one row: the chain head (optimistic append lock)
+    "audit_head", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("hash", String(64), nullable=False),
+    Column("last_id", Integer, nullable=False),
+)
 
 events = Table(
     "events", metadata,
@@ -230,7 +265,8 @@ _ADDED_COLUMNS = [("executions", "params", "JSON"), ("executions", "region", "VA
                   ("executions", "required_caps", "JSON"), ("executions", "waiting_reason", "TEXT"),
                   ("endpoints", "region", "VARCHAR(64)"), ("endpoints", "required_tags", "JSON"),
                   ("workers", "region", "VARCHAR(64)"), ("workers", "capabilities", "JSON"),
-                  ("workers", "export_url", "VARCHAR(512)"), ("workers", "export_fp", "VARCHAR(128)")]
+                  ("workers", "export_url", "VARCHAR(512)"), ("workers", "export_fp", "VARCHAR(128)"),
+                  ("task_logs", "logger", "VARCHAR(128)")]
 
 
 def upgrade_schema(engine: Engine) -> list[str]:
