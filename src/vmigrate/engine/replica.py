@@ -411,7 +411,7 @@ class ReplicaRunner:
             new_cp = _ref_to_dict(self.source.retire_snapshot(snap, old_cp))
             new_base = None
         totals = {k: sum((v.get(k) or 0) for v in cur["disks"].values())
-                  for k in ("bytes_read", "bytes_written", "bytes_unchanged")}
+                  for k in ("bytes_read", "bytes_written", "bytes_unchanged", "changed_bytes")}
         modes = sorted({v["mode"] for v in cur["disks"].values()})
         rec = {"id": cur["id"], "started": cur["started"], "finished": time.time(), "ok": True, "snapshot_id": snap.id,
                "modes": modes, "restore_point": rp["id"] if rp else None, **totals}

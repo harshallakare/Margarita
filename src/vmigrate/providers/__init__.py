@@ -33,7 +33,8 @@ SOURCES: dict[str, tuple[str | None, str, str]] = {
                 "PVE REST + SSH/qemu-nbd snapshot reads (lvmthin, zfs, rbd, qcow2); rbd diff incremental"),
     "openstack": ("vmigrate.providers.openstack.source:OpenstackSource", "implemented",
                   "Nova createImage snapshots; Ceph RBD or attach-to-worker reads; rbd diff incremental"),
-    "aws": (None, "planned", "EBS snapshot + EBS direct APIs, ListChangedBlocks"),
+    "aws": ("vmigrate.providers.aws.source:AwsSource", "implemented",
+            "CreateSnapshots (crash-consistent set) + EBS direct APIs; ListChangedBlocks incremental"),
     "azure": (None, "planned", "managed-disk snapshot SAS export, page-range diff"),
 }
 
@@ -155,6 +156,18 @@ FIELDS: dict[str, list[dict[str, Any]]] = {
         {"name": "ssh_known_hosts", "label": "Pinned host keys", "kind": "textarea"},
         {"name": "worker_server_id", "label": "Worker server ID (attach)", "kind": "text",
          "help": "default: read from the metadata service"},
+    ],
+    "aws": [
+        {"name": "region", "label": "Region", "kind": "text", "required": True, "help": "e.g. eu-west-1"},
+        {"name": "access_key_id", "label": "Access key ID", "kind": "password", "secret": True,
+         "help": "leave empty to use the worker's own IAM role"},
+        {"name": "secret_access_key", "label": "Secret access key", "kind": "password", "secret": True},
+        {"name": "role_arn", "label": "Role to assume", "kind": "text",
+         "help": "optional: arn:aws:iam::<account>:role/<name> in the source account"},
+        {"name": "external_id", "label": "External ID", "kind": "password", "secret": True},
+        {"name": "ignore_instance_store", "label": "Ignore instance store", "kind": "bool", "default": False,
+         "help": "only if instance-store disks hold scratch data: EBS snapshots never include them"},
+        {"name": "read_workers", "label": "Parallel block reads per disk", "kind": "int", "default": 16},
     ],
     "fake": [
         {"name": "vms", "label": "VMs", "kind": "json", "help": "source side: [{name, os, disks: [{size, boot}]}]"},

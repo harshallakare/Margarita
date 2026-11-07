@@ -412,6 +412,27 @@ Endpoint config (`type: openstack`): Keystone (`auth_url`, `username`, `password
 The Glance upload in `createImage` only happens for image-backed roots on non-Ceph ephemeral storage. Root disks
 are usually small, but keep pitfall 8 (multi-TB through Glance) in mind: move large root disks to volumes first.
 
+## AWS EC2 source
+
+Endpoint config (`type: aws`): `region`, plus `access_key_id` / `secret_access_key` (encrypted; leave empty to use
+the worker's own IAM role), an optional `role_arn` + `external_id` to assume a role in the source account,
+`ignore_instance_store`, and `read_workers` (parallel block reads per disk, default 16).
+
+| Step | How |
+|---|---|
+| Inspect | DescribeInstances + DescribeInstanceTypes + DescribeVolumes. Disks are ordered root first, then by device. Nitro instances use `nvme` disks and `ena` NICs; Xen instances use `xen-blkfront` / `xen-netfront`. Neither is virtio, so OSMorph injects virtio for KVM targets. UEFI comes from BootMode. |
+| Disk-count gate | BlockDeviceMappings vs DescribeVolumes(`attachment.instance-id`). The snapshot set must also cover exactly the inspected volumes; a volume attached or detached in between fails loudly. |
+| Refused | **instance store** data (never in EBS snapshots) unless `ignore_instance_store: true`; `app_consistent` (EBS multi-volume snapshots are crash-consistent, with no native Linux quiesce), so set it false or stop the instance; non-unique `Name` tags (use the instance id) |
+| Snapshot | `CreateSnapshots` for the whole instance: one crash-consistent point in time across all volumes, tagged `vmigrate:run`, waited until `completed` |
+| Read | **EBS direct APIs**, with no helper instance and no volume attach. ListSnapshotBlocks is read as a sliding window of tokens, so multi-TiB volumes don't hold millions of tokens in memory. GetSnapshotBlock fetches blocks in parallel, each SHA-256-verified, with corrupt blocks re-fetched and throttling backed off. Never-written blocks are skipped on a full copy. |
+| Cleanup | `DeleteSnapshot`, only for snapshots tagged `vmigrate:run` |
+| Replicas | `ListChangedBlocks(previous, current)` per volume, at 512 KiB granularity; blocks zeroed since the last sync are written as zeros. The previous snapshot set is kept as the diff base and rotated each sync. |
+
+IAM: `ec2:Describe{Instances,Volumes,InstanceTypes,Snapshots}`, `ec2:CreateSnapshots`, `ec2:CreateTags`,
+`ec2:DeleteSnapshot`, `ebs:ListSnapshotBlocks`, `ebs:GetSnapshotBlock`, `ebs:ListChangedBlocks`, plus `kms:Decrypt`
+on the volume keys for encrypted volumes. **Costs:** AWS bills EBS direct API requests (about one request per
+512 KiB block read) and snapshot storage. A replica's kept base snapshot is incremental.
+
 ## Support matrix
 
 | Side | Platform | Status |
@@ -421,7 +442,8 @@ are usually small, but keep pitfall 8 (multi-TB through Glance) in mind: move la
 | source | Microsoft Hyper-V (Windows Server 2016+) | **implemented**. Tested against a fake WinRM client only (with real VHDX files); not yet run against a Hyper-V host. RCT is experimental and opt-in. |
 | source | Proxmox VE (qemu VMs) | **implemented**. Tested against a fake PVE API and node shell (with a real NBD read path); not yet run against a cluster. |
 | source | OpenStack (Nova + Cinder; Ceph or any backend) | **implemented**. Tested against a fake cloud only; not yet run against a real deployment. |
-| source | AWS, Azure | planned (interface-ready) |
+| source | AWS EC2 (EBS-backed instances) | **implemented**. Tested against a fake EC2/EBS only; not yet run against an AWS account. |
+| source | Azure | planned (interface-ready) |
 | target | Virtuozzo VHI | **implemented** (reference) |
 | target | OpenStack, Proxmox VE, Nutanix AHV, VMware vSphere, AWS, Azure | planned |
 

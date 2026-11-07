@@ -18,7 +18,7 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY --from=web /web/dist ./web/dist
-RUN pip install --no-cache-dir '.[platform,postgres,nutanix,vhi,vmware,hyperv]'
+RUN pip install --no-cache-dir '.[platform,postgres,nutanix,vhi,vmware,hyperv,openstack,aws]'
 RUN useradd -r -u 10001 vmigrate && mkdir -p /data && chown vmigrate /data
 USER vmigrate
 ENV VMIGRATE_DATA_DIR=/data VMIGRATE_WEB_DIR=/app/web/dist
