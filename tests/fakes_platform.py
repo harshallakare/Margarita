@@ -78,6 +78,8 @@ class FakePrism:
 
     # --- v3
     def v3_post(self, path: str, body: Any) -> Any:
+        if path == "/clusters/list":
+            return {"entities": [{"metadata": {"uuid": "cl"}}], "metadata": {"total_matches": 1}}
         assert path == "/vms/list"
         all_vms = [{"metadata": {"uuid": VM_UUID}, "status": {"name": self.vm_name}}] + [
             {"metadata": {"uuid": f"other-{i}"}, "status": {"name": f"other-{i}"}} for i in range(self.extra_vms)]
@@ -98,6 +100,8 @@ class FakePrism:
         return {}
 
     def v2_get(self, path: str, params: dict | None = None) -> Any:
+        if path == "/cluster":
+            return {"name": "lab-cluster", "uuid": "cl"}
         if path == f"/vms/{VM_UUID}":
             disks = self.v2_disks_override if self.v2_disks_override is not None else self.disks
             return v2_vm(self.vm_name, VM_UUID, disks)

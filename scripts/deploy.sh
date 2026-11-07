@@ -18,7 +18,7 @@
 #   -h | --help
 #
 # What it does (idempotent — safe to re-run; never overwrites the secret key or existing users):
-#   1. installs OS packages (apt or dnf/yum): git, Python >= 3.11, qemu-img, ssh client, ...
+#   1. installs OS packages (apt or dnf/yum): git, Python >= 3.11, qemu-img, ssh client, iSCSI initiator, ...
 #   2. clones the repo to /opt/margarita/app, creates a venv at /opt/margarita/venv, pip installs
 #   3. builds the web UI with Node (system Node >= 18, else a pinned, SHA-256-verified Node tarball)
 #   4. creates /etc/margarita/{margarita.env, secret.key} and /var/lib/margarita (data)
@@ -109,16 +109,21 @@ if [ "$PM" = apt ]; then
   pkg_install required ca-certificates $(missing git:git curl:curl tar:tar xz:xz-utils ssh:openssh-client python3:python3)
   "${PY_PROBE:-python3}" -c 'import ensurepip' 2>/dev/null || pkg_install required python3-venv
   # shellcheck disable=SC2046
-  pkg_install optional $(missing qemu-img:qemu-utils)
+  pkg_install optional $(missing qemu-img:qemu-utils iscsiadm:open-iscsi)
   # shellcheck disable=SC2046
   [ $FULL -eq 1 ] && pkg_install optional $(missing nbdkit:nbdkit guestfish:libguestfs-tools mount.cifs:cifs-utils)
 else
   # shellcheck disable=SC2046
   pkg_install required ca-certificates $(missing git:git curl:curl tar:tar xz:xz ssh:openssh-clients python3:python3)
   # shellcheck disable=SC2046
-  pkg_install optional $(missing qemu-img:qemu-img)
+  pkg_install optional $(missing qemu-img:qemu-img iscsiadm:iscsi-initiator-utils)
   # shellcheck disable=SC2046
   [ $FULL -eq 1 ] && pkg_install optional $(missing nbdkit:nbdkit guestfish:libguestfs-tools mount.cifs:cifs-utils)
+fi
+
+# Nutanix iSCSI transport: the initiator daemon must run on workers (no-op without systemd/iscsiadm)
+if command -v iscsiadm >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+  systemctl enable --now iscsid >/dev/null 2>&1 || systemctl enable --now iscsid.socket >/dev/null 2>&1 || true
 fi
 
 py_ok() { "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; }

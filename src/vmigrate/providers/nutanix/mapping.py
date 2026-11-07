@@ -144,7 +144,7 @@ def to_vmspec(v3: dict[str, Any], v2: dict[str, Any]) -> VmSpec:
             id=d2.vmdisk_uuid or d3.uuid, bus=key[0], size_bytes=d3.size_bytes, order=order,
             is_boot=key == boot_addr, bus_index=key[1], controller=_CONTROLLER.get(key[0]),
             source_handle={"vmdisk_uuid": d2.vmdisk_uuid, "ndfs_filepath": d2.ndfs_filepath,
-                           "container_uuid": d2.container_uuid or d3.container_uuid},
+                           "container_uuid": d2.container_uuid or d3.container_uuid, "v3_uuid": d3.uuid},
         ))
 
     nics = []

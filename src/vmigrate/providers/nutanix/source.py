@@ -5,11 +5,13 @@ Usage (config):
       ahv1:
         type: nutanix
         prism_element: https://10.0.0.10:9440      # v1/v2 (PD snapshots, vm_disk_info)
-        prism_central: https://10.0.0.20:9440      # v3 (optional; defaults to prism_element)
+        prism_central: https://10.0.0.20:9440      # v3 + v4 (needed for the iSCSI transport)
+        transport: auto                            # auto | iscsi | nfs (auto: iSCSI when PC v4 + a cluster
+                                                   # Data Services IP are available, else NFS)
         username: admin
         password: ${NUTANIX_PASSWORD}
         verify_tls: false
-        protection_domain: vmigrate-pd             # PD used for app-consistent OOB snapshots
+        protection_domain: vmigrate-pd             # NFS transport only: PD used for OOB snapshots
         protect_vm_if_missing: false               # add VM to the PD automatically (PD config change)
         snapshot_retention_secs: 172800
         # NFS access is AUTOMATIC: the worker mounts each needed container read-only from the
@@ -19,7 +21,14 @@ Usage (config):
         # nfs_mounts: {ctr-prod: /mnt/ntnx/ctr-prod}   # use these pre-mounted paths instead
         # nfs_root: /mnt/ntnx                      # or: pre-mounted under nfs_root/<container>
 
-How it works:
+How it works (iSCSI transport, PC >= 7.3 / AOS >= 6.8 — the Coriolis method, no NFS, no PD):
+  snapshot : v4 recovery point (app/crash consistent) -> temporary volume group vmigrate-<run> with one
+             disk per VM disk, data source = the disk recovery point (instant, no copy) -> this
+             worker's iSCSI initiator attached through the API (no manual whitelist)
+  read     : iscsiadm login to the cluster Data Services IP; each LUN mapped to its disk and size-
+             checked; the volume group's disk count and the visible LUN count join the disk gate
+  cleanup  : iSCSI logout -> detach initiator -> delete volume group -> delete recovery point
+How it works (NFS transport, any cluster; the manually proven path):
   inspect  : Prism v3 VM (paged list, full disk_list) joined with v2 vm_disk_info; both must agree
   gate     : disk_count_crosscheck = {prism_v3.disk_list, prism_v2.vm_disk_info}
   snapshot : v1 PD oob_schedules (appConsistent) -> v2 dr_snapshots poll -> v2 restore_entities as a
@@ -46,7 +55,9 @@ from ...core.interfaces import DiskReader, SnapshotRef, SourceProvider, VmRef
 from ...core.retry import poll_until
 from ...ir import DiskSpec, VmSpec
 from .client import PrismClient
+from .iscsi import IscsiSession, block_size_of, map_devices
 from .nfs import NfsMounter
+from .v4 import PrismV4
 from .mapping import disks_v2, disks_v3, to_vmspec
 
 PAGE = 250
@@ -57,9 +68,18 @@ class NutanixSource(SourceProvider):
     type_name = "nutanix"
 
     def __init__(self, name: str, config: Mapping[str, Any], ctx: RunContext, client: PrismClient | None = None,
-                 mounter: NfsMounter | None = None):
+                 mounter: NfsMounter | None = None, v4: PrismV4 | None = None, iscsi_factory: Any = None,
+                 size_of: Any = None):
         super().__init__(name, config, ctx)
         self._mounter = mounter
+        self.transport = config.get("transport", "auto")
+        if self.transport not in ("auto", "iscsi", "nfs"):
+            raise ConfigError(f"sources.{name}.transport must be auto, iscsi or nfs")
+        self._v4 = v4
+        self._iscsi_factory = iscsi_factory or IscsiSession
+        self._size_of = size_of or block_size_of
+        self._sessions: dict[str, IscsiSession] = {}
+        self._decided: dict[str, tuple[str, str]] = {}
         for k in ("prism_element", "username"):
             if k not in config and client is None:
                 raise ConfigError(f"sources.{name}: missing {k!r}")
@@ -88,8 +108,15 @@ class NutanixSource(SourceProvider):
                 self.c.v3_post("/clusters/list", {"kind": "cluster", "length": 1})
             except Exception as e:  # noqa: BLE001
                 p.append(f"cannot reach Prism Central {self.config['prism_central']}: {e}")
+        v4_ok, why = self._v4_status()
+        if self.transport == "iscsi" and not v4_ok:
+            p.append(f"transport iscsi: {why}")
+        needs_pd = self.transport == "nfs" or (self.transport == "auto" and not v4_ok)
+        if not needs_pd:
+            return p
         if not self.pd:
-            p.append("protection_domain is required (used for app-consistent snapshots)")
+            p.append("protection_domain is required for the NFS transport (Prism Central v4 not available: "
+                     f"{why})")
         else:
             try:
                 self.c.v2_get(f"/protection_domains/{self.pd}")
@@ -164,13 +191,67 @@ class NutanixSource(SourceProvider):
         return self._mounter
 
     def close(self) -> None:
+        for s in list(self._sessions.values()):
+            s.logout()
+        self._sessions.clear()
         if self._mounter is not None:
             self._mounter.unmount_all()
 
+    # ------------------------------------------------------------------ transport choice
+    @property
+    def v4(self) -> PrismV4:
+        if self._v4 is None:
+            if not self.config.get("prism_central"):
+                raise ConfigError("the iSCSI transport needs prism_central (Prism Central v4 API)")
+            self._v4 = PrismV4(self.c.s, self.config["prism_central"])
+        return self._v4
+
+    def _v4_status(self) -> tuple[bool, str]:
+        if self.transport == "nfs":
+            return False, "transport is nfs"
+        if not self.config.get("prism_central") and self._v4 is None:
+            return False, "prism_central is not set"
+        try:
+            self.v4.clusters()
+            return True, "Prism Central v4 API reachable"
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)
+
+    def transport_for(self, cluster_ext: str | None) -> tuple[str, str]:
+        """('iscsi'|'nfs', reason) for VMs on `cluster_ext`. Explicit config wins; auto prefers iSCSI."""
+        key = cluster_ext or ""
+        if key in self._decided:
+            return self._decided[key]
+        if self.transport == "nfs":
+            out = ("nfs", "configured")
+        else:
+            ok, why = self._v4_status()
+            dsip = self.v4.data_services_ip(cluster_ext) if ok and cluster_ext else None
+            if ok and dsip:
+                out = ("iscsi", f"Prism Central v4 + Data Services IP {dsip}")
+            elif self.transport == "iscsi":
+                raise ProviderError(f"transport iscsi unavailable: {why if not ok else 'the cluster has no Data Services IP'}")
+            else:
+                out = ("nfs", f"iSCSI unavailable ({why if not ok else 'no Data Services IP on the cluster'})")
+        self._decided[key] = out
+        return out
+
     def preflight(self, spec: VmSpec | None = None) -> list[str]:
         problems: list[str] = []
+        if spec is not None:
+            try:
+                mode, why = self.transport_for((spec.extra.get("nutanix") or {}).get("cluster"))
+            except ProviderError as e:
+                return [str(e)]
+            self.ctx.logger.info("nutanix transport for %s: %s (%s)", spec.name, mode, why)
+            if mode == "iscsi":
+                try:
+                    self._iscsi_factory("127.0.0.1").initiator_name()
+                except ProviderError as e:
+                    problems.append(str(e))
+                return problems
         if not self.pd:
-            problems.append(f"sources.{self.name}.protection_domain is not set (needed for app-consistent snapshots)")
+            problems.append(f"sources.{self.name}.protection_domain is not set (needed by the NFS transport)")
         if spec is not None:
             for ctr in spec.extra.get("nutanix", {}).get("containers", []):
                 try:
@@ -196,6 +277,59 @@ class NutanixSource(SourceProvider):
                        {"app_consistent_snapshots": app, "uuids": [vm.id]})
 
     def create_snapshot(self, vm: VmRef, app_consistent: bool) -> SnapshotRef:
+        spec = to_vmspec(self._v3(vm), self._v2(vm.id))
+        cluster = (spec.extra.get("nutanix") or {}).get("cluster")
+        if self.transport_for(cluster)[0] == "iscsi":
+            return self._snapshot_iscsi(vm, spec, cluster, app_consistent)
+        return self._snapshot_pd(vm, app_consistent)
+
+    def _snapshot_iscsi(self, vm: VmRef, spec: VmSpec, cluster: str, app: bool) -> SnapshotRef:
+        name = f"vmigrate-{self.ctx.run_id}"
+        self.ctx.require_execute("nutanix v4 recovery point + volume group", vm=vm.name, name=name, app_consistent=app)
+        v4 = self.v4
+        portal = v4.data_services_ip(cluster)
+        iqn = self._iscsi_factory(portal).initiator_name()
+        data: dict[str, Any] = {"transport": "iscsi", "name": name, "portal": portal, "iqn": iqn, "cluster": cluster}
+        ref = SnapshotRef(id=name, vm=vm, app_consistent=app, data=data)
+        try:
+            data["recovery_point"] = v4.create_recovery_point(vm.id, name, app_consistent=app)
+            rp_disks = v4.recovery_point_disks(data["recovery_point"])
+            pairs = []
+            for d in spec.ordered_disks():
+                keys = {d.id, d.source_handle.get("v3_uuid"), d.source_handle.get("vmdisk_uuid")} - {None, ""}
+                hit = [rp_disks[k] for k in keys if k in rp_disks]
+                if len(set(hit)) != 1:
+                    raise SafetyGateError(f"recovery point has no unique copy of disk {d.address} ({sorted(keys)}); "
+                                          f"it lists {sorted(rp_disks)}")
+                pairs.append((d, hit[0]))
+            if len(rp_disks) != len(spec.disks):
+                raise SafetyGateError(f"recovery point covers {len(rp_disks)} disks, the VM has {len(spec.disks)}")
+            data["volume_group"] = v4.create_volume_group(name, cluster)
+            for d, drp in pairs:
+                v4.add_disk_from_recovery_point(data["volume_group"], data["recovery_point"], drp, d.order)
+            vg_disks = v4.vg_disks(data["volume_group"])
+            if len(vg_disks) != len(spec.disks):
+                raise SafetyGateError(f"volume group has {len(vg_disks)} disks, the VM has {len(spec.disks)}")
+            data["vg_disks"] = vg_disks
+            data["disk_index"] = {d.id: d.order for d in spec.disks}
+            v4.attach_iscsi_client(data["volume_group"], iqn)
+            data["attached"] = True
+        except Exception:
+            self.cleanup(ref)
+            raise
+        return ref
+
+    def _devices(self, snapshot: SnapshotRef) -> dict[int, str]:
+        d = snapshot.data
+        sess = self._sessions.get(snapshot.id)
+        if sess is None:
+            sess = self._iscsi_factory(d["portal"])
+            self._sessions[snapshot.id] = sess
+            devs = sess.login(d["name"], expected=len(d["vg_disks"]))
+            sess.devices = map_devices(d["vg_disks"], devs, self._size_of)   # type: ignore[attr-defined]
+        return sess.devices  # type: ignore[attr-defined]
+
+    def _snapshot_pd(self, vm: VmRef, app_consistent: bool) -> SnapshotRef:
         self.ctx.require_execute("nutanix PD oob snapshot", pd=self.pd, vm=vm.name, app_consistent=app_consistent)
         if not self.pd:
             raise ConfigError(f"sources.{self.name}.protection_domain is required")
@@ -217,7 +351,8 @@ class NutanixSource(SourceProvider):
         sid = str(snap["snapshot_id"])
         prefix = f"vmigrate-{self.ctx.run_id}-"
         clone_name = prefix + vm.name
-        ref_data: dict[str, Any] = {"protection_domain": self.pd, "snapshot_id": sid, "clone_name": clone_name,
+        ref_data: dict[str, Any] = {"transport": "nfs", "protection_domain": self.pd, "snapshot_id": sid,
+                                    "clone_name": clone_name,
                                     "app_consistent_reported": snap.get("app_consistent_snapshots")}
         # Materialize the frozen copy as a powered-off clone VM; its vmdisks are what we read.
         self.ctx.require_execute("nutanix restore snapshot as clone", snapshot=sid, clone=clone_name)
@@ -255,9 +390,22 @@ class NutanixSource(SourceProvider):
         return SnapshotRef(id=sid, vm=vm, app_consistent=app_consistent, data=ref_data)
 
     def snapshot_disk_count(self, snapshot: SnapshotRef) -> int | None:
+        if snapshot.data.get("transport") == "iscsi":
+            return len(self._devices(snapshot))       # LUNs actually visible on this worker
         return len(snapshot.data.get("disk_paths", {}))
 
     def open_disk(self, snapshot: SnapshotRef, disk: DiskSpec) -> DiskReader:
+        if snapshot.data.get("transport") == "iscsi":
+            if not str(snapshot.data.get("name", "")).startswith("vmigrate-"):
+                raise LiveDiskReadRefused("nutanix iscsi: reads require a vmigrate volume group")
+            idx = (snapshot.data.get("disk_index") or {}).get(disk.id)
+            if idx is None:
+                raise LiveDiskReadRefused(f"disk {disk.address} has no copy in volume group {snapshot.id}")
+            path = self._devices(snapshot)[idx]
+            size = self._size_of(path)
+            if size < disk.size_bytes:
+                raise SafetyGateError(f"{path}: {size} bytes < disk {disk.address} {disk.size_bytes}")
+            return RawFileReader(path, size=disk.size_bytes)
         paths = snapshot.data.get("disk_paths") or {}
         ndfs = paths.get(disk.id)
         if not ndfs:
@@ -271,6 +419,9 @@ class NutanixSource(SourceProvider):
 
     # ------------------------------------------------------------------ cleanup
     def cleanup(self, snapshot: SnapshotRef) -> None:
+        if snapshot.data.get("transport") == "iscsi":
+            self._cleanup_iscsi(snapshot)
+            return
         d = snapshot.data
         self.ctx.require_execute("nutanix cleanup clone + snapshot", clone=d.get("clone_name"), snapshot=snapshot.id)
         cu = d.get("clone_uuid")
@@ -283,3 +434,30 @@ class NutanixSource(SourceProvider):
             self.c.v2_delete(f"/vms/{cu}")
         if d.get("snapshot_id") and d.get("protection_domain"):
             self.c.v2_delete(f"/protection_domains/{d['protection_domain']}/dr_snapshots/{d['snapshot_id']}")
+
+    def _cleanup_iscsi(self, snapshot: SnapshotRef) -> None:
+        d = snapshot.data
+        self.ctx.require_execute("nutanix iscsi cleanup", volume_group=d.get("volume_group"),
+                                 recovery_point=d.get("recovery_point"))
+        sess = self._sessions.pop(snapshot.id, None) or self._iscsi_factory(d.get("portal") or "127.0.0.1")
+        sess.logout()
+        sess.logout_matching(d["name"])            # also sessions left by a crashed worker process
+        errors = []
+        if d.get("volume_group"):
+            if d.get("attached"):
+                try:
+                    self.v4.detach_iscsi_client(d["volume_group"], d["iqn"])
+                except Exception as e:  # noqa: BLE001 - keep cleaning; report at the end
+                    errors.append(f"detach: {e}")
+            try:
+                self.v4.delete_volume_group(d["volume_group"])
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"delete volume group {d['volume_group']}: {e}")
+        if d.get("recovery_point"):
+            try:
+                self.v4.delete_recovery_point(d["recovery_point"])
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"delete recovery point {d['recovery_point']}: {e}")
+        if errors:
+            raise ProviderError("nutanix iscsi cleanup incomplete (objects are named " + d["name"] + "): "
+                                + "; ".join(errors))

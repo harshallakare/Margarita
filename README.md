@@ -340,7 +340,24 @@ Secrets: use `${VAR}` / `${VAR:-default}`. `validate` warns about literal secret
    so must the target attachment list. Volume-group disks fail loudly instead of being dropped.
 2. **Live disks are never read.** A PD out-of-band snapshot is restored as a powered-off clone,
    `vmigrate-<run>-<name>`, and its vmdisks are what gets read. Reading a source vmdisk uuid raises `LiveDiskReadRefused`.
-3. **Nutanix disk data is read over NFS, mounted automatically.** Prism has no API that streams a
+3. **Nutanix disk data travels over iSCSI by default (no NFS, no protection domain).** With Prism Central
+   ≥ 7.3 (v4 API) and AOS ≥ 6.8, `transport: auto` uses the method Coriolis documents:
+   - a v4 **recovery point** (application- or crash-consistent);
+   - a temporary **volume group** `vmigrate-<run>`, with one disk per VM disk whose data source is the disk
+     recovery point (instant, no copy);
+   - **this worker's iSCSI initiator is attached through the API**, so nothing is whitelisted by hand;
+   - `iscsiadm` logs in to the cluster's **Data Services IP**;
+   - each LUN is mapped to its disk (both Nutanix target layouts) and size-checked;
+   - the recovery point's, volume group's and visible LUNs' disk counts all join the disk gate;
+   - cleanup logs out, detaches the initiator, then deletes the volume group and the recovery point
+     (only `vmigrate-*` objects).
+
+   Worker needs: open-iscsi (`deploy.sh` installs it and enables `iscsid`) and TCP 3260 to the Data Services
+   IP. The v4 request/response shapes live in one module (`providers/nutanix/v4.py`). A missing field fails
+   loudly with the raw payload, so the first live run will confirm them against your Prism Central version.
+   Older clusters, or no Prism Central, use the **NFS transport** below automatically (`transport: nfs`
+   forces it; `transport: iscsi` forbids the fallback).
+   **NFS transport: disk data is read over NFS, mounted automatically.** Prism has no API that streams a
    vmdisk's bytes, so the worker reads the snapshot clone's files from the storage container. You don't
    configure mounts: the worker mounts each container it needs **read-only** from the Prism Element address
    (`nfs_host` overrides it), and unmounts it afterwards. The one-time cluster step is to add the worker's IP

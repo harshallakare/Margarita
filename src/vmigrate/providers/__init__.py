@@ -24,7 +24,7 @@ from ..core.interfaces import SourceProvider, TargetProvider
 SOURCES: dict[str, tuple[str | None, str, str]] = {
     "fake": ("vmigrate.providers.fake.provider:FakeSource", "implemented", "in-memory, for tests/demos"),
     "nutanix": ("vmigrate.providers.nutanix.source:NutanixSource", "implemented",
-                "Prism v3+v2 cross-check, PD app-consistent snapshot, NFS linear read"),
+                "Prism v3+v2 cross-check; iSCSI via PC v4 recovery points + volume groups, or NFS"),
     "vmware": ("vmigrate.providers.vmware.source:VmwareSource", "implemented",
                "pyVmomi inventory + snapshots; VDDK via nbdkit (or HTTPS flat-file); CBT for replicas"),
     "hyperv": ("vmigrate.providers.hyperv.source:HypervSource", "implemented",
@@ -63,8 +63,10 @@ FIELDS: dict[str, list[dict[str, Any]]] = {
         {"name": "username", "label": "Username", "kind": "text", "required": True},
         {"name": "password", "label": "Password", "kind": "password", "secret": True, "required": True},
         {"name": "verify_tls", "label": "Verify TLS", "kind": "bool", "default": True},
-        {"name": "protection_domain", "label": "Protection domain", "kind": "text", "required": True,
-         "help": "PD used for app-consistent out-of-band snapshots"},
+        {"name": "transport", "label": "Disk transport", "kind": "text", "default": "auto",
+         "help": "auto (iSCSI via Prism Central v4 when available, else NFS), iscsi, or nfs"},
+        {"name": "protection_domain", "label": "Protection domain (NFS transport only)", "kind": "text",
+         "help": "not needed for iSCSI (PC >= 7.3 / AOS >= 6.8); required for the NFS transport"},
         {"name": "protect_vm_if_missing", "label": "Add VM to PD if missing", "kind": "bool", "default": False},
         {"name": "nfs_host", "label": "NFS address (optional)", "kind": "text",
          "help": "leave empty: workers mount containers from the Prism Element host automatically "
