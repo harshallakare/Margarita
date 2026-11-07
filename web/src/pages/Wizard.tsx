@@ -10,6 +10,24 @@ import { ErrorBox, Icon, Loading, Status, errText, useAuth, useLoad } from "../u
 import { roles } from "./Endpoints";
 
 const STEPS = ["Source", "Virtual machines", "Target", "Mapping", "Options", "Review"];
+
+interface Res { id: string; name: string; vcpus?: number; ram_mb?: number }
+interface Resources { networks: Res[]; storage: Res[]; flavors: Res[]; errors: Record<string, string> }
+
+/** A dropdown of real target resources, or a text box when the target cannot list them. */
+function Pick({ value, onChange, options, placeholder, label }: {
+  value: string; onChange: (v: string) => void; options: Res[] | undefined; placeholder: string; label?: (r: Res) => string;
+}) {
+  if (!options || options.length === 0) {
+    return <input type="text" value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />;
+  }
+  return (
+    <select value={value} onChange={(e) => onChange(e.target.value)}>
+      <option value="">{placeholder}</option>
+      {options.map((o) => <option key={o.id} value={o.id}>{label ? label(o) : o.name}</option>)}
+    </select>
+  );
+}
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 100) || "vm";
 
 interface Inv { id: string; name: string }
@@ -57,9 +75,17 @@ export default function Wizard() {
   const [parallel, setParallel] = useState(4);
   const [onFailure, setOnFailure] = useState<"keep" | "cleanup">("keep");
   const [bootCheck, setBootCheck] = useState(true);
+  const [verifyFull, setVerifyFull] = useState(false);
+  const [pool, setPool] = useState("");
+  const [cluster, setCluster] = useState("");
+  const [pools, setPools] = useState<{ name: string; region: string | null }[]>([]);
+  useEffect(() => { api.get<{ name: string; region: string | null }[]>("/pools").then(setPools).catch(() => setPools([])); }, []);
+  const [offlineScript, setOfflineScript] = useState("");
+  const [firstbootScript, setFirstbootScript] = useState("");
   const [fstabHarden, setFstabHarden] = useState(true);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [res, setRes] = useState<Resources | null>(null);
 
   const sources = (eps.data ?? []).filter((e) => roles(prov.data, e.type).includes("source"));
   const targets = (eps.data ?? []).filter((e) => roles(prov.data, e.type).includes("target"));
@@ -90,6 +116,11 @@ export default function Wizard() {
   const filtered = (inv ?? []).filter((v) => v.name.toLowerCase().includes(q.toLowerCase()));
 
   useEffect(() => { if (sel.length === 1 && !prefix) setPrefix(slug(sel[0])); }, [sel, prefix]);
+  useEffect(() => {
+    setRes(null);
+    if (!tgt) return;
+    api.get<Resources>(`/endpoints/${tgt.id}/resources`).then(setRes).catch(() => setRes(null));
+  }, [tgt]);
 
   const canNext = [!!src, gateOk, !!tgt, true,
     parallel >= 1 && parallel <= 64 && (!replica || ((retention >= 1 && retention <= 100) && (!cron.trim() || !!cronOk?.valid))),
@@ -111,8 +142,12 @@ export default function Wizard() {
         const options = {
           ...(sel.length === 1 && targetName.trim() ? { target_name: targetName.trim() } : {}),
           app_consistent: appConsistent, target_options,
-          osmorph: { fstab_harden: fstabHarden, disable_periodic_fsck: fstabHarden },
-          engine: { max_parallel_disks: parallel, on_failure: onFailure, boot_check: bootCheck },
+          osmorph: { fstab_harden: fstabHarden, disable_periodic_fsck: fstabHarden,
+                     ...(offlineScript.trim() ? { offline_script: offlineScript } : {}),
+                     ...(firstbootScript.trim() ? { firstboot_script: firstbootScript } : {}) },
+          ...(pool ? { pool } : {}),
+          ...(cluster.trim() ? { cluster: cluster.trim() } : {}),
+          engine: { max_parallel_disks: parallel, on_failure: onFailure, boot_check: bootCheck, verify_full: verifyFull },
           ...(replica ? { retention } : {}),
         };
         const body = { name: names[i], source_endpoint_id: src!.id, target_endpoint_id: tgt!.id, vm, options };
@@ -229,16 +264,18 @@ export default function Wizard() {
               <div className="table-wrap" style={{ margin: 0 }}><table>
                 <thead><tr><th>Source network</th><th>Target network (name or ID)</th></tr></thead>
                 <tbody>{networks.map((n) => (<tr key={n}><td className="mono">{n}</td><td>
-                  <input type="text" value={netMap[n] ?? ""} placeholder="leave empty to use the target default"
-                         onChange={(e) => setNetMap({ ...netMap, [n]: e.target.value })} /></td></tr>))}</tbody>
+                  <Pick value={netMap[n] ?? ""} options={res?.networks} placeholder="target default"
+                        onChange={(v) => setNetMap({ ...netMap, [n]: v })} /></td></tr>))}</tbody>
               </table></div>)}
           </div>
           <div><h2>Storage and sizing</h2>
             <div className="form cols">
               <label className="field"><span>Storage pool / volume type</span>
-                <input type="text" value={storagePool} onChange={(e) => setStoragePool(e.target.value)} placeholder="target default" /></label>
+                <Pick value={storagePool} options={res?.storage} placeholder="target default" onChange={setStoragePool} /></label>
               <label className="field"><span>Flavor</span>
-                <input type="text" value={flavor} onChange={(e) => setFlavor(e.target.value)} placeholder="match source CPU/RAM" /></label>
+                <Pick value={flavor} options={res?.flavors} placeholder="auto: smallest that fits the source"
+                      label={(f) => `${f.name} (${f.vcpus ?? "?"} vCPU, ${f.ram_mb ? Math.round(f.ram_mb / 1024) : "?"} GiB)`}
+                      onChange={setFlavor} /></label>
               <label className="field"><span>Availability zone</span>
                 <input type="text" value={az} onChange={(e) => setAz(e.target.value)} placeholder="target default" /></label>
               {sel.length === 1 && <label className="field"><span>Name on target</span>
@@ -255,6 +292,23 @@ export default function Wizard() {
             <span>Harden Linux boot (fstab nofail + pass 0, no periodic fsck)<small>Avoids hours-long fsck or emergency mode on large data disks.</small></span></label>
           <label className="check"><input type="checkbox" checked={bootCheck} onChange={(e) => setBootCheck(e.target.checked)} />
             <span>Boot check after deploy<small>Watch the serial console for a login prompt.</small></span></label>
+          <label className="check"><input type="checkbox" checked={verifyFull} onChange={(e) => setVerifyFull(e.target.checked)} />
+            <span>Full checksum verification<small>SHA-256 of every byte on source and target. Reads each disk twice more; sampled checks always run.</small></span></label>
+          {pools.length > 0 && <label className="field"><span>Worker pool</span>
+            <select value={pool} onChange={(e) => setPool(e.target.value)}>
+              <option value="">any capable worker</option>
+              {pools.map((p) => <option key={p.name} value={p.name}>{p.name}{p.region ? ` (${p.region})` : ""}</option>)}
+            </select></label>}
+          <label className="field"><span>Cluster group (shared disks)</span>
+            <input type="text" value={cluster} placeholder="only for VMs that share disks, e.g. sql-cluster"
+                   onChange={(e) => setCluster(e.target.value)} />
+            <small>Give every cluster member the same group: each shared disk is copied once and attached to all of them.</small></label>
+          <label className="field"><span>Offline script (Linux, optional)</span>
+            <textarea rows={3} value={offlineScript} placeholder="#!/bin/sh — runs inside the copied disk before the VM is created"
+                      onChange={(e) => setOfflineScript(e.target.value)} /></label>
+          <label className="field"><span>First-boot script (Linux, optional)</span>
+            <textarea rows={3} value={firstbootScript} placeholder="#!/bin/sh — runs once when the migrated VM first boots"
+                      onChange={(e) => setFirstbootScript(e.target.value)} /></label>
           <div className="form cols">
             <label className="field"><span>Disks copied in parallel</span>
               <input type="number" min={1} max={64} value={parallel} onChange={(e) => setParallel(Number(e.target.value))} />
@@ -282,7 +336,8 @@ export default function Wizard() {
             <dt>To</dt><dd>{tgt?.name} <span className="tag">{tgt?.type}</span></dd>
             <dt>VMs</dt><dd>{sel.map((v, i) => <div key={v}>{v} → <code>{names[i]}</code> · {(insp[v] as Inspect).vm.disks.length} disks</div>)}</dd>
             <dt>Data</dt><dd>{totalDisks} disks, {fmt.bytes(totalBytes)}, {parallel} in parallel</dd>
-            <dt>Networks</dt><dd>{networks.map((n) => `${n} → ${netMap[n] || "default"}`).join(", ") || "—"}</dd>
+            <dt>Networks</dt><dd>{networks.map((n) => `${n} → ${res?.networks.find((r) => r.id === netMap[n])?.name
+              ?? (netMap[n] || "default")}`).join(", ") || "—"}</dd>
             <dt>Snapshot</dt><dd>{appConsistent ? "application-consistent" : "crash-consistent"}</dd>
             {replica && <><dt>Syncs</dt><dd>{cron.trim() ? <><code>{cron}</code> (UTC)</> : "manual"} · keep {retention} restore points</dd></>}
           </dl>

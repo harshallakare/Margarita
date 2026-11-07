@@ -12,6 +12,7 @@ Usage (config):
         project_id: 0123abcd...               # scope by ID (pitfall 7)
         verify_tls: false
         volume_type: vmds                     # VMDS-backed Cinder volume type
+        multiattach_volume_type: vmds-shared  # optional: type with multiattach="<is> True" (cluster shared disks)
         vstorage_mount: /mnt/vstorage
         cinder_datastore: vols/datastores/cinder   # default
         staging_dir: /var/lib/vmigrate/staging
@@ -147,6 +148,20 @@ class VhiTarget(TargetProvider):
                 "network_map": {**(self.config.get("network_map") or {}),
                                 **((spec.extra.get("target_options") or {}).get("network_map") or {})}}
 
+    # ------------------------------------------------------------------ wizard resources
+    def list_networks(self) -> list[dict[str, Any]]:
+        return sorted(({"id": n["id"], "name": n.get("name") or n["id"], "shared": bool(n.get("is_shared")),
+                        "external": bool(n.get("is_router_external"))} for n in self.api.networks()),
+                      key=lambda n: n["name"])
+
+    def list_storage(self) -> list[dict[str, Any]]:
+        return sorted(({"id": t["name"], "name": t["name"]} for t in self.api.volume_types()), key=lambda t: t["name"])
+
+    def list_flavors(self) -> list[dict[str, Any]]:
+        return sorted(({"id": f["id"], "name": f.get("name") or f["id"], "vcpus": f.get("vcpus"),
+                        "ram_mb": f.get("ram")} for f in self.api.flavors()),
+                      key=lambda f: (f.get("vcpus") or 0, f.get("ram_mb") or 0))
+
     def check_connection(self) -> list[str]:
         try:
             pid = self.api.current_project_id()
@@ -205,10 +220,19 @@ class VhiTarget(TargetProvider):
         return p
 
     # ------------------------------------------------------------------ disks
+    def supports_shared_disks(self) -> tuple[bool, str]:
+        if self.config.get("multiattach_volume_type"):
+            return True, ""
+        return False, ("vhi: set multiattach_volume_type (a Cinder volume type with multiattach=\"<is> True\") on "
+                       "the target endpoint to migrate clusters with shared disks")
+
     def create_disk(self, name: str, size_bytes: int, hints: DiskHints) -> TargetDiskRef:
         gib = round_up_gib(size_bytes)
-        self.ctx.require_execute("cinder create volume", name=name, size_gib=gib, type=self.volume_type)
-        vol = self.api.create_volume(name, gib, self.volume_type,
+        vtype = self.config.get("multiattach_volume_type") if hints.shared else self.volume_type
+        if hints.shared and not vtype:
+            raise ConfigError("vhi: shared disk requested but multiattach_volume_type is not configured")
+        self.ctx.require_execute("cinder create volume", name=name, size_gib=gib, type=vtype, shared=hints.shared)
+        vol = self.api.create_volume(name, gib, vtype,
                                      {MANAGED: "true", "vmigrate:run": self.ctx.run_id,
                                       "vmigrate:order": str(hints.order), "vmigrate:boot": str(hints.is_boot).lower()},
                                      availability_zone=self.config.get("availability_zone"))

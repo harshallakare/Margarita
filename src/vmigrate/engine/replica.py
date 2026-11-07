@@ -19,6 +19,11 @@ Sync (per execution):
     compare  no change tracking: read everything, write only chunks that differ from the replica
 Deploy: validate_endpoints (target) -> check_replica -> clone_disks -> osmorphing -> deploy_instance
         -> verify_instance -> finalize_deploy. Deploy never contacts the source.
+Cutover (planned failover, one execution): validate_endpoints -> inspect_instance -> check_cutover
+        -> shutdown_source (ONLY with shutdown_source=true; otherwise recorded as skipped and the final
+        sync is crash-consistent at its snapshot) -> the sync tasks (final, normally small, delta)
+        -> clone_disks -> osmorphing -> deploy_instance -> verify_instance -> finalize_deploy
+        -> finalize_cutover. The source is never deleted; it is left powered off when it was shut down.
 Consistency: replica disks are mid-update while a sync runs; `consistent` is False from the first
 write until finalize_sync. Deploying the latest state requires consistent=True; restore points
 (frozen copies) can be deployed at any time.
@@ -44,7 +49,7 @@ from .copier import copy_disk
 from .dag import Handler, TaskContext, TaskOutcome, TaskSpec
 from .pipeline import MigrationRunner, _ref_to_dict, _snap, _tdisk
 from .state import DiskState, MigrationState, Phase
-from .verify import check_size, compare_samples, sample_offsets
+from .verify import check_size, compare_samples, full_verify, sample_offsets
 
 
 def _gib(n: int) -> str:
@@ -82,6 +87,26 @@ def deploy_dag(dry_run: bool) -> list[TaskSpec]:
     ]
 
 
+def cutover_dag(dry_run: bool) -> list[TaskSpec]:
+    t = [TaskSpec("validate_endpoints", "validate_endpoints", label="Validate endpoints"),
+         TaskSpec("inspect_instance", "inspect_instance", ["validate_endpoints"], label="Inspect VM + disk-count gate"),
+         TaskSpec("check_cutover", "check_cutover", ["inspect_instance"], label="Check replica (initial sync done)")]
+    if dry_run:
+        return t + [TaskSpec("plan", "plan_cutover", ["check_cutover"], label="Build dry-run plan")]
+    return t + [
+        TaskSpec("shutdown_source", "shutdown_source", ["check_cutover"], label="Shut down source (opt-in)"),
+        TaskSpec("create_snapshot", "create_snapshot", ["shutdown_source"], label="Final sync: snapshot source"),
+        TaskSpec("deploy_replica_disks", "deploy_replica_disks", ["create_snapshot"], label="Final sync: replica disks"),
+        TaskSpec("finalize_sync", "finalize_sync", ["deploy_replica_disks"], label="Final sync: finalize"),
+        TaskSpec("clone_disks", "clone_disks", ["finalize_sync"], label="Clone replica disks"),
+        TaskSpec("osmorphing", "osmorphing", ["clone_disks"], label="OSMorphing"),
+        TaskSpec("deploy_instance", "deploy_instance", ["osmorphing"], label="Create VM + attach disks"),
+        TaskSpec("verify_instance", "verify_instance", ["deploy_instance"], label="Verify (counts, boot)"),
+        TaskSpec("finalize_deploy", "finalize_deploy", ["verify_instance"], label="Finalize deploy"),
+        TaskSpec("finalize_cutover", "finalize_cutover", ["finalize_deploy"], label="Finalize cutover"),
+    ]
+
+
 def delete_dag(dry_run: bool) -> list[TaskSpec]:
     t = [TaskSpec("validate_endpoints", "validate_target", label="Validate target")]
     if dry_run:
@@ -107,6 +132,7 @@ class ReplicaState:
     syncs: list[dict[str, Any]] = field(default_factory=list)
     restore_points: list[dict[str, Any]] = field(default_factory=list)
     deployments: list[dict[str, Any]] = field(default_factory=list)
+    cutovers: list[dict[str, Any]] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -298,7 +324,8 @@ class ReplicaRunner:
         with self._lock:
             self.state.consistent = False   # writes start now
         self._save()
-        children = [TaskSpec(f"replicate_disk:{d.id}", "replicate_disk", params={"disk_id": d.id}, max_attempts=3,
+        children = [TaskSpec(f"replicate_disk:{d.id}", "replicate_disk", params={"disk_id": d.id, "size_bytes": d.size_bytes},
+                             max_attempts=3,
                              label=f"Disk {d.order:02d} {d.address} ({_gib(d.size_bytes)}) · {self._mode_for(d)}")
                     for d in sorted(s.disks, key=lambda d: -d.size_bytes)]
         return TaskOutcome(children=children, message=f"{len(s.disks)} replica disks ready")
@@ -358,11 +385,21 @@ class ReplicaRunner:
                     compare.close()
         verify: dict[str, Any] = {}
         if staged is not None:
+            ctx.progress(100, "copied; verifying samples against the source", force=True)
             verify["staged_samples"] = self._verify(snap, d, RawFileReader(staged), "staged")
+        ctx.progress(100, "committing to the replica disk", force=True)
         self.target.commit_disk(ref, staged)
         back = self.target.open_disk_reader(ref)
         if back is not None:
+            ctx.progress(100, "verifying the replica disk", force=True)
             verify["target_samples"] = self._verify(snap, d, back, "committed")
+        if self.engine.verify_full:
+            with self.source.open_disk(snap, d) as src:
+                full = full_verify(src, self.target.open_disk_reader(ref), d.size_bytes, chunk=self.engine.chunk_size,
+                                   progress=lambda o, n: ctx.progress(100, f"full SHA-256 checksum {o * 100 // max(n, 1)}%"))
+            verify["full"] = full
+            if not full.get("skipped") and not full["ok"]:
+                raise VerificationError(f"disk {d.id}: full checksum mismatch after sync")
         self.target.discard_staging(ref)
         rec = {"done": True, "mode": mode, "bytes_read": stats.bytes_read, "bytes_written": stats.bytes_written,
                "bytes_unchanged": stats.bytes_unchanged, "bytes_zero_skipped": stats.bytes_zero_skipped,
@@ -540,6 +577,74 @@ class ReplicaRunner:
                 "clone_disks": clone, "osmorphing": morph, "deploy_instance": instance, "verify_instance": verify,
                 "finalize_deploy": finalize}
 
+    # ------------------------------------------------------------------ cutover
+    def cutover_handlers(self, params: dict[str, Any]) -> dict[str, Handler]:
+        """params: shutdown_source (bool, default False), force_power_off (bool), shutdown_timeout (s),
+        deploy_name, deployment_id, cutover_id."""
+        shutdown = bool(params.get("shutdown_source", False))
+        force = bool(params.get("force_power_off", False))
+        timeout = int(params.get("shutdown_timeout", 900))
+        cid: str = params.get("cutover_id") or uuid.uuid4().hex[:12]
+        dep = self.deploy_handlers({**params, "restore_point": None})
+        name = params.get("deploy_name") or f"{self.job.target_name or self.job.vm}-dr"
+        if shutdown:
+            # a powered-off guest is already consistent; quiescing (VMware tools, VSS) would fail on it
+            self.job.app_consistent = False
+
+        def record(**kw: Any) -> dict[str, Any]:
+            with self._lock:
+                c = next((x for x in self.state.cutovers if x["id"] == cid), None)
+                if c is None:
+                    c = {"id": cid, "t": time.time(), "name": name, "status": "running",
+                         "shutdown_source": shutdown, "deployment_id": self._deploy_id}
+                    self.state.cutovers.append(c)
+                c.update(kw)
+            self._save()
+            return c
+
+        def check(ctx: TaskContext) -> TaskOutcome:
+            if not self.state.syncs:
+                raise SafetyGateError("cutover needs a completed initial sync (run the replica first, so the "
+                                      "final sync during the outage only moves the last changes)")
+            if not all(self.state.disks.get(d.id, {}).get("synced") for d in self.spec().disks):
+                raise SafetyGateError("not every replica disk has completed a sync")
+            if self.target.find_vm(name) is not None and not any(
+                    d["id"] == self._deploy_id for d in self.state.deployments):
+                raise SafetyGateError(f"target already has a VM named {name!r}")
+            record()
+            last = self.state.syncs[-1]
+            return TaskOutcome(result={"last_sync": last.get("id"), "shutdown_source": shutdown},
+                               message=f"cutover to {name}; last sync {last.get('id')}")
+
+        def plan(ctx: TaskContext) -> TaskOutcome:
+            s = self.spec()
+            steps: list[dict[str, Any]] = [
+                {"action": "source.shutdown_vm", "vm": s.name, "force": force} if shutdown else
+                {"action": "source_left_running", "note": "final sync is crash-consistent; writes after its "
+                                                          "snapshot are not migrated"}]
+            steps += self._plan_sync(ctx).result["plan"]  # type: ignore[index]
+            steps += dep["plan_deploy"](ctx).result["plan"]  # type: ignore[index]
+            return TaskOutcome(result={"plan": steps}, message=f"{len(steps)} planned actions (nothing changed)")
+
+        def stop_source(ctx: TaskContext) -> TaskOutcome:
+            if not shutdown:
+                record(source="left running")
+                return TaskOutcome(message="source left running (shutdown_source not set): the final sync is "
+                                           "crash-consistent and later writes on the source are not migrated")
+            vm = self.source.find_vm(self.job.vm)
+            out = self.source.shutdown_vm(vm, force=force, timeout=timeout)
+            record(source=out)
+            return TaskOutcome(result={"source": out}, message=out)
+
+        def finalize(ctx: TaskContext) -> TaskOutcome:
+            d = next((x for x in self.state.deployments if x["id"] == self._deploy_id), {})
+            record(status="done", target_vm=d.get("target_vm"), finished=time.time())
+            return TaskOutcome(message=f"cutover complete: {name} is running on the target"
+                                       + ("; the source is powered off (not deleted)" if shutdown else ""))
+
+        return {**self.sync_handlers(), **dep, "check_cutover": check, "plan_cutover": plan,
+                "shutdown_source": stop_source, "finalize_cutover": finalize}
+
     # ------------------------------------------------------------------ delete replica disks
     def delete_handlers(self) -> dict[str, Handler]:
         def plan(ctx: TaskContext) -> TaskOutcome:
@@ -585,10 +690,15 @@ class ReplicaRunner:
         with self._lock:
             self.state.errors.append({"t": time.time(), "kind": kind, "error": error})
             self.state.errors = self.state.errors[-50:]
-            if kind == "replica_sync" and self.state.current:
+            if kind in ("replica_sync", "replica_cutover") and self.state.current:
                 self.state.current["last_error"] = error
+            if kind == "replica_cutover":
+                for c in self.state.cutovers:
+                    if c.get("status") == "running":
+                        c["status"], c["error"] = "failed", error
         self._save()
-        if kind == "replica_deploy" and hasattr(self, "_deploy_runner"):
+        if kind in ("replica_deploy", "replica_cutover") and hasattr(self, "_deploy_runner") and any(
+                d["id"] == self._deploy_id for d in self.state.deployments):
             dep = next((d for d in self.state.deployments if d["id"] == self._deploy_id), None)
             if dep is not None:
                 dep["status"] = "failed"

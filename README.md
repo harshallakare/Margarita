@@ -102,8 +102,19 @@ creates `/etc/margarita/{secret.key,margarita.env}` and `/var/lib/margarita`, an
 random password (printed once, saved to `/root/margarita-admin-password`). It then starts three systemd services
 and waits for `/health`. The API and conductor run as user `margarita`; the worker runs as root because it writes
 VHI vStorage backings and uses mounts, qemu-img and ssh. Options: `--port`, `--bind`, `--branch`, `--db-url`
-(Postgres), `--full` (nbdkit, guestfish, cifs-utils), `--no-web`, `--no-systemd`. Re-running is safe: the key,
-config and users are kept.
+(Postgres), `--full` (nbdkit, guestfish, virt-v2v, virtio-win on RHEL, cifs-utils), `--no-web`, `--no-systemd`.
+Re-running is safe: the key, config and users are kept.
+
+Multi-site and worker options:
+
+| Option | Effect |
+|---|---|
+| `--role all\|server\|worker` | `server` = API + conductor; `worker` = worker only, joining a central server (needs `--db-url postgresql+psycopg://…` and `--secret-key-file`) |
+| `--region NAME` | the worker only takes jobs for endpoints in that region |
+| `--worker-tags a,b` | extra capability tags (`vstorage`, `site-a`, …) that endpoints can require |
+| `--pool NAME` | join worker pool NAME (tag `pool:NAME`) |
+| `--enroll URL --enroll-token T` | join as a pool worker with a single-use token: fetches DB URL, secret key, region and pool from `URL/enroll` over HTTPS |
+| `--export-agent PORT` | also run the export agent (HTTPS, self-signed cert pinned by peers) that serves this site's source disks to other sites; needs `--region` |
 
 **Back up `/etc/margarita/secret.key`.** Without it, stored endpoint credentials cannot be decrypted.
 
@@ -209,6 +220,86 @@ by each migration's dry-run/preflight on the worker. The endpoint page's **Test*
 Roles: `viewer` can read. `operator` can also manage endpoints and migrations and start, cancel or retry executions.
 `admin` can also manage users and sees every project. Credentials are encrypted at rest and never returned; the API
 rejects secret-looking keys in `config`.
+
+## Coriolis-parity features (cross-site, pools, clusters, cutover, OSMorphing)
+
+Everything below is tested against fakes and local files only. None of it has run on real infrastructure yet.
+
+**Worker routing.** Each worker reports its region and capabilities: `provider:<type>` for importable SDKs,
+`tool:<name>` for qemu-img, iscsiadm, ssh, virt-v2v-in-place and similar tools, plus `vstorage`, `root` and
+operator tags. An endpoint's `region` and `required_tags` decide which workers may run its jobs. A queued job
+that no worker can run shows why on the execution page.
+
+**Cross-site transfers.** When the source and target endpoints are in different regions, the job runs at the
+target site. Every source call is forwarded to an **export agent** at the source site
+(`vmigrate-platform export-agent`, or `deploy.sh --export-agent 8443`). The agent runs the real source
+provider, so snapshots, iSCSI sessions and safety checks stay at the source. It streams snapshot disks over
+HTTPS, skipping zero blocks and compressing with zlib.
+- Requests are HMAC-signed with a key derived from the shared secret key, and replays are refused after 5 minutes.
+- The agent's self-signed certificate is pinned by its SHA-256 fingerprint, published through the workers table.
+- Plain HTTP is refused.
+- Replica deploys never contact the source site, so a failover works while the source is down.
+
+**Worker pools.** These are named groups of workers (tag `pool:<name>`). A migration with `options.pool`
+runs only on that pool, in the pool's region. Settings → Worker pools creates single-use **enrollment tokens**:
+- A new host runs `deploy.sh --enroll https://<api> --enroll-token …` and receives the DB URL and secret key over HTTPS.
+- Enrollment needs Postgres. It refuses plain HTTP unless `VMIGRATE_ALLOW_HTTP_ENROLL=1` is set (lab only).
+- With `provision` set (VHI/OpenStack endpoint, image, flavor, network, `api_url`), the conductor boots minion
+  VMs up to `min_size`, never more than `max_size`. Their cloud-init carries only an enrollment token.
+- Minions are never deleted automatically. Use `DELETE /pools/{id}/minions/{server}`.
+
+**Replica cutover.** Use `POST /replicas/{id}/cutover` (or the replica page's Cutover… button). It optionally
+shuts the source VM down, then runs a final delta sync and deploys from it in one execution.
+- Shutting down the source happens **only** when `shutdown_source` is true. It is the only source-state change
+  Margarita makes. `force_power_off` does a hard power-off instead of a guest shutdown.
+- Implemented for Nutanix, VMware, Hyper-V, Proxmox, OpenStack, AWS and physical servers.
+
+**Full checksum verification.** The `engine.verify_full` option (wizard → Options) adds a SHA-256 of every byte
+on the source snapshot and the committed target disk, on top of the sampled checks. A mismatch fails the disk.
+
+**Linux OSMorphing** (KVM targets, offline with guestfish):
+- OS detection.
+- virtio initramfs.
+- Network config: MACs are rewritten when known (`preserve_mac`, `osmorph.mac_map`), otherwise unpinned in
+  ifcfg, NetworkManager and netplan. udev persistent-net rules are dropped.
+- VMware, Hyper-V and Azure tools are removed; qemu-guest-agent is installed at first boot.
+- fstab `/dev/sdX` entries become `UUID=`, plus nofail. Periodic fsck is disabled.
+- SELinux `/.autorelabel` is set.
+- Operator scripts:
+  - offline scripts run inside the image;
+  - first-boot scripts run once through a self-disabling systemd unit (log: `/var/log/vmigrate-firstboot.log`).
+
+**Windows OSMorphing** calls `virt-v2v-in-place` (or `virt-v2v --in-place`) with virtio-win drivers
+(`osmorph.virtio_win`, `$VIRTIO_WIN` or `/usr/share/virtio-win`).
+- Static IPs are re-applied through `osmorph.windows_ip`.
+- An optional first-boot script is installed with `virt-customize --firstboot`.
+- Without these tools the step is manual and the run stops before VM creation.
+
+**Physical Linux servers (P2V).** Endpoint type `physical`, over SSH with a pinned host key; needs python3 on
+the server.
+- `mode: cold`: the server runs a rescue ISO, and raw disks are read only when nothing on them is mounted read-write.
+- `mode: lvm-snapshot`: the server stays live.
+  - Each mounted LV gets an LVM snapshot, and plain partitions such as `/boot` are remounted read-only.
+  - Each disk image is composed on the fly: LV extents come from the snapshots, and the PV metadata from a copy
+    taken before the snapshots.
+  - Thin, RAID or cache LVs, md, LUKS, and a root filesystem on a plain partition are refused.
+
+**Shared-disk clusters.** Give every member the same `options.cluster`. Each shared disk (VMware multi-writer,
+OpenStack or AWS multi-attach) is copied **once** by the first member to claim it, into a multi-attach target
+volume (VHI: `multiattach_volume_type`). Every member then attaches that volume. Members wait for shared disks
+only after their own disks are done, so two members cannot deadlock. A VM with shared disks and no cluster is
+refused.
+- vSphere cannot snapshot multi-writer disks; such VMs get a clear refusal.
+- Hyper-V shared VHDX stays refused, because checkpoints exclude it.
+
+**Extra transports.**
+- VMware `transport: openvix` uses Cloudbase's [OpenVixDiskLib](https://github.com/cloudbase/OpenVixDiskLib)
+  over NFC. It needs vSphere 8 and no VDDK. It is an external library installed separately; its license file is
+  ambiguous, so check it before redistributing.
+- Hyper-V `rct_service_url` uses Cloudbase's [rct-service](https://github.com/cloudbase/rct-service)
+  (Apache-2.0) on the host. It provides disk reads and RCT changed ranges over HTTPS, so no SMB/CSV share
+  mounts are needed.
+- Both APIs were taken from their published source and are used as documented, not copied.
 
 ## Repository layout
 
@@ -518,14 +609,16 @@ on the volume keys for encrypted volumes. **Costs:** AWS bills EBS direct API re
 | source | Proxmox VE (qemu VMs) | **implemented**. Tested against a fake PVE API and node shell (with a real NBD read path); not yet run against a cluster. |
 | source | OpenStack (Nova + Cinder; Ceph or any backend) | **implemented**. Tested against a fake cloud only; not yet run against a real deployment. |
 | source | AWS EC2 (EBS-backed instances) | **implemented**. Tested against a fake EC2/EBS only; not yet run against an AWS account. |
+| source | Physical Linux server (P2V over SSH: cold or live LVM-snapshot) | **implemented**. Tested against a scripted shell and real local files; not yet run on hardware. |
+| source | Any of the above at another site | **implemented** through the export agent (cross-site). |
 | source | Azure | planned (interface-ready) |
 | target | Virtuozzo VHI | **implemented** (reference) |
 | target | OpenStack, Proxmox VE, Nutanix AHV, VMware vSphere, AWS, Azure | planned |
 
 | OSMorph | KVM family | VMware | AWS | Azure |
 |---|---|---|---|---|
-| Linux | **auto**: no injection when the guest already boots from virtio on the same bus (AHV). Otherwise (VMware pvscsi/LSI, unknown controller, bus change), virtio is injected offline with guestfish (dracut or update-initramfs, then verified). fstab and tune2fs hardening. Without guestfish this is **manual**. | manual | manual | manual |
-| Windows | manual | manual | manual | manual |
+| Linux | **auto**: no injection when the guest already boots from virtio on the same bus (AHV). Otherwise (VMware pvscsi/LSI, unknown controller, bus change), virtio is injected offline with guestfish (dracut or update-initramfs, then verified). Also: OS detection, network MAC handling, hypervisor-tool swap, fstab UUID/nofail, tune2fs, SELinux relabel, offline + first-boot scripts. Without guestfish this is **manual**. | manual | manual | manual |
+| Windows | **auto** with virt-v2v-in-place + virtio-win on the worker (drivers, tool removal, static IPs, first-boot script); otherwise manual | manual | manual | manual |
 
 A "manual" cell stops the run before VM creation unless `osmorph.allow_manual: true` is set, and the
 report says so in bold. Run `vmigrate matrix` for the live view.
@@ -540,5 +633,7 @@ place, plus range math in `src/vmigrate/core/ranges.py`. Orchestration of delta 
 | Replica mode: incremental sync (full / cbt / compare), deploy from latest or restore point, schedules, retention, delete-disks | **done** (fake + VHI; VHI without restore points) |
 | Nutanix change tracking (CRT) for replicas | planned; Nutanix replicas use `compare` |
 | Web UI: endpoints, wizard, live progress, reports, settings | **done** |
-| Worker/minion pools, OIDC/Keystone identity, metrics | planned (build step 7) |
+| Worker routing (regions, capabilities), worker pools, enrollment tokens, auto-provisioned minions (VHI/OpenStack) | **done** (fakes only) |
+| Cross-site export agent, replica cutover, full checksum verification, shared-disk clusters | **done** (fakes only) |
+| OIDC/Keystone identity, metrics | planned |
 | RabbitMQ/Redis queue backend | optional; the DB queue sits behind the same claim/renew calls |

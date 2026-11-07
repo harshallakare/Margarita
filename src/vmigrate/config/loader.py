@@ -89,6 +89,7 @@ class EngineConfig:
     on_failure: str = "keep"     # keep (resume later) | cleanup (delete what this run created on target)
     boot_check: bool = True
     boot_timeout: int = 900
+    verify_full: bool = False          # full-disk SHA-256 of source snapshot vs committed target (2x reads)
 
 
 @dataclass
@@ -102,6 +103,7 @@ class MigrationConfig:
     target_options: dict[str, Any] = field(default_factory=dict)
     osmorph: dict[str, Any] = field(default_factory=dict)
     app_consistent: bool | None = None
+    cluster: str | None = None       # cluster group: shared disks are copied once and attached to every member
 
 
 @dataclass

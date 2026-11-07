@@ -12,9 +12,21 @@
 #   --branch NAME       git branch to deploy (default main)
 #   --repo URL          git repository (default https://github.com/harshallakare/Margarita.git)
 #   --db-url URL        database (default sqlite:////var/lib/margarita/platform.db; postgresql+psycopg://... for HA)
-#   --full              also install nbdkit, libguestfs-tools, cifs-utils (VMware VDDK reads, OSMorph, Hyper-V shares)
+#   --full              also install nbdkit, libguestfs-tools, virt-v2v, virtio-win (RHEL), cifs-utils
+#                       (VMware VDDK reads, Linux + Windows OSMorph, Hyper-V shares)
 #   --no-web            skip building the web UI (API only)
 #   --no-systemd        install everything but do not create/start services (containers, CI)
+#   --role ROLE         all (default) | server (api + conductor) | worker (worker only: joins a central
+#                       server; needs --db-url postgresql+psycopg://... and --secret-key-file)
+#   --region NAME       this worker's region/site (routing: it only takes jobs for that region)
+#   --worker-tags LIST  extra worker capability tags, comma-separated (e.g. vstorage,site-a)
+#   --secret-key-file F copy the central server's secret.key (required for --role worker)
+#   --pool NAME         join worker pool NAME (adds the worker tag pool:NAME)
+#   --enroll URL        join a central server as a worker with a single-use token (with --enroll-token):
+#                       fetches the database URL, secret key, region and pool from URL/enroll over HTTPS
+#   --enroll-token T    the token from the UI (Settings > Worker pools) or POST /pools/{id}/enroll-token
+#   --export-agent PORT also run the export agent (HTTPS on PORT, self-signed cert pinned by peers):
+#                       serves this site's source disks to workers at other sites (needs --region)
 #   -h | --help
 #
 # What it does (idempotent — safe to re-run; never overwrites the secret key or existing users):
@@ -39,6 +51,14 @@ DB_URL=""
 FULL=0
 WEB=1
 SYSTEMD=1
+ROLE="all"
+EXPORT_PORT=""
+POOL=""
+ENROLL_URL=""
+ENROLL_TOKEN=""
+REGION=""
+WORKER_TAGS=""
+KEY_FILE=""
 PREFIX="/opt/margarita"
 APP="$PREFIX/app"
 VENV="$PREFIX/venv"
@@ -64,12 +84,35 @@ while [ $# -gt 0 ]; do
     --full) FULL=1; shift ;;
     --no-web) WEB=0; shift ;;
     --no-systemd) SYSTEMD=0; shift ;;
+    --role) ROLE="$2"; shift 2 ;;
+    --region) REGION="$2"; shift 2 ;;
+    --export-agent) EXPORT_PORT="$2"; shift 2 ;;
+    --pool) POOL="$2"; shift 2 ;;
+    --enroll) ENROLL_URL="$2"; shift 2 ;;
+    --enroll-token) ENROLL_TOKEN="$2"; shift 2 ;;
+    --worker-tags) WORKER_TAGS="$2"; shift 2 ;;
+    --secret-key-file) KEY_FILE="$2"; shift 2 ;;
     -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
 done
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo bash $0)"
+case "$ROLE" in all|server|worker) ;; *) die "--role must be all, server or worker" ;; esac
+if [ -n "$EXPORT_PORT" ]; then
+  [ -n "$REGION" ] || die "--export-agent needs --region (peers find the agent by its region)"
+  [ "$ROLE" != server ] || die "--export-agent runs next to a worker: use --role all or worker"
+fi
+if [ -n "$ENROLL_URL" ] || [ -n "$ENROLL_TOKEN" ]; then
+  [ -n "$ENROLL_URL" ] && [ -n "$ENROLL_TOKEN" ] || die "--enroll and --enroll-token go together"
+  [ -f /etc/margarita/install.conf ] && die "this host already runs Margarita; enrollment is for new workers"
+  ROLE=worker
+fi
+if [ "$ROLE" = worker ] && [ -z "$ENROLL_URL" ]; then
+  WEB=0
+  case "$DB_URL" in postgres*) ;; *) [ -f /etc/margarita/margarita.env ] || die "--role worker needs --db-url postgresql+psycopg://... (the central database)" ;; esac
+  [ -n "$KEY_FILE" ] || [ -s /etc/margarita/secret.key ] || die "--role worker needs --secret-key-file (copy of the server's /etc/margarita/secret.key)"
+fi
 [ "$(uname -s)" = "Linux" ] || die "Linux only"
 case "$PORT" in ''|*[!0-9]*) die "--port must be a number" ;; esac
 
@@ -112,6 +155,8 @@ if [ "$PM" = apt ]; then
   pkg_install optional $(missing qemu-img:qemu-utils iscsiadm:open-iscsi)
   # shellcheck disable=SC2046
   [ $FULL -eq 1 ] && pkg_install optional $(missing nbdkit:nbdkit guestfish:libguestfs-tools mount.cifs:cifs-utils)
+  # shellcheck disable=SC2046
+  [ $FULL -eq 1 ] && pkg_install optional $(missing virt-v2v:virt-v2v)
 else
   # shellcheck disable=SC2046
   pkg_install required ca-certificates $(missing git:git curl:curl tar:tar xz:xz ssh:openssh-clients python3:python3)
@@ -119,6 +164,41 @@ else
   pkg_install optional $(missing qemu-img:qemu-img iscsiadm:iscsi-initiator-utils)
   # shellcheck disable=SC2046
   [ $FULL -eq 1 ] && pkg_install optional $(missing nbdkit:nbdkit guestfish:libguestfs-tools mount.cifs:cifs-utils)
+  # shellcheck disable=SC2046
+  [ $FULL -eq 1 ] && pkg_install optional $(missing virt-v2v:virt-v2v)
+  # Windows OSMorphing drivers (RHEL AppStream; elsewhere download virtio-win.iso and set VIRTIO_WIN)
+  [ $FULL -eq 1 ] && [ ! -e /usr/share/virtio-win ] && pkg_install optional virtio-win
+fi
+
+# ------------------------------------------------------------------ 1b. enrollment (new pool workers)
+if [ -n "$ENROLL_URL" ]; then
+  WEB=0
+  log "enrolling with $ENROLL_URL"
+  ENROLL_JSON=$(umask 077 && mktemp)
+  ENROLL_KEY=$(umask 077 && mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$ENROLL_JSON' '$ENROLL_KEY'" EXIT
+  python3 - "$ENROLL_URL" "$ENROLL_TOKEN" "$(hostname 2>/dev/null || cat /etc/hostname)" "$ENROLL_JSON" <<'PYEOF' || die "enrollment failed (see above)"
+import json, sys, urllib.request, urllib.error
+url, tok, host, out = sys.argv[1].rstrip("/") + "/enroll", sys.argv[2], sys.argv[3], sys.argv[4]
+req = urllib.request.Request(url, data=json.dumps({"token": tok, "hostname": host}).encode(),
+                             headers={"Content-Type": "application/json"})
+try:
+    body = urllib.request.urlopen(req, timeout=60).read()
+except urllib.error.HTTPError as e:
+    print(f"enroll: HTTP {e.code}: {e.read().decode(errors='replace')[:300]}", file=sys.stderr); sys.exit(1)
+open(out, "wb").write(body)
+PYEOF
+  DB_URL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["database_url"])' "$ENROLL_JSON")
+  python3 -c 'import json,sys; open(sys.argv[2],"w").write(json.load(open(sys.argv[1]))["secret_key"])' "$ENROLL_JSON" "$ENROLL_KEY"
+  KEY_FILE="$ENROLL_KEY"
+  [ -n "$REGION" ] || REGION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("region") or "")' "$ENROLL_JSON")
+  ETAGS=$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1])).get("tags") or []))' "$ENROLL_JSON")
+  [ -n "$ETAGS" ] && WORKER_TAGS="${WORKER_TAGS:+$WORKER_TAGS,}$ETAGS"
+  log "enrolled: region ${REGION:-none}, tags ${ETAGS:-none}"
+fi
+if [ -n "$POOL" ]; then
+  WORKER_TAGS="${WORKER_TAGS:+$WORKER_TAGS,}pool:$POOL"
 fi
 
 # Nutanix iSCSI transport: the initiator daemon must run on workers (no-op without systemd/iscsiadm)
@@ -195,7 +275,10 @@ mkdir -p "$ETC" "$DATA/reports"
 chown root:"$SVC_USER" "$ETC"; chmod 0750 "$ETC"
 chown "$SVC_USER":"$SVC_USER" "$DATA" "$DATA/reports"
 chmod 2770 "$DATA" "$DATA/reports"           # setgid: root-written files (worker) stay group-writable
-if [ ! -s "$ETC/secret.key" ]; then
+if [ -n "$KEY_FILE" ] && [ ! -s "$ETC/secret.key" ]; then
+  log "installing the shared secret-store key from $KEY_FILE"
+  (umask 077 && cp "$KEY_FILE" "$ETC/secret.key")
+elif [ ! -s "$ETC/secret.key" ]; then
   log "generating secret-store key $ETC/secret.key (BACK THIS UP: without it stored credentials are unreadable)"
   (umask 077 && "$VENV/bin/vmigrate-platform" gen-key > "$ETC/secret.key")
 else
@@ -217,6 +300,12 @@ EOF
 else
   log "keeping existing $ETC/margarita.env"
 fi
+set_env() {   # set_env KEY VALUE  (replace or append in margarita.env)
+  if grep -q "^$1=" "$ETC/margarita.env"; then sed -i "s|^$1=.*|$1=$2|" "$ETC/margarita.env"
+  else echo "$1=$2" >> "$ETC/margarita.env"; fi
+}
+[ -n "$REGION" ] && set_env VMIGRATE_WORKER_REGION "$REGION"
+[ -n "$WORKER_TAGS" ] && set_env VMIGRATE_WORKER_TAGS "$WORKER_TAGS"
 chown root:"$SVC_USER" "$ETC/margarita.env"; chmod 0640 "$ETC/margarita.env"
 
 cat > "$ETC/install.conf" <<EOF
@@ -231,6 +320,8 @@ BRANCH=$BRANCH
 WEB=$WEB
 SYSTEMD=$SYSTEMD
 SVC_USER=$SVC_USER
+ROLE=$ROLE
+EXPORT_PORT=$EXPORT_PORT
 EOF
 
 # ------------------------------------------------------------------ 5. schema + admin user
@@ -246,7 +337,8 @@ log "initializing database schema"
 run_as_svc init-db >/dev/null
 
 ADMIN_FILE="/root/margarita-admin-password"
-has_admin=$( set -a; . "$ETC/margarita.env"; set +a; "$VENV/bin/python" - <<'PY'
+NEW_ADMIN=0
+[ "$ROLE" = worker ] && has_admin=skip || has_admin=$( set -a; . "$ETC/margarita.env"; set +a; "$VENV/bin/python" - <<'PY'
 from vmigrate.platform.factory import Services
 from vmigrate.platform.settings import Settings
 print(Services.from_settings(Settings.from_env()).repo.count_users())
@@ -292,16 +384,35 @@ EOF
   unit margarita-conductor "Margarita conductor" "$SVC_USER" "$VENV/bin/vmigrate-platform conductor" yes
   unit margarita-worker "Margarita worker (runs migrations; root for host storage access)" root \
        "$VENV/bin/vmigrate-platform worker" no
+  case "$ROLE" in
+    all) UNITS="margarita-api margarita-conductor margarita-worker" ;;
+    server) UNITS="margarita-api margarita-conductor" ;;
+    worker) UNITS="margarita-worker" ;;
+  esac
+  if [ -n "$EXPORT_PORT" ]; then
+    unit margarita-export "Margarita export agent (serves source disks to other sites, HTTPS :$EXPORT_PORT)" root \
+         "$VENV/bin/vmigrate-platform export-agent --port $EXPORT_PORT" no
+    UNITS="$UNITS margarita-export"
+    log "export agent on :$EXPORT_PORT — open this port to the other sites' workers only"
+  fi
   systemctl daemon-reload
-  systemctl enable --quiet margarita-api margarita-conductor margarita-worker
-  systemctl restart margarita-api margarita-conductor margarita-worker
-  log "waiting for the API on port $PORT"
+  # shellcheck disable=SC2086
+  systemctl enable --quiet $UNITS
+  # shellcheck disable=SC2086
+  systemctl restart $UNITS
   ok=0
-  for _ in $(seq 1 60); do
-    if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then ok=1; break; fi
-    sleep 1
-  done
-  [ $ok -eq 1 ] || die "API did not become healthy; check: journalctl -u margarita-api -n 50"
+  if [ "$ROLE" = worker ]; then
+    log "waiting for the worker service"
+    for _ in $(seq 1 30); do systemctl is-active --quiet margarita-worker && { ok=1; break; }; sleep 1; done
+    [ $ok -eq 1 ] || die "worker did not start; check: journalctl -u margarita-worker -n 50"
+  else
+    log "waiting for the API on port $PORT"
+    for _ in $(seq 1 60); do
+      if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then ok=1; break; fi
+      sleep 1
+    done
+    [ $ok -eq 1 ] || die "API did not become healthy; check: journalctl -u margarita-api -n 50"
+  fi
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     warn "firewalld is active; to allow remote access: firewall-cmd --permanent --add-port=$PORT/tcp && firewall-cmd --reload"
   elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -315,7 +426,7 @@ trap - ERR
 HOST_IP="$( { hostname -I 2>/dev/null || ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="src") print $(i+1)}' \
             || awk '/32 host/ {print f} {f=$2}' /proc/net/fib_trie 2>/dev/null | grep -v '^127\.'; } | awk 'NF {print $1; exit}' || true )"
 echo
-log "Margarita is installed ($(git -C "$APP" rev-parse --short HEAD) on $BRANCH)"
+log "Margarita ($ROLE) is installed ($(git -C "$APP" rev-parse --short HEAD) on $BRANCH)${REGION:+, region $REGION}"
 echo "    UI:        http://${HOST_IP:-<this-host>}:$PORT/ui/"
 echo "    API docs:  http://${HOST_IP:-<this-host>}:$PORT/docs"
 if [ "$NEW_ADMIN" = "1" ]; then

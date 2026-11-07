@@ -30,6 +30,34 @@ def _services():
     return Services.from_settings(Settings.from_env())
 
 
+def _export_agent(svc, args) -> int:  # noqa: ANN001
+    import socket
+
+    import uvicorn
+
+    from ..export.agent import ExportAgent, cert_fingerprint, ensure_self_signed, heartbeat_loop, make_agent_app
+    from ..export.codec import derive_key
+    host = socket.getfqdn()
+    tls = svc.settings.data_dir / "export-tls"
+    cert, key = args.cert or str(tls / "cert.pem"), args.key or str(tls / "key.pem")
+    if not args.cert:
+        ensure_self_signed(cert, key, host)
+    url = args.url or f"https://{host}:{args.port}"
+    k = derive_key(svc.settings.secret_key)
+    agent = ExportAgent(svc, k)
+    stop = threading.Event()
+    region = os.environ.get("VMIGRATE_WORKER_REGION") or None
+    threading.Thread(target=heartbeat_loop, name="export-heartbeat", daemon=True,
+                     kwargs={"services": svc, "agent": agent, "agent_id": f"export-{host}-{args.port}", "url": url,
+                             "fingerprint": cert_fingerprint(cert), "region": region, "stop": stop}).start()
+    logging.getLogger("vmigrate.export").info("export agent %s (region %s, cert sha256 %s)", url, region,
+                                              cert_fingerprint(cert))
+    uvicorn.run(make_agent_app(svc, k, agent), host=args.host, port=args.port, ssl_certfile=cert, ssl_keyfile=key,
+                log_level=args.log_level.lower())
+    stop.set()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="vmigrate-platform")
     ap.add_argument("--log-level", default=os.environ.get("VMIGRATE_LOG_LEVEL", "INFO"))
@@ -48,6 +76,12 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("conductor")
     w = sub.add_parser("worker")
     w.add_argument("--id")
+    ea = sub.add_parser("export-agent", help="serve this site's source disks to workers at other sites (HTTPS)")
+    ea.add_argument("--host", default="0.0.0.0")
+    ea.add_argument("--port", type=int, default=8443)
+    ea.add_argument("--url", help="URL other sites use (default https://<hostname>:<port>)")
+    ea.add_argument("--cert", help="TLS certificate (default: self-signed in <data_dir>/export-tls/, pinned by peers)")
+    ea.add_argument("--key")
     args = ap.parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)-7s %(name)s [%(threadName)s] %(message)s")
 
@@ -84,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         from ..worker.service import Worker
         Worker(svc, args.id).run_forever()
         return 0
+    if args.cmd == "export-agent":
+        return _export_agent(svc, args)
     import uvicorn
 
     from ..api.app import create_app

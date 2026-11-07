@@ -101,7 +101,8 @@ def to_vmspec(server: Mapping[str, Any], attachments: list[dict[str, Any]], volu
         if v is None:
             raise OpenstackMappingError(f"{name}: attached volume {a['volume_id']} is not visible in Cinder "
                                         "(other project? use an admin/project-scoped account)")
-        rows.append({"id": v["id"], "device": a.get("device"), "size": int(v["size"]) * GIB, "kind": "volume"})
+        rows.append({"id": v["id"], "device": a.get("device"), "size": int(v["size"]) * GIB, "kind": "volume",
+                     "multiattach": bool(v.get("multiattach"))})
     if not rows:
         raise OpenstackMappingError(f"{name}: server has no disks")
     rows.sort(key=lambda r: device_key(r["device"]))
@@ -109,7 +110,8 @@ def to_vmspec(server: Mapping[str, Any], attachments: list[dict[str, Any]], volu
     bus, ctrl = bus_and_controller(image_props)
     disks = [DiskSpec(id=r["id"], bus=bus, size_bytes=r["size"], order=i, is_boot=r["id"] == boot, bus_index=i,
                       label=(r["device"] or f"disk{i}").removeprefix("/dev/"), controller=ctrl,
-                      source_handle={"kind": r["kind"], "device": r["device"], "volume_id": r["id"] if r["kind"] == "volume" else None})
+                      source_handle={"kind": r["kind"], "device": r["device"], "volume_id": r["id"] if r["kind"] == "volume" else None},
+                      shared_id=r["id"] if r.get("multiattach") else None)
              for i, r in enumerate(rows)]
     vif = str(image_props.get("hw_vif_model") or "virtio")
     nics = [NicSpec(id=n.get("port_id") or f"nic{i}", network=n.get("network") or "", mac=n.get("mac"), model=vif)

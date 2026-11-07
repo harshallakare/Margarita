@@ -217,7 +217,7 @@ def test_dead_worker_lease_expiry_requeues_and_resumes(plat):
     xid = plat.c.post(f"/migrations/{mid}/start", headers=plat.admin, json={"dry_run": False}).json()["id"]
     plat.conductor.tick()
     repo = plat.svc.repo
-    assert repo.claim_execution("crashed-worker", lease_s=-1) == xid  # claimed, lease already expired
+    assert repo.claim_execution("crashed-worker", lease_s=-1, caps={"provider:fake"}) == xid  # lease already expired
     store = SqlTaskStore(repo, xid)
     t = store.load_tasks()[0]
     t.status = TaskStatus.RUNNING
@@ -260,3 +260,18 @@ def test_provider_form_fields_and_static_ui(tmp_path):
     assert "<title>vmigrate</title>" in c.get("/ui/migrations/abc").text      # SPA fallback
     assert "nope" not in c.get("/ui/../secret.txt").text                      # no path traversal
     assert "nope" not in c.get("/ui/%2e%2e/secret.txt").text
+
+
+def test_execution_transfer_bytes(plat):
+    src, tgt = plat.endpoints()
+    mid = plat.migration(src, tgt)
+    xid = plat.c.post(f"/migrations/{mid}/start", headers=plat.admin, json={"dry_run": False}).json()["id"]
+    plat.drive()
+    x = plat.c.get(f"/executions/{xid}", headers=plat.admin).json()
+    t = x["transfer"]
+    assert x["status"] == "completed" and t["disks"] == t["disks_done"] == 13
+    assert t["total_bytes"] == t["done_bytes"] == 13 * 9 * (1 << 20)          # fake_vm: 13 x 9 MiB
+    listed = plat.c.get("/migrations", headers=plat.admin).json()[0]["last_execution"]["transfer"]
+    assert listed == t
+    tasks = plat.c.get(f"/executions/{xid}/tasks", headers=plat.admin).json()
+    assert all(tk["params"]["size_bytes"] == 9 << 20 for tk in tasks if tk["kind"] == "replicate_disk")

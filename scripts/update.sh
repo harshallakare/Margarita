@@ -112,7 +112,12 @@ if [ $FORCE -eq 0 ]; then
 fi
 
 # ------------------------------------------------------------------ apply
-SERVICES="margarita-api margarita-conductor margarita-worker"
+case "${ROLE:-all}" in
+  server) SERVICES="margarita-api margarita-conductor" ;;
+  worker) SERVICES="margarita-worker" ;;
+  *) SERVICES="margarita-api margarita-conductor margarita-worker" ;;
+esac
+[ -n "${EXPORT_PORT:-}" ] && SERVICES="$SERVICES margarita-export"
 node_dir() {
   if command -v node >/dev/null 2>&1 && node -e 'process.exit(+process.versions.node.split(".")[0] >= 18 ? 0 : 1)'; then
     dirname "$(command -v node)"
@@ -152,10 +157,12 @@ apply() {   # apply <commit> <rebuild-web 0|1>
 
 healthy() {
   [ "$SYSTEMD" = "1" ] || return 0
+  # shellcheck disable=SC2086
   systemctl restart $SERVICES
   for _ in $(seq 1 60); do
-    if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 \
-       && systemctl is-active --quiet margarita-conductor && systemctl is-active --quiet margarita-worker; then
+    local all_up=1 s
+    for s in $SERVICES; do systemctl is-active --quiet "$s" || all_up=0; done
+    if [ $all_up -eq 1 ] && { [ "${ROLE:-all}" = worker ] || curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; }; then
       return 0
     fi
     sleep 1

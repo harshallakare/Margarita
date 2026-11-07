@@ -172,6 +172,14 @@ class ProxmoxSource(SourceProvider):
         d = self._get(vm.id)
         return mapping.crosscheck(d["cfg"], d["content"], d["vmid"])
 
+    def shutdown_vm(self, vm: VmRef, *, force: bool = False, timeout: int = 900) -> str:
+        d = self._get(vm.id)
+        if self.api.status(d["node"], d["vmid"]) == "stopped":
+            return f"{vm.name} already stopped"
+        self.ctx.require_execute("proxmox shutdown", vm=vm.name, vmid=d["vmid"], force=force)
+        self.api.shutdown(d["node"], d["vmid"], force=force, timeout=timeout)
+        return f"{vm.name} {'stopped (hard)' if force else 'shut down'}"
+
     def create_snapshot(self, vm: VmRef, app_consistent: bool) -> SnapshotRef:
         d = self._get(vm.id)
         for disk in mapping.config_disks(d["cfg"]):

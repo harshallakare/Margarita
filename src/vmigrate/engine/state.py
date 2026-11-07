@@ -61,6 +61,7 @@ class DiskState:
     staged_path: str | None = None
     copy_stats: dict[str, Any] | None = None
     verify: dict[str, Any] | None = None
+    shared_owner: str | None = None      # cluster shared disk: the migration that copies it
 
 
 @dataclass

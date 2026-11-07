@@ -21,8 +21,9 @@ from typing import Any
 from ..db.repo import Repo, SqlTaskStore
 from ..engine.dag import ExecStatus, TaskRecord, TaskStatus, reset_for_resume, validate_graph
 from ..core.cron import Cron, CronError
+from ..core.routing import Requirement, requirements, waiting_reason
 from ..engine.flows import migration_dag
-from ..engine.replica import delete_dag, deploy_dag, sync_dag
+from ..engine.replica import cutover_dag, delete_dag, deploy_dag, sync_dag
 from ..platform.factory import Services
 
 log = logging.getLogger("vmigrate.conductor")
@@ -31,7 +32,7 @@ S = ExecStatus
 
 
 DAGS = {"migration": migration_dag, "replica_sync": sync_dag, "replica_deploy": deploy_dag,
-        "replica_delete": delete_dag}
+        "replica_delete": delete_dag, "replica_cutover": cutover_dag}
 
 
 def build_dag(kind: str, dry_run: bool) -> list[TaskRecord]:
@@ -120,10 +121,23 @@ class Conductor:
                 continue
             if not repo.list_tasks(xid):
                 repo.insert_tasks(xid, recs)
+            req = self._requirements(ex)
+            if req is not None:
+                repo.set_execution(xid, region=req.region, required_caps=req.to_dict())
             if repo.transition(xid, (S.PENDING.value,), S.QUEUED.value):
                 stats["queued"] += 1
                 repo.add_event("execution.queued", {"tasks": len(recs), "dry_run": ex["dry_run"]},
                                execution_id=xid, migration_id=ex["migration_id"])
+        # 1b) explain QUEUED work no live worker can run (region / capabilities)
+        alive_after = time.time() - 3 * self.svc.settings.lease_seconds
+        workers = repo.list_workers()
+        for ex in repo.list_executions(status=S.QUEUED.value):
+            why = waiting_reason(workers, ex.get("required_caps"), alive_after)
+            if why != ex.get("waiting_reason"):
+                repo.set_execution(ex["id"], waiting_reason=why)
+                if why:
+                    repo.add_event("execution.waiting", {"reason": why}, execution_id=ex["id"],
+                                   migration_id=ex["migration_id"])
         # 2) cancel requested while still QUEUED (no worker yet)
         for ex in repo.list_executions(status=S.QUEUED.value):
             if ex["cancel_requested"] and repo.transition(ex["id"], (S.QUEUED.value,), S.CANCELED.value,
@@ -149,7 +163,47 @@ class Conductor:
         for w in repo.list_workers():
             if w["heartbeat_at"] < dead:
                 repo.remove_worker(w["id"])
+        # 5) auto-provisioned worker pools: keep min_size members
+        stats["minions"] = self.scale_pools()
         return stats
+
+    def _requirements(self, ex: dict[str, Any]) -> Requirement | None:
+        mig = self.repo.get_migration(ex["migration_id"])
+        if mig is None:
+            return None
+        src = self.repo.get_endpoint(mig["source_endpoint_id"])
+        tgt = self.repo.get_endpoint(mig["target_endpoint_id"])
+        if src is None or tgt is None:
+            return None
+        if ex["kind"] in ("replica_deploy", "replica_delete"):   # target-only work: no source access needed
+            src = {**src, "region": tgt.get("region"), "required_tags": [], "type": tgt["type"]}
+        req = requirements(src, tgt)
+        pool_name = (mig.get("options") or {}).get("pool")
+        if pool_name:                                            # options.pool: only that pool's workers
+            req.caps.add(f"pool:{pool_name}")
+            pl = self.repo.get_pool_by_name(pool_name)
+            if pl is not None and pl.get("region") and not req.region:
+                req.region = pl["region"]
+        return req
+
+    def scale_pools(self, now: float | None = None) -> int:
+        """Auto-provisioned pools: create minions up to min_size (at most once a minute per pool)."""
+        from ..platform.pools import scale
+        now = now or time.time()
+        n = 0
+        for pl in self.repo.list_pools():
+            if not pl.get("provision") or not pl.get("min_size"):
+                continue
+            if now - ((pl.get("state") or {}).get("last_scale_at") or 0) < 60:
+                continue
+            try:
+                n += len(scale(self.repo, pl, self.svc.minion_provisioner(pl),
+                               alive_after=now - 3 * self.svc.settings.lease_seconds, now=now))
+            except Exception as e:  # noqa: BLE001 - recorded, retried next minute
+                st = dict(pl.get("state") or {})
+                st.update(last_error=f"{type(e).__name__}: {e}", last_scale_at=now)
+                self.repo.update_pool(pl["id"], state=st)
+        return n
 
     def run_forever(self) -> None:
         log.info("conductor started (poll %.1fs)", self.svc.settings.poll_seconds)

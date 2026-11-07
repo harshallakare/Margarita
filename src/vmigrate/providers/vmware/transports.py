@@ -142,3 +142,72 @@ class HttpFlatReader(DiskReader):
                 last = e
             time.sleep(min(30, 2 ** attempt))
         raise TransientProviderError(f"datastore range read failed at {offset}: {last}")
+
+
+class OpenVixReader(DiskReader):
+    """Snapshot disk reads through Cloudbase's OpenVixDiskLib — a pure-Python VDDK NBD replacement over
+    vSphere NFC (https://github.com/cloudbase/OpenVixDiskLib). Used as an external library (imported at
+    runtime, never vendored). Requires vCenter 8 / ESXi 8 (its only compatibility mode, "8.0"); it has no
+    size or allocated-block queries, so the size comes from the inventory. Its LICENSE file is LGPL-2.1
+    text with an unclear preamble: check licensing before redistributing it. UNVERIFIED here.
+
+    API used (from its README/source): VixDiskLibHandle(vixdisklib_compatibility_version="8.0");
+    .connect(server_name, thumbprint, username, password, vmx_spec="moref=vm-..", read_only=True,
+    transport_modes="nbdssl") and .open(conn, "[ds] vm/vm-000001.vmdk", flags=READ_ONLY) are context
+    managers; .read(disk, start_sector, num_sectors, buf) reads SECTORS into get_buffer(bytes)."""
+
+    MAX_SECTORS = 2048            # 1 MiB per NFC read
+
+    def __init__(self, *, server: str, user: str, password: str, thumbprint: str, vm_moref: str, file_name: str,
+                 size: int, transports: str = "nbdssl", lib: Any = None):
+        import contextlib
+        import threading
+        if lib is None:
+            try:
+                import importlib
+                lib = importlib.import_module("openvixdisklib.openvixdisklib")
+            except ImportError as e:
+                raise ConfigError("vmware transport openvix: install OpenVixDiskLib on the worker "
+                                  "(pip install git+https://github.com/cloudbase/OpenVixDiskLib)") from e
+        self.lib, self._size, self._lock = lib, size, threading.Lock()
+        self._stack = contextlib.ExitStack()
+        try:
+            self.h = lib.VixDiskLibHandle(vixdisklib_compatibility_version="8.0")
+            conn = self._stack.enter_context(self.h.connect(
+                server_name=server, thumbprint=thumbprint, username=user, password=password,
+                vmx_spec=f"moref={vm_moref}", read_only=True, transport_modes=transports.split(":")[0]))
+            self.disk = self._stack.enter_context(self.h.open(conn, file_name, flags=lib.VIXDISKLIB_FLAG_OPEN_READ_ONLY))
+        except ConfigError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            self._stack.close()
+            raise ProviderError(f"openvix: cannot open {file_name}: {e}") from e
+        self.sector = int(getattr(self.disk, "sector_size", 0) or lib.VIXDISKLIB_SECTOR_SIZE)
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def read(self, offset: int, length: int) -> bytes:
+        length = max(0, min(length, self._size - offset))
+        if length == 0:
+            return b""
+        sec = self.sector
+        first, end = offset // sec, -(-(offset + length) // sec)
+        out = bytearray()
+        with self._lock:
+            s = first
+            while s < end:
+                n = min(self.MAX_SECTORS, end - s)
+                buf = self.lib.get_buffer(n * sec)
+                try:
+                    self.h.read(self.disk, s, n, buf)
+                except Exception as e:  # noqa: BLE001
+                    raise TransientProviderError(f"openvix read at sector {s}: {e}") from e
+                out += bytes(buf.raw[:n * sec])
+                s += n
+        skip = offset - first * sec
+        return bytes(out[skip:skip + length])
+
+    def close(self) -> None:
+        self._stack.close()

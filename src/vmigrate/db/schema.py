@@ -69,6 +69,8 @@ endpoints = Table(
     Column("description", Text, nullable=False, default=""),
     Column("config", JSON, nullable=False),              # NON-secret provider config
     Column("secret_id", String(32), ForeignKey("secrets.id"), nullable=True),
+    Column("region", String(64), nullable=True),           # site/region for worker routing (optional)
+    Column("required_tags", JSON, nullable=True),          # extra worker capabilities this endpoint needs
     Column("created_at", Float, nullable=False),
     Column("updated_at", Float, nullable=False),
     UniqueConstraint("project", "name"),
@@ -95,8 +97,11 @@ executions = Table(
     "executions", metadata,
     Column("id", String(32), primary_key=True),
     Column("migration_id", String(32), ForeignKey("migrations.id", ondelete="CASCADE"), nullable=False),
-    Column("kind", String(32), nullable=False),          # migration | replica_sync | replica_deploy | replica_delete
+    Column("kind", String(32), nullable=False),          # migration | replica_sync | replica_deploy | replica_delete | replica_cutover
     Column("params", JSON, nullable=True),               # kind-specific (deploy: restore_point, deploy_name, ...)
+    Column("region", String(64), nullable=True),           # routing: only workers in this region claim it
+    Column("required_caps", JSON, nullable=True),          # routing: {"region", "caps": [...], "cross_site"}
+    Column("waiting_reason", Text, nullable=True),         # why no worker has claimed it (conductor)
     Column("dry_run", Boolean, nullable=False),
     Column("status", String(16), nullable=False),        # ExecStatus
     Column("error", Text, nullable=True),
@@ -175,11 +180,57 @@ workers = Table(
     Column("started_at", Float, nullable=False),
     Column("heartbeat_at", Float, nullable=False),
     Column("current_execution", String(32), nullable=True),
+    Column("region", String(64), nullable=True),
+    Column("capabilities", JSON, nullable=True),
+    Column("export_url", String(512), nullable=True),      # export agents: https URL other sites call
+    Column("export_fp", String(128), nullable=True),       # export agents: pinned TLS cert SHA-256
+)
+
+
+pools = Table(
+    "pools", metadata,
+    Column("id", String(32), primary_key=True),
+    Column("name", String(128), nullable=False, unique=True),
+    Column("region", String(64), nullable=True),
+    Column("description", Text, nullable=True),
+    Column("min_size", Integer, nullable=False, default=0),
+    Column("max_size", Integer, nullable=False, default=0),
+    Column("provision", JSON, nullable=True),     # auto-provisioned minions: {endpoint_id, image, flavor, network, api_url, ...}
+    Column("state", JSON, nullable=True),         # {minions: [...], last_error, last_scale_at}
+    Column("created_at", Float, nullable=False),
+    Column("updated_at", Float, nullable=False),
+)
+
+shared_disks = Table(
+    "shared_disks", metadata,
+    Column("cluster", String(128), primary_key=True),
+    Column("shared_id", String(256), primary_key=True),
+    Column("owner", String(32), nullable=False),        # migration id that copies it
+    Column("status", String(16), nullable=False),       # claimed | created | done | failed
+    Column("target", JSON, nullable=True),
+    Column("size_bytes", Integer, nullable=True),
+    Column("updated_at", Float, nullable=False),
+)
+
+enroll_tokens = Table(
+    "enroll_tokens", metadata,
+    Column("id", String(32), primary_key=True),
+    Column("token_hash", String(128), nullable=False, unique=True),
+    Column("pool_id", String(32), nullable=True),
+    Column("expires_at", Float, nullable=False),
+    Column("used_at", Float, nullable=True),
+    Column("used_by", String(256), nullable=True),
+    Column("created_by", String(32), nullable=True),
+    Column("created_at", Float, nullable=False),
 )
 
 
 # columns added after the first release: (table, column, DDL type)
-_ADDED_COLUMNS = [("executions", "params", "JSON")]
+_ADDED_COLUMNS = [("executions", "params", "JSON"), ("executions", "region", "VARCHAR(64)"),
+                  ("executions", "required_caps", "JSON"), ("executions", "waiting_reason", "TEXT"),
+                  ("endpoints", "region", "VARCHAR(64)"), ("endpoints", "required_tags", "JSON"),
+                  ("workers", "region", "VARCHAR(64)"), ("workers", "capabilities", "JSON"),
+                  ("workers", "export_url", "VARCHAR(512)"), ("workers", "export_fp", "VARCHAR(128)")]
 
 
 def upgrade_schema(engine: Engine) -> list[str]:

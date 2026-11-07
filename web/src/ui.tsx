@@ -3,7 +3,7 @@
 // Usage: import { useLoad, Status, Bar, Modal, useAuth } from "./ui";
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
-import { ApiError, type Me, type Role } from "./api";
+import { ApiError, fmt, type Me, type Role, type Transfer } from "./api";
 
 // ------------------------------------------------------------------ auth context
 export interface Auth { me: Me | null; can: (r: Role) => boolean; logout: () => void; }
@@ -61,6 +61,47 @@ export function Bar({ pct, tone, lg }: { pct: number; tone?: "ok" | "bad"; lg?: 
     <div className={`bar ${tone ?? ""} ${lg ? "lg" : ""}`} role="progressbar" aria-valuenow={Math.round(pct)}
          aria-valuemin={0} aria-valuemax={100}>
       <i style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} />
+    </div>
+  );
+}
+
+/** Smoothed transfer rate (bytes/s) from successive done_bytes samples of one execution. */
+export function useRate(key: string | undefined, done: number | undefined, active: boolean): number | null {
+  const last = useRef<{ key?: string; t: number; done: number; rate: number | null }>({ t: 0, done: 0, rate: null });
+  const [rate, setRate] = useState<number | null>(null);
+  useEffect(() => {
+    const now = Date.now() / 1000;
+    const l = last.current;
+    if (done == null || l.key !== key || !active) {
+      last.current = { key, t: now, done: done ?? 0, rate: null };
+      setRate(null);
+      return;
+    }
+    const dt = now - l.t;
+    if (dt < 1 || done < l.done) return;
+    const inst = (done - l.done) / dt;
+    const r = l.rate == null ? inst : 0.7 * l.rate + 0.3 * inst;      // smooth the bursts between checkpoints
+    last.current = { key, t: now, done, rate: r };
+    setRate(r);
+  }, [key, done, active]);
+  return rate;
+}
+
+/** "12.4 GiB of 160 GiB · 85 MB/s · about 29m left" with a bar. Used for migrations and replica syncs. */
+export function TransferBar({ id, x, status, compact }: { id: string; x: Transfer; status: string; compact?: boolean }) {
+  const active = status === "running";
+  const rate = useRate(id, x.done_bytes, active);
+  const pct = x.total_bytes ? (x.done_bytes * 100) / x.total_bytes : (x.disks ? (x.disks_done * 100) / x.disks : 0);
+  const left = rate && rate > 0 ? (x.total_bytes - x.done_bytes) / rate : null;
+  const tone = status === "completed" ? "ok" : status === "failed" ? "bad" : undefined;
+  return (
+    <div className={`transfer ${compact ? "compact" : ""}`}>
+      <Bar pct={pct} tone={tone} lg={!compact} />
+      <div className="small">
+        <b>{fmt.bytes(x.done_bytes)}</b> <span className="muted">of {fmt.bytes(x.total_bytes)} · {pct.toFixed(pct < 10 ? 1 : 0)}%</span>
+        {!compact && <span className="muted"> · {x.disks_done}/{x.disks} disks done{x.disks_running ? `, ${x.disks_running} copying` : ""}</span>}
+        {active && rate != null && <span className="muted"> · {(rate / (1 << 20)).toFixed(0)} MB/s{left != null ? ` · about ${fmt.secs(left)} left` : ""}</span>}
+      </div>
     </div>
   );
 }

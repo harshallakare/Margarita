@@ -113,6 +113,10 @@ class AwsSource(SourceProvider):
         d = self._vm.get(vm.id) or self._load(vm)
         return mapping.crosscheck(d["inst"], d["vols"])
 
+    def shutdown_vm(self, vm: VmRef, *, force: bool = False, timeout: int = 900) -> str:
+        self.ctx.require_execute("ec2 StopInstances", instance=vm.id, force=force)
+        return f"{vm.name} {self.client.stop_instance(vm.id, force=force, timeout=timeout)}"
+
     def create_snapshot(self, vm: VmRef, app_consistent: bool) -> SnapshotRef:
         if app_consistent:
             raise SafetyGateError("aws: EBS multi-volume snapshots are crash-consistent (there is no native quiesce "

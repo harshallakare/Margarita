@@ -84,6 +84,12 @@ class OpenStackApi:
         return (out or {}).get("output", "") if isinstance(out, dict) else str(out)
 
     # network
+    def networks(self) -> list[dict[str, Any]]:
+        return [_d(n) for n in self.conn.network.networks()]
+
+    def volume_types(self) -> list[dict[str, Any]]:
+        return [_d(t) for t in self.conn.block_storage.types()]
+
     def find_network(self, name_or_id: str) -> dict[str, Any] | None:
         n = self.conn.network.find_network(name_or_id, ignore_missing=True)
         return _d(n) if n else None

@@ -92,7 +92,8 @@ def to_vmspec(instance: dict[str, Any], volumes: list[dict[str, Any]], itype: di
                               is_boot=m["DeviceName"] == root or (root is None and i == 0), bus_index=i,
                               label=m["DeviceName"].removeprefix("/dev/"), controller=ctrl,
                               source_handle={"volume_id": vid, "device": m["DeviceName"],
-                                             "encrypted": bool(v.get("Encrypted")), "type": v.get("VolumeType")}))
+                                             "encrypted": bool(v.get("Encrypted")), "type": v.get("VolumeType")},
+                              shared_id=vid if v.get("MultiAttachEnabled") else None))
     if not any(d.is_boot for d in disks):
         disks[0].is_boot = True
     cpu = instance.get("CpuOptions") or {}

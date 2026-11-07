@@ -74,6 +74,9 @@ class DiskSpec:
     # lsilogic-sas, buslogic, ahci, ide, nvme. OSMorph needs it: "scsi" on VMware (pvscsi) and
     # "scsi" on KVM (virtio-scsi) are different drivers. None = unknown (treated as non-virtio).
     controller: str | None = None
+    # Same value on every VM that attaches the SAME physical disk (multi-writer VMDK, shared VHDX,
+    # multi-attach volume): cluster quorum/data disks. None = private to this VM.
+    shared_id: str | None = None
 
     @property
     def address(self) -> str:

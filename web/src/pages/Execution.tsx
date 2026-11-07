@@ -6,7 +6,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, fmt, KIND_LABEL, subscribe, type Execution as Exec, type LogLine, type Migration, type Task } from "../api";
-import { Bar, ErrorBox, Loading, Status, Toast, errText, useAuth, useLoad } from "../ui";
+import { Bar, ErrorBox, Loading, Status, Toast, TransferBar, errText, useAuth, useLoad } from "../ui";
 
 const LIVE = ["pending", "queued", "running"];
 
@@ -20,7 +20,9 @@ function TaskRow({ t, sel, onClick, child }: { t: Task; sel: boolean; onClick: (
         {t.error ? <div className="msg err">{t.error}</div> : t.message ? <div className="msg">{t.message}</div> : null}
       </div>
       <div>{(t.status === "running" || (child && t.status !== "pending")) &&
-        <Bar pct={t.progress} tone={t.status === "completed" ? "ok" : t.status === "failed" ? "bad" : undefined} />}</div>
+        <Bar pct={t.progress} tone={t.status === "completed" ? "ok" : t.status === "failed" ? "bad" : undefined} />}
+        {child && typeof t.params.size_bytes === "number" && <div className="small muted" style={{ marginTop: 2, whiteSpace: "nowrap" }}>
+          {fmt.bytes(t.status === "completed" ? t.params.size_bytes : (t.params.size_bytes * t.progress) / 100)} / {fmt.bytes(t.params.size_bytes)}</div>}</div>
       <div className="when">{t.status === "running" ? fmt.dur(t.started_at, null) : t.finished_at ? fmt.dur(t.started_at, t.finished_at) : ""}</div>
     </div>
   );
@@ -85,7 +87,13 @@ export default function Execution() {
   const all = tasks.data ?? [];
   const disks = all.filter((t) => t.kind === "replicate_disk");
   const top = all.filter((t) => t.kind !== "replicate_disk");
-  const overall = all.length ? all.reduce((a, t) => a + (t.status === "completed" ? 100 : t.progress), 0) / all.length : 0;
+  const stepPct = all.length ? all.reduce((a, t) => a + (t.status === "completed" ? 100 : t.progress), 0) / all.length : 0;
+  // when disks are copied, data dominates: 90% data moved, 10% the other steps (validate, snapshot, VM, verify)
+  const tr = ex.data?.transfer;
+  const overall = tr && tr.total_bytes > 0 && !ex.data?.dry_run
+    ? 0.9 * (tr.done_bytes * 100 / tr.total_bytes)
+      + 0.1 * (top.length ? top.reduce((a, t) => a + (t.status === "completed" ? 100 : t.progress), 0) / top.length : 0)
+    : stepPct;
   const diskPct = disks.length ? disks.reduce((a, t) => a + t.progress, 0) / disks.length : 0;
   const selected = all.find((t) => t.id === sel) ?? null;
   const plan = (all.find((t) => t.kind.startsWith("plan"))?.result?.plan ?? null) as Record<string, unknown>[] | null;
@@ -102,6 +110,7 @@ export default function Execution() {
     replica_sync: `All ${disks.length} replica disks are up to date and verified.`,
     replica_deploy: "The VM was deployed from the replica. The replica keeps syncing.",
     replica_delete: "Replica disks and restore points were deleted.",
+    replica_cutover: "Cutover finished: the VM now runs on the target from the final sync.",
   };
 
   return (
@@ -126,6 +135,8 @@ export default function Execution() {
         </div>}
       </div>
       <ErrorBox error={err} title="Action failed" />
+      {x.status === "queued" && x.waiting_reason && <div className="alert warn" style={{ marginBottom: 16 }}>
+        <b>Waiting for a suitable worker.</b> {x.waiting_reason}</div>}
       {x.status === "failed" && <div className="alert bad" style={{ marginBottom: 16 }}><b>Failed{failedTask ? ` in “${failedTask.label}”` : ""}.</b>
         <pre>{x.error}</pre></div>}
       {x.status === "completed" && !x.dry_run && <div className="alert ok" style={{ marginBottom: 16 }}>
@@ -142,6 +153,11 @@ export default function Execution() {
         <div className="card stat"><div className="k">Elapsed</div><div className="v" style={{ fontSize: 18 }}>{fmt.dur(x.started_at, x.finished_at)}</div>
           <div className="small muted">queued {fmt.ago(x.created_at)}</div></div>
       </div>
+
+      {!x.dry_run && x.transfer && x.transfer.total_bytes > 0 && <div className="card" style={{ marginTop: 16 }}>
+        <h2>Data copied</h2>
+        <TransferBar id={x.id} x={x.transfer} status={x.status} />
+      </div>}
 
       <div className="split">
         <div className="card">

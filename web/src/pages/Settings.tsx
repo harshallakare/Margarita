@@ -6,7 +6,55 @@ import { api, fmt, type Providers } from "../api";
 import { ErrorBox, Modal, Status, Toast, errText, useAuth, useLoad } from "../ui";
 
 interface User { id: string; username: string; role: string; project: string; disabled: boolean; created_at: number }
-interface WorkerRow { id: string; hostname: string; pid: number; heartbeat_at: number; current_execution: string | null; alive: boolean }
+interface WorkerRow { id: string; hostname: string; pid: number; heartbeat_at: number; current_execution: string | null;
+  alive: boolean; region?: string | null; capabilities?: string[] | null }
+
+interface Pool { id: string; name: string; region: string | null; description: string | null; min_size: number;
+  max_size: number; tag: string; busy: number; last_error: string | null; provision: Record<string, unknown> | null;
+  members: { id: string; hostname: string; busy: boolean }[];
+  minions: { server_id: string; name: string; status: string; created_at: number }[] }
+
+function NewPool({ onClose, onDone }: { onClose: () => void; onDone: (m: string) => void }) {
+  const [name, setName] = useState("");
+  const [region, setRegion] = useState("");
+  const [desc, setDesc] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  return (
+    <Modal title="Add worker pool" onClose={onClose} footer={<>
+      <button className="btn" onClick={onClose}>Cancel</button>
+      <button className="btn primary" disabled={!name} onClick={async () => {
+        try { await api.post("/pools", { name, region: region || null, description: desc || null }); onDone(`Added pool ${name}`); }
+        catch (e) { setErr(errText(e)); }
+      }}>Add pool</button></>}>
+      <div className="form">
+        <label className="field"><span>Name</span><input type="text" value={name} onChange={(e) => setName(e.target.value)} />
+          <small>Workers join with <code>deploy.sh --pool {name || "NAME"}</code> or an enrollment token.</small></label>
+        <label className="field"><span>Region (optional)</span><input type="text" value={region} onChange={(e) => setRegion(e.target.value)} /></label>
+        <label className="field"><span>Description</span><input type="text" value={desc} onChange={(e) => setDesc(e.target.value)} /></label>
+        <ErrorBox error={err} title="Could not add the pool" />
+      </div>
+    </Modal>
+  );
+}
+
+function JoinToken({ pool, onClose }: { pool: Pool; onClose: () => void }) {
+  const [tok, setTok] = useState<{ token: string; expires_at: number } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  return (
+    <Modal title={`Join pool ${pool.name}`} onClose={onClose} footer={<>
+      <button className="btn" onClick={onClose}>Close</button>
+      {!tok && <button className="btn primary" onClick={async () => {
+        try { setTok(await api.post(`/pools/${pool.id}/enroll-token`, { ttl_minutes: 60 })); } catch (e) { setErr(errText(e)); }
+      }}>Create token</button>}</>}>
+      <p className="small">A single-use token, valid for one hour. On the new worker host run (the API must be reachable over HTTPS
+        and use a shared Postgres database):</p>
+      {tok && <pre className="mono small" style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+        {`sudo bash deploy.sh --enroll ${window.location.origin} --enroll-token ${tok.token}`}</pre>}
+      {tok && <p className="muted small">Expires {fmt.time(tok.expires_at)}. It is shown only once.</p>}
+      <ErrorBox error={err} title="Could not create a token" />
+    </Modal>
+  );
+}
 
 function NewUser({ onClose, onDone }: { onClose: () => void; onDone: (m: string) => void }) {
   const [u, setU] = useState("");
@@ -43,6 +91,9 @@ export default function Settings() {
   const secrets = useLoad(() => (admin ? api.get<Record<string, unknown>>("/secrets/status") : Promise.resolve(null)), [admin]);
   const prov = useLoad(() => api.get<Providers>("/providers"));
   const [add, setAdd] = useState(false);
+  const pools = useLoad(() => api.get<Pool[]>("/pools"), [], 5000);
+  const [addPool, setAddPool] = useState(false);
+  const [join, setJoin] = useState<Pool | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
   return (
@@ -55,11 +106,31 @@ export default function Settings() {
           <ErrorBox error={workers.error} />
           {(workers.data ?? []).length === 0 ? <p className="muted">No workers have checked in. Start one with <code>vmigrate-platform worker</code>.</p> : (
             <div className="table-wrap"><table>
-              <thead><tr><th>Worker</th><th>State</th><th>Heartbeat</th></tr></thead>
+              <thead><tr><th>Worker</th><th>Region</th><th>State</th><th>Heartbeat</th></tr></thead>
               <tbody>{workers.data!.map((w) => (
-                <tr key={w.id}><td className="mono small">{w.id}</td>
+                <tr key={w.id}><td className="mono small">{w.id}
+                  <div className="muted small" title={(w.capabilities ?? []).join("\n")}>
+                    {(w.capabilities ?? []).filter((c) => !c.startsWith("provider:")).join(" · ") || "—"}</div></td>
+                  <td className="small">{w.region || <span className="muted">any</span>}</td>
                   <td>{!w.alive ? <Status s="failed" label="stale" /> : w.current_execution ? <Status s="running" label="busy" /> : <Status s="ok" label="idle" />}</td>
                   <td className="small muted">{fmt.ago(w.heartbeat_at)}</td></tr>))}</tbody>
+            </table></div>)}
+        </div>
+        <div className="card">
+          <div className="spread" style={{ marginBottom: 12 }}><h2 style={{ margin: 0 }}>Worker pools</h2>
+            {admin && <button className="btn small" onClick={() => setAddPool(true)}>Add pool</button>}</div>
+          <ErrorBox error={pools.error} />
+          {(pools.data ?? []).length === 0 ? <p className="muted">No pools. Without pools any capable worker runs any job; with them a
+            migration can be pinned to a pool (wizard, Options).</p> : (
+            <div className="table-wrap"><table>
+              <thead><tr><th>Pool</th><th>Members</th><th></th></tr></thead>
+              <tbody>{pools.data!.map((p) => (
+                <tr key={p.id}><td><b>{p.name}</b><div className="muted small">{p.region ? `region ${p.region}` : "any region"}</div>
+                  {p.last_error && <div className="small" style={{ color: "var(--danger, #c33)" }}>{p.last_error}</div>}</td>
+                  <td className="small">{p.members.length} live · {p.busy} busy
+                    {p.provision && <div className="muted">auto: min {p.min_size} / max {p.max_size} ·{" "}
+                      {p.minions.filter((m) => m.status === "booting").length} booting</div>}</td>
+                  <td>{admin && <button className="btn small" onClick={() => setJoin(p)}>Join token</button>}</td></tr>))}</tbody>
             </table></div>)}
         </div>
         <div className="card">
@@ -99,6 +170,8 @@ export default function Settings() {
         </div>
       </div>
       {add && <NewUser onClose={() => setAdd(false)} onDone={(m) => { setAdd(false); setToast(m); users.reload(); }} />}
+      {addPool && <NewPool onClose={() => setAddPool(false)} onDone={(m) => { setAddPool(false); setToast(m); pools.reload(); }} />}
+      {join && <JoinToken pool={join} onClose={() => setJoin(null)} />}
       <Toast msg={toast} onDone={() => setToast(null)} />
     </>
   );

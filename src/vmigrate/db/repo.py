@@ -84,12 +84,13 @@ class Repo:
 
     # ------------------------------------------------------------------ endpoints
     def create_endpoint(self, project: str, name: str, type_: str, config: dict[str, Any], secret_id: str | None,
-                        description: str = "") -> str:
+                        description: str = "", region: str | None = None,
+                        required_tags: list[str] | None = None) -> str:
         eid, now = _id(), time.time()
         with self.engine.begin() as c:
             c.execute(insert(s.endpoints).values(id=eid, project=project, name=name, type=type_, config=config,
-                                                 secret_id=secret_id, description=description,
-                                                 created_at=now, updated_at=now))
+                                                 secret_id=secret_id, description=description, region=region,
+                                                 required_tags=required_tags or [], created_at=now, updated_at=now))
         return eid
 
     def get_endpoint(self, eid: str) -> dict[str, Any] | None:
@@ -198,11 +199,15 @@ class Repo:
                           .values(status=to, **values))
             return r.rowcount == 1
 
-    def claim_execution(self, worker_id: str, lease_s: float) -> str | None:
+    def claim_execution(self, worker_id: str, lease_s: float, *, region: str | None = None,
+                        caps: set[str] | None = None) -> str | None:
+        """Claim the oldest QUEUED execution THIS worker can run (region + capabilities)."""
+        from ..core.routing import can_run
         with self.engine.connect() as c:
-            cands = [r[0] for r in c.execute(
-                select(s.executions.c.id).where(s.executions.c.status == ExecStatus.QUEUED.value)
-                .order_by(s.executions.c.created_at).limit(10))]
+            rows = c.execute(select(s.executions.c.id, s.executions.c.required_caps)
+                             .where(s.executions.c.status == ExecStatus.QUEUED.value)
+                             .order_by(s.executions.c.created_at).limit(200)).all()
+        cands = [xid for xid, req in rows if can_run(region, caps, req)[0]]
         now = time.time()
         for xid in cands:
             with self.engine.begin() as c:
@@ -245,6 +250,28 @@ class Repo:
         q = select(s.tasks).where(s.tasks.c.execution_id == xid).order_by(s.tasks.c.seq)
         with self.engine.connect() as c:
             return [_row(r) for r in c.execute(q)]  # type: ignore[misc]
+
+    def transfer_summary(self, xids: list[str]) -> dict[str, dict[str, Any]]:
+        """Byte-level disk progress per execution, from its replicate_disk tasks:
+        {total_bytes, done_bytes, disks, disks_done, disks_running}. Disks whose size is unknown
+        (tasks created before sizes were recorded) count as disks but not as bytes."""
+        if not xids:
+            return {}
+        q = (select(s.tasks.c.execution_id, s.tasks.c.status, s.tasks.c.progress, s.tasks.c.params)
+             .where(s.tasks.c.execution_id.in_(xids), s.tasks.c.kind == "replicate_disk"))
+        out: dict[str, dict[str, Any]] = {}
+        with self.engine.connect() as c:
+            for xid, st, pct, params in c.execute(q):
+                t = out.setdefault(xid, {"total_bytes": 0, "done_bytes": 0, "disks": 0, "disks_done": 0,
+                                         "disks_running": 0})
+                size = int((params or {}).get("size_bytes") or 0)
+                done = st == "completed"
+                t["disks"] += 1
+                t["disks_done"] += int(done)
+                t["disks_running"] += int(st == "running")
+                t["total_bytes"] += size
+                t["done_bytes"] += size if done else int(size * min(100.0, float(pct or 0)) / 100)
+        return out
 
     def task_counts(self, xids: list[str]) -> dict[str, dict[str, int]]:
         if not xids:
@@ -325,15 +352,70 @@ class Repo:
         with self.engine.begin() as c:
             c.execute(delete(s.schedules).where(s.schedules.c.id == sid))
 
-    # ------------------------------------------------------------------ workers
-    def worker_heartbeat(self, wid: str, hostname: str, pid: int, current: str | None) -> None:
+    # ------------------------------------------------------------------ pools
+    def create_pool(self, name: str, *, region: str | None, description: str | None, min_size: int, max_size: int,
+                    provision: dict[str, Any] | None) -> str:
+        pid, now = _id(), time.time()
+        with self.engine.begin() as c:
+            c.execute(insert(s.pools).values(id=pid, name=name, region=region, description=description,
+                                             min_size=min_size, max_size=max_size, provision=provision,
+                                             state={"minions": []}, created_at=now, updated_at=now))
+        return pid
+
+    def get_pool(self, pid: str) -> dict[str, Any] | None:
+        with self.engine.connect() as c:
+            return _row(c.execute(select(s.pools).where(s.pools.c.id == pid)).first())
+
+    def get_pool_by_name(self, name: str) -> dict[str, Any] | None:
+        with self.engine.connect() as c:
+            return _row(c.execute(select(s.pools).where(s.pools.c.name == name)).first())
+
+    def list_pools(self) -> list[dict[str, Any]]:
+        with self.engine.connect() as c:
+            return [_row(r) for r in c.execute(select(s.pools).order_by(s.pools.c.name))]  # type: ignore[misc]
+
+    def update_pool(self, pid: str, **values: Any) -> None:
+        with self.engine.begin() as c:
+            c.execute(update(s.pools).where(s.pools.c.id == pid).values(updated_at=time.time(), **values))
+
+    def delete_pool(self, pid: str) -> None:
+        with self.engine.begin() as c:
+            c.execute(delete(s.enroll_tokens).where(s.enroll_tokens.c.pool_id == pid))
+            c.execute(delete(s.pools).where(s.pools.c.id == pid))
+
+    def create_enroll_token(self, pool_id: str | None, ttl_s: float, created_by: str | None) -> tuple[str, float]:
+        """Single-use join token; only its hash is stored. Returns (token, expires_at)."""
+        import secrets as _secrets
+        tok = "mgj_" + _secrets.token_urlsafe(32)
+        exp, now = time.time() + ttl_s, time.time()
+        with self.engine.begin() as c:
+            c.execute(insert(s.enroll_tokens).values(id=_id(), token_hash=_sha(tok), pool_id=pool_id, expires_at=exp,
+                                                     created_by=created_by, created_at=now))
+        return tok, exp
+
+    def consume_enroll_token(self, tok: str, used_by: str) -> dict[str, Any] | None:
+        """Atomically mark a valid, unused, unexpired token used. None when it is not."""
         now = time.time()
         with self.engine.begin() as c:
-            r = c.execute(update(s.workers).where(s.workers.c.id == wid)
-                          .values(heartbeat_at=now, current_execution=current))
+            r = c.execute(update(s.enroll_tokens)
+                          .where(s.enroll_tokens.c.token_hash == _sha(tok), s.enroll_tokens.c.used_at.is_(None),
+                                 s.enroll_tokens.c.expires_at > now)
+                          .values(used_at=now, used_by=used_by[:256]))
+            if r.rowcount != 1:
+                return None
+            return _row(c.execute(select(s.enroll_tokens).where(s.enroll_tokens.c.token_hash == _sha(tok))).first())
+
+    # ------------------------------------------------------------------ workers
+    def worker_heartbeat(self, wid: str, hostname: str, pid: int, current: str | None, *,
+                         region: str | None = None, capabilities: list[str] | None = None,
+                         export_url: str | None = None, export_fp: str | None = None) -> None:
+        now = time.time()
+        vals = {"heartbeat_at": now, "current_execution": current, "region": region, "capabilities": capabilities,
+                "export_url": export_url, "export_fp": export_fp}
+        with self.engine.begin() as c:
+            r = c.execute(update(s.workers).where(s.workers.c.id == wid).values(**vals))
             if r.rowcount == 0:
-                c.execute(insert(s.workers).values(id=wid, hostname=hostname, pid=pid, started_at=now,
-                                                   heartbeat_at=now, current_execution=current))
+                c.execute(insert(s.workers).values(id=wid, hostname=hostname, pid=pid, started_at=now, **vals))
 
     def list_workers(self) -> list[dict[str, Any]]:
         with self.engine.connect() as c:
@@ -342,6 +424,51 @@ class Repo:
     def remove_worker(self, wid: str) -> None:
         with self.engine.begin() as c:
             c.execute(delete(s.workers).where(s.workers.c.id == wid))
+
+
+class DbSharedDisks:
+    """engine.shared broker backed by the shared_disks table (atomic first-claim wins)."""
+
+    def __init__(self, repo: Repo):
+        self.repo = repo
+
+    def claim(self, cluster: str, shared_id: str, migration: str, size: int) -> dict[str, Any]:
+        from sqlalchemy.exc import IntegrityError
+        try:
+            with self.repo.engine.begin() as c:
+                c.execute(insert(s.shared_disks).values(cluster=cluster, shared_id=shared_id, owner=migration,
+                                                        status="claimed", size_bytes=size, updated_at=time.time()))
+        except IntegrityError:
+            pass
+        row = self.get(cluster, shared_id)
+        assert row is not None
+        return row
+
+    def get(self, cluster: str, shared_id: str) -> dict[str, Any] | None:
+        with self.repo.engine.connect() as c:
+            return _row(c.execute(select(s.shared_disks).where(s.shared_disks.c.cluster == cluster,
+                                                               s.shared_disks.c.shared_id == shared_id)).first())
+
+    def update(self, cluster: str, shared_id: str, owner: str, **vals: Any) -> None:
+        with self.repo.engine.begin() as c:
+            r = c.execute(update(s.shared_disks).where(s.shared_disks.c.cluster == cluster,
+                                                       s.shared_disks.c.shared_id == shared_id,
+                                                       s.shared_disks.c.owner == owner)
+                          .values(updated_at=time.time(), **vals))
+            if r.rowcount != 1:
+                raise PermissionError(f"shared disk {shared_id} is not owned by {owner}")
+
+    def list(self, cluster: str | None = None) -> list[dict[str, Any]]:
+        q = select(s.shared_disks)
+        if cluster:
+            q = q.where(s.shared_disks.c.cluster == cluster)
+        with self.repo.engine.connect() as c:
+            return [_row(r) for r in c.execute(q)]  # type: ignore[misc]
+
+
+def _sha(t: str) -> str:
+    import hashlib
+    return hashlib.sha256(t.encode()).hexdigest()
 
 
 def _task_row(xid: str, r: TaskRecord) -> dict[str, Any]:

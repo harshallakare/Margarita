@@ -107,6 +107,13 @@ class OsCloud:
         return out
 
     # ------------------------------------------------------------------ snapshots
+    def stop_server(self, sid: str) -> str:
+        if str(self.server(sid).get("status", "")).lower() == "shutoff":
+            return "already shut off"
+        self.conn.compute.stop_server(sid)      # Nova sends ACPI power-off, then forces after its own timeout
+        self._wait(lambda: self.conn.compute.get_server(sid), "shutoff", f"stop server {sid}")
+        return "stopped"
+
     def create_server_image(self, sid: str, name: str) -> dict[str, Any]:
         if not name.startswith(PREFIX):
             raise SafetyGateError("snapshot image names must start with vmigrate-")

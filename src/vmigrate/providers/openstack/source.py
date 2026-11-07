@@ -224,6 +224,10 @@ class OpenstackSource(SourceProvider):
         return mapping.crosscheck(d["server"], d["atts"], d["vols"])
 
     # ------------------------------------------------------------------ snapshots
+    def shutdown_vm(self, vm: VmRef, *, force: bool = False, timeout: int = 900) -> str:
+        self.ctx.require_execute("nova stop", server=vm.name)
+        return f"{vm.name} {self.cloud.stop_server(vm.id)}"
+
     def create_snapshot(self, vm: VmRef, app_consistent: bool) -> SnapshotRef:
         d = self._vm.get(vm.id) or self._load(vm)
         spec = mapping.to_vmspec(d["server"], d["atts"], d["vols"], d["props"], d["ifaces"], d["vsize"])

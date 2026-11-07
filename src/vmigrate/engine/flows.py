@@ -75,7 +75,14 @@ def migration_handlers(runner: MigrationRunner) -> dict[str, Handler]:
             rate = f", {ds.rate_mb_s:.0f} MB/s" if ds and ds.rate_mb_s else ""
             ctx.progress(off * 100 / max(size, 1), f"{off / (1 << 30):.1f}/{size / (1 << 30):.1f} GiB{rate}")
 
+    def on_disk_step(disk_id: str, msg: str) -> None:
+        with lock:
+            ctx = disk_ctx.get(disk_id)
+        if ctx is not None:
+            ctx.progress(ctx.rec.progress, msg, force=True)
+
     runner.progress_hook = on_disk_progress
+    runner.step_hook = on_disk_step
 
     def spec() -> VmSpec:
         if runner.state.spec is None:
@@ -123,7 +130,8 @@ def migration_handlers(runner: MigrationRunner) -> dict[str, Handler]:
         s = spec()
         r = runner._create_disks(s)
         children = [
-            TaskSpec(f"replicate_disk:{d.id}", "replicate_disk", params={"disk_id": d.id}, max_attempts=3,
+            TaskSpec(f"replicate_disk:{d.id}", "replicate_disk", params={"disk_id": d.id, "size_bytes": d.size_bytes},
+                     max_attempts=3,
                      label=f"Disk {d.order:02d} {d.address} ({_gib(d.size_bytes)})")
             for d in sorted(s.disks, key=lambda d: -d.size_bytes)   # pitfall 10: largest first
         ]

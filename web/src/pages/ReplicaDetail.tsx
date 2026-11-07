@@ -5,7 +5,7 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, fmt, KIND_LABEL, type Endpoint, type Execution, type Replica, type Schedule } from "../api";
-import { ConfirmTyped, ErrorBox, Loading, Modal, Status, Toast, errText, useAuth, useLoad } from "../ui";
+import { ConfirmTyped, ErrorBox, Loading, Modal, Status, Toast, TransferBar, errText, useAuth, useLoad } from "../ui";
 import { ConsistencyPill } from "./Replicas";
 
 const ACTIVE = ["pending", "queued", "running"];
@@ -88,6 +88,42 @@ function DeployDialog({ r, onClose, onStarted }: { r: Replica; onClose: () => vo
   );
 }
 
+function CutoverDialog({ r, onClose, onStarted }: { r: Replica; onClose: () => void; onStarted: (x: Execution) => void }) {
+  const [name, setName] = useState(`${r.options.target_name || r.vm}`.toLowerCase().replace(/[^a-z0-9._-]+/g, "-"));
+  const [shutdown, setShutdown] = useState(false);
+  const [force, setForce] = useState(false);
+  const [dry, setDry] = useState(true);
+  const [confirm, setConfirm] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const go = async () => {
+    const x = await api.post<Execution>(`/replicas/${r.id}/cutover`,
+      { dry_run: dry, deploy_name: name, shutdown_source: shutdown, force_power_off: shutdown && force });
+    onStarted(x);
+  };
+  if (confirm) return <ConfirmTyped title="Cut over to the target" word={name} action="Cut over" onClose={onClose} onConfirm={go}
+    body={<>{shutdown ? <><b>Shuts down the source VM {r.vm}</b>{force ? " (hard power-off)" : " (guest shutdown)"}, then</> : "Leaves the source running, then"} runs
+      a final sync and creates VM <b>{name}</b> on the target from it. The source is never deleted.</>} />;
+  return (
+    <Modal title="Cutover (planned failover)" onClose={onClose} footer={<>
+      <button className="btn" onClick={onClose}>Cancel</button>
+      <button className="btn primary" disabled={!name} onClick={async () => {
+        setErr(null);
+        if (dry) { try { await go(); } catch (e) { setErr(errText(e)); } } else setConfirm(true);
+      }}>{dry ? "Start dry-run" : "Continue"}</button></>}>
+      <div className="form">
+        <label className="field"><span>VM name on target</span><input type="text" value={name} onChange={(e) => setName(e.target.value)} /></label>
+        <label className="check"><input type="checkbox" checked={shutdown} onChange={(e) => setShutdown(e.target.checked)} />
+          <span>Shut down the source first<small>Recommended: no writes are lost. Without it the final sync is crash-consistent and later writes stay on the source.</small></span></label>
+        {shutdown && <label className="check"><input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
+          <span>Hard power-off<small>Only if the guest cannot shut down cleanly (no guest tools/ACPI).</small></span></label>}
+        <label className="check"><input type="checkbox" checked={dry} onChange={(e) => setDry(e.target.checked)} />
+          <span>Dry-run<small>Show the plan without touching the source or target.</small></span></label>
+        <ErrorBox error={err} title="Could not start" />
+      </div>
+    </Modal>
+  );
+}
+
 export default function ReplicaDetail() {
   const { id } = useParams();
   const nav = useNavigate();
@@ -95,7 +131,7 @@ export default function ReplicaDetail() {
   const rep = useLoad(() => api.get<Replica>(`/replicas/${id}`), [id], 3000);
   const execs = useLoad(() => api.get<Execution[]>(`/executions?migration_id=${id}`), [id], 3000);
   const eps = useLoad(() => api.get<Endpoint[]>("/endpoints"));
-  const [modal, setModal] = useState<null | "sync" | "deploy" | "deldisks" | "delete" | "sched" | Schedule>(null);
+  const [modal, setModal] = useState<null | "sync" | "deploy" | "cutover" | "deldisks" | "delete" | "sched" | Schedule>(null);
   const [err, setErr] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
@@ -128,7 +164,8 @@ export default function ReplicaDetail() {
             <button className="btn" onClick={() => act(() => start("execute", { dry_run: true }))}>Dry-run sync</button>
             <button className="btn" disabled={!dryOk && !hasDisks} title={!dryOk && !hasDisks ? "Run a dry-run first" : ""}
                     onClick={() => setModal("sync")}>Sync now</button>
-            <button className="btn primary" disabled={!r.last_sync} onClick={() => setModal("deploy")}>Deploy…</button>
+            <button className="btn" disabled={!r.last_sync} onClick={() => setModal("deploy")}>Deploy…</button>
+            <button className="btn primary" disabled={!r.last_sync} onClick={() => setModal("cutover")}>Cutover…</button>
           </>}
         </div>}
       </div>
@@ -139,6 +176,13 @@ export default function ReplicaDetail() {
       {!hasDisks && !active && <div className="alert info" style={{ marginBottom: 16 }}>
         Start with a <b>dry-run sync</b>. The first real sync copies every disk; later syncs copy only what changed.</div>}
 
+      {active && !active.dry_run && active.transfer && active.transfer.total_bytes > 0 && (
+        <div className="card" style={{ marginBottom: 16 }}>
+          <div className="spread" style={{ marginBottom: 8 }}>
+            <h2 style={{ margin: 0 }}>{KIND_LABEL[active.kind] ?? "Sync"} in progress</h2>
+            <Link className="small" to={`/executions/${active.id}`}>details</Link></div>
+          <TransferBar id={active.id} x={active.transfer} status={active.status} />
+        </div>)}
       <div className="grid cols-4">
         <div className="card stat"><div className="k">Disks</div><div className="v">{r.disks ?? "—"}<small> · {fmt.bytes(r.disk_total_bytes)}</small></div>
           {r.crosscheck && <div className="small mono muted">{new Set(Object.values(r.crosscheck)).size === 1 ? "counts agree" : "COUNT MISMATCH"}</div>}</div>
@@ -236,6 +280,7 @@ export default function ReplicaDetail() {
         onConfirm={() => start("execute", { dry_run: false })}
         body={<>Snapshots <b>{r.vm}</b> on the source and updates the {r.disks ?? ""} replica disks on the target
           {r.last_sync ? " with what changed since the last sync" : " (first sync: every disk is copied in full)"}. The source VM is never modified.</>} />}
+      {modal === "cutover" && <CutoverDialog r={r} onClose={() => setModal(null)} onStarted={(x) => nav(`/executions/${x.id}`)} />}
       {modal === "deploy" && <DeployDialog r={r} onClose={() => setModal(null)} onStarted={(x) => nav(`/executions/${x.id}`)} />}
       {modal === "deldisks" && <ConfirmTyped title="Delete replica disks" word={r.name} action="Delete disks" onClose={() => setModal(null)}
         onConfirm={() => start("delete-disks", { dry_run: false })}

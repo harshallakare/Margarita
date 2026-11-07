@@ -38,6 +38,7 @@ class Settings:
     allowed_providers: list[str] = field(default_factory=list)
     cors_origins: list[str] = field(default_factory=list)
     web_dir: Path | None = None
+    allow_http_enroll: bool = False     # VMIGRATE_ALLOW_HTTP_ENROLL=1: lab only (secrets cross the wire in clear)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
@@ -48,6 +49,7 @@ class Settings:
             return [x.strip() for x in e.get(k, "").split(",") if x.strip()]
 
         return cls(
+            allow_http_enroll=e.get("VMIGRATE_ALLOW_HTTP_ENROLL", "") in ("1", "true", "yes"),
             database_url=e.get("VMIGRATE_DATABASE_URL", cls.database_url),
             secret_key=load_key(e),
             engine_config=Path(e["VMIGRATE_ENGINE_CONFIG"]) if e.get("VMIGRATE_ENGINE_CONFIG") else None,

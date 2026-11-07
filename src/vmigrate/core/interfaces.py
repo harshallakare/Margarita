@@ -69,6 +69,7 @@ class DiskHints:
     thin: bool = True
     storage_pool: str | None = None
     order: int = 0
+    shared: bool = False             # multi-attach volume (cluster shared disk)
 
 
 @dataclass
@@ -183,6 +184,15 @@ class SourceProvider(_Provider):
     @abstractmethod
     def list_vms(self) -> list[VmRef]: ...
 
+    # ---- cutover (optional) ---------------------------------------------------------------
+    def shutdown_vm(self, vm: VmRef, *, force: bool = False, timeout: int = 900) -> str:
+        """Power the SOURCE VM off for a cutover: guest (ACPI/tools) shutdown, or hard power-off when
+        force. The ONLY call that changes a source VM's state; used only when the operator opts in
+        (replica cutover with shutdown_source). Returns a short description. Idempotent: an
+        already-off VM returns immediately."""
+        raise NotImplementedError(f"{self.type_name}: source shutdown is not supported; power the VM off "
+                                  "yourself, then run the cutover without shutdown_source")
+
     @abstractmethod
     def find_vm(self, name_or_id: str) -> VmRef: ...
 
@@ -253,6 +263,24 @@ class TargetProvider(_Provider):
     def open_disk_writer(self, disk: TargetDiskRef, *, resume: bool = False, incremental: bool = False) -> DiskWriter:
         """Writer for `disk`. incremental=True (replica sync): the writer starts with the disk's
         CURRENT committed content, so only changed ranges need writing; commit_disk then publishes it."""
+
+    # ---- shared (multi-attach) disks for clusters (optional) ------------------------------
+    def supports_shared_disks(self) -> tuple[bool, str]:
+        """(True, "") when create_disk(hints.shared=True) makes a disk several VMs can attach at once."""
+        return False, f"{self.type_name}: shared (multi-attach) disks are not supported"
+
+    # ---- resources for the wizard's mapping dropdowns (optional) --------------------------
+    def list_networks(self) -> list[dict[str, Any]]:
+        """[{id, name, ...}] the target can attach VMs to. Empty = not supported (free text)."""
+        return []
+
+    def list_storage(self) -> list[dict[str, Any]]:
+        """[{id, name, ...}] storage pools / volume types the target can create disks on."""
+        return []
+
+    def list_flavors(self) -> list[dict[str, Any]]:
+        """[{id, name, vcpus, ram_mb}] VM sizes, if the target uses predefined sizes."""
+        return []
 
     # ---- replica support (optional) -------------------------------------------------------
     def supports_replica(self) -> bool:

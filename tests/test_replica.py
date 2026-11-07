@@ -218,3 +218,32 @@ def test_compare_copy_writes_only_differing_blocks(tmp_path):
     assert p.read_bytes() == new.read(0, SIZE)
     assert st.bytes_written == len(old.changed_blocks(0, 1)) * (64 << 10)
     assert st.bytes_written + st.bytes_unchanged == SIZE
+
+
+def test_cutover_final_sync_then_deploy(rep):
+    r = rep.c.post(f"/replicas/{rep.rid}/cutover", headers=rep.admin, json={"dry_run": False})
+    assert r.status_code == 409 and "initial sync" in r.text                # nothing synced yet
+    rep.run("execute")                                                      # initial sync (generation 0)
+    rep.set_source(generation=1)                                            # source keeps changing
+    x = rep.run("cutover", {"dry_run": True, "shutdown_source": True})
+    assert x["status"] == "completed" and rep.registry()["vms"] == {}       # plan only
+    x = rep.run("cutover", {"dry_run": False, "shutdown_source": True, "deploy_name": "ris-prod"})
+    assert x["status"] == "completed", x
+    s = rep.get()
+    assert s["last_sync"]["modes"] == ["cbt"]                               # the final sync was a delta
+    assert (rep.tmp / "tgt" / "volumes" / "ris-prod-disk01.img").read_bytes() == _expected(1, 1)  # latest data
+    c = s["cutovers"][0]
+    assert c["status"] == "done" and c["shutdown_source"] and "powered off" in c["source"]
+    assert c["target_vm"] and s["deployments"][0]["status"] == "done"
+
+
+def test_cutover_without_shutdown_and_shutdown_failure(rep):
+    rep.run("execute")
+    x = rep.run("cutover", {"dry_run": False, "deploy_name": "ris-a"})
+    assert x["status"] == "completed"
+    assert rep.get()["cutovers"][0]["source"] == "left running"
+    rep.set_source(fail_shutdown="guest did not respond")
+    x = rep.run("cutover", {"dry_run": False, "shutdown_source": True, "deploy_name": "ris-b"})
+    assert x["status"] == "failed" and "guest did not respond" in x["error"]
+    c = rep.get()["cutovers"][0]
+    assert c["status"] == "failed" and "ris-b" not in rep.registry()["vms"]   # nothing deployed after a failed stop

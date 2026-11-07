@@ -276,6 +276,20 @@ class NutanixSource(SourceProvider):
         self.c.v2_post(f"/protection_domains/{self.pd}/protect_vms",
                        {"app_consistent_snapshots": app, "uuids": [vm.id]})
 
+    def shutdown_vm(self, vm: VmRef, *, force: bool = False, timeout: int = 900) -> str:
+        """Prism v2 set_power_state ACPI_SHUTDOWN (needs NGT or an ACPI-aware guest) / OFF."""
+        if str(self.client.v2_get(f"/vms/{vm.id}").get("power_state", "")).lower() == "off":
+            return f"{vm.name} already off"
+        how = "OFF" if force else "ACPI_SHUTDOWN"
+        self.ctx.require_execute("nutanix power off", vm=vm.name, transition=how)
+        self.client.v2_post(f"/vms/{vm.id}/set_power_state", {"transition": how})
+        deadline = time.monotonic() + timeout
+        while str(self.client.v2_get(f"/vms/{vm.id}").get("power_state", "")).lower() != "off":
+            if time.monotonic() > deadline:
+                raise ProviderError(f"{vm.name}: still on {timeout}s after {how}; retry with force_power_off")
+            time.sleep(5)
+        return f"{vm.name} powered off ({how})"
+
     def create_snapshot(self, vm: VmRef, app_consistent: bool) -> SnapshotRef:
         spec = to_vmspec(self._v3(vm), self._v2(vm.id))
         cluster = (spec.extra.get("nutanix") or {}).get("cluster")

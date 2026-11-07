@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import ssl
+import time
 from typing import Any
 
 from ...core.errors import ProviderError, SafetyGateError, TransientProviderError
@@ -106,7 +107,8 @@ class VsphereClient:
                 "backing_type": _cls(b), "disk_mode": getattr(b, "diskMode", None),
                 "rdm_mode": getattr(b, "compatibilityMode", None),
                 "parent_file": parent.fileName if parent is not None else None,
-                "uuid": getattr(b, "uuid", None), "change_id": getattr(b, "changeId", None)}
+                "uuid": getattr(b, "uuid", None), "change_id": getattr(b, "changeId", None),
+                "sharing": getattr(b, "sharing", None)}
 
     def _devices(self, hw: Any) -> tuple[list[dict], list[dict], list[dict]]:
         from pyVmomi import vim
@@ -191,6 +193,24 @@ class VsphereClient:
             return None
         vm = self._vm(moref)
         return walk(vm.snapshot.rootSnapshotList) if vm.snapshot else None
+
+    def power_state(self, moref: str) -> str:
+        return str(self._vm(moref).runtime.powerState)
+
+    def shutdown(self, moref: str, *, force: bool, timeout: int) -> str:
+        vm = self._vm(moref)
+        if str(vm.runtime.powerState) == "poweredOff":
+            return "already off"
+        if force:
+            self._wait(vm.PowerOffVM_Task(), "power off")
+            return "powered off (hard)"
+        vm.ShutdownGuest()                      # needs VMware Tools running in the guest
+        deadline = time.monotonic() + timeout
+        while str(vm.runtime.powerState) != "poweredOff":
+            if time.monotonic() > deadline:
+                raise ProviderError(f"guest shutdown did not finish in {timeout}s; retry with force_power_off")
+            time.sleep(5)
+        return "guest shutdown"
 
     def remove_snapshot(self, moref: str, snap_moref: str) -> None:
         name = self.snapshot_name(moref, snap_moref)

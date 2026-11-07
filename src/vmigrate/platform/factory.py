@@ -25,7 +25,7 @@ import yaml
 
 from ..config.loader import EngineConfig, MigrationConfig, _engine
 from ..core.context import RunContext
-from ..core.errors import ConfigError
+from ..core.errors import ConfigError, ProviderError
 from ..core.interfaces import SourceProvider, TargetProvider
 from ..db.repo import DbReplicaStore, DbStateStore, Repo
 from ..db.schema import make_engine
@@ -36,7 +36,8 @@ from ..security.secretstore import FernetSecretStore, SecretStore
 from .settings import Settings
 
 ENGINE_OVERRIDES = {"max_parallel_disks", "chunk_size", "checkpoint_every", "verify_samples", "verify_sample_bytes",
-                    "app_consistent", "cleanup_source_snapshot", "on_failure", "boot_check", "boot_timeout"}
+                    "app_consistent", "cleanup_source_snapshot", "on_failure", "boot_check", "boot_timeout",
+                    "verify_full"}
 
 
 @dataclass
@@ -67,8 +68,41 @@ class Services:
         creds = self.secrets.get(ep["secret_id"]) if ep.get("secret_id") else {}
         return {**ep["config"], **creds, "type": ep["type"]}
 
-    def build_source(self, ep: dict[str, Any], ctx: RunContext) -> SourceProvider:
+    def build_source(self, ep: dict[str, Any], ctx: RunContext, *, target_ep: dict[str, Any] | None = None,
+                     http: Any = None) -> SourceProvider:
+        """The real provider — or, when the source is at another site than the target (both endpoints
+        have a region and they differ), a RemoteSource that runs it on an export agent there."""
+        if target_ep is not None and ep.get("region") and target_ep.get("region") \
+                and ep["region"] != target_ep["region"]:
+            return self.remote_source(ep, ctx, http=http)
         return build_source(ep["name"], self.provider_config(ep), ctx)
+
+    def minion_provisioner(self, pool: dict[str, Any]) -> Any:
+        prov = pool.get("provision") or {}
+        ep = self.repo.get_endpoint(prov.get("endpoint_id", ""))
+        if ep is None:
+            raise ConfigError(f"pool {pool['name']}: provisioning endpoint not found")
+        if ep["type"] not in ("vhi", "openstack"):
+            raise ConfigError(f"pool {pool['name']}: minions can be provisioned on vhi/openstack endpoints only")
+        from .pools import OpenStackMinions
+        return OpenStackMinions(self.provider_config(ep))
+
+    def remote_source(self, ep: dict[str, Any], ctx: RunContext, *, http: Any = None) -> SourceProvider:
+        import time as _t
+
+        from ..core.routing import pick_export_agent
+        from ..export.codec import derive_key
+        from ..export.remote import RemoteSource
+
+        def locate() -> tuple[str, str | None]:
+            a = pick_export_agent(self.repo.list_workers(), ep["region"], ep["type"],
+                                  _t.time() - 3 * self.settings.lease_seconds)
+            if a is None:
+                raise ProviderError(f"no live export agent in region {ep['region']!r} for {ep['type']} sources; "
+                                    "start one there: vmigrate-platform export-agent (deploy.sh --export-agent)")
+            return a["export_url"], a.get("export_fp")
+        return RemoteSource(ep["name"], {"type": ep["type"]}, ctx, endpoint_id=ep["id"],
+                            key=derive_key(self.settings.secret_key), locate=locate, http=http)
 
     def build_target(self, ep: dict[str, Any], ctx: RunContext) -> TargetProvider:
         return build_target(ep["name"], self.provider_config(ep), ctx)
@@ -88,7 +122,7 @@ class Services:
             name=mig["name"], source=mig["source_endpoint_id"], target=mig["target_endpoint_id"], vm=mig["vm"],
             target_name=o.get("target_name"), guest_os=o.get("guest_os"),
             target_options=dict(o.get("target_options") or {}), osmorph=dict(o.get("osmorph") or {}),
-            app_consistent=o.get("app_consistent"),
+            app_consistent=o.get("app_consistent"), cluster=o.get("cluster"),
         )
 
     def _endpoints(self, mig: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -100,12 +134,14 @@ class Services:
 
     def build_runner(self, mig: dict[str, Any], ctx: RunContext) -> MigrationRunner:
         src_ep, tgt_ep = self._endpoints(mig)
-        return MigrationRunner(self.job_for(mig), self.engine_for(mig), self.build_source(src_ep, ctx),
-                               self.build_target(tgt_ep, ctx), ctx, DbStateStore(self.repo, mig["id"]))
+        from ..db.repo import DbSharedDisks
+        return MigrationRunner(self.job_for(mig), self.engine_for(mig), self.build_source(src_ep, ctx, target_ep=tgt_ep),
+                               self.build_target(tgt_ep, ctx), ctx, DbStateStore(self.repo, mig["id"]),
+                               shared=DbSharedDisks(self.repo), migration_id=mig["id"])
 
     def build_replica_runner(self, mig: dict[str, Any], ctx: RunContext) -> ReplicaRunner:
         src_ep, tgt_ep = self._endpoints(mig)
-        return ReplicaRunner(self.job_for(mig), self.engine_for(mig), self.build_source(src_ep, ctx),
+        return ReplicaRunner(self.job_for(mig), self.engine_for(mig), self.build_source(src_ep, ctx, target_ep=tgt_ep),
                              self.build_target(tgt_ep, ctx), ctx, DbReplicaStore(self.repo, mig["id"]),
                              retention=int((mig.get("options") or {}).get("retention", 3)))
 

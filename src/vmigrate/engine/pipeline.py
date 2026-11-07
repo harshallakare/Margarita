@@ -25,7 +25,7 @@ from typing import Any
 
 from ..config.loader import EngineConfig, MigrationConfig
 from ..core.context import RunContext
-from ..core.errors import ManualMorphRequired, SafetyGateError, VerificationError
+from ..core.errors import ManualMorphRequired, SafetyGateError, TransientProviderError, VerificationError
 from ..core.fileio import RawFileReader
 from ..core.interfaces import DiskHints, SnapshotRef, SourceProvider, TargetDiskRef, TargetProvider, VmRef
 from ..ir import DiskSpec, GuestOS, OsFamily, VmSpec
@@ -34,7 +34,7 @@ from . import safety
 from .copier import copy_disk
 from .report import write_report
 from .state import DiskState, MigrationState, Phase, StateStore, phase_at_least
-from .verify import check_size, compare_samples, sample_offsets
+from .verify import check_size, compare_samples, full_verify, sample_offsets
 
 
 def _ref_to_dict(r: Any) -> dict[str, Any]:
@@ -61,7 +61,17 @@ class MigrationRunner:
         target: TargetProvider,
         ctx: RunContext,
         store: StateStore,
+        *,
+        shared: Any = None,
+        migration_id: str | None = None,
     ):
+        from .shared import MemorySharedDisks
+        self.shared = shared if shared is not None else MemorySharedDisks()
+        self.migration_id = migration_id or job.name
+        #: how long a cluster member waits for the owner to create / finish a shared disk
+        self.shared_create_wait = 4 * 3600
+        self.shared_copy_wait = 7 * 86400
+        self.shared_poll = 15.0
         self.job = job
         self.engine = engine
         self.source = source
@@ -75,6 +85,8 @@ class MigrationRunner:
         self.progress_hook: Any = None
         #: optional () -> None that raises to abort a copy (task cancel)
         self.cancel_hook: Any = None
+        #: optional (disk_id, message) callback: what a disk is doing after/around its copy
+        self.step_hook: Any = None
 
     # ------------------------------------------------------------------ helpers
     def _save(self) -> None:
@@ -111,6 +123,7 @@ class MigrationRunner:
         spec.extra["target_options"] = dict(self.job.target_options)
         spec.extra["max_parallel_disks"] = self.engine.max_parallel_disks  # for target headroom checks
         spec.validate()
+        self._check_shared(spec)
 
         counts = safety.check_disk_counts(spec, self.source.disk_count_crosscheck(vm))
         if len(spec.disks) >= safety.LEGACY_DISK_CAP:
@@ -151,7 +164,7 @@ class MigrationRunner:
         placeholders = [(Path(f"<{self._disk_name(d)}>"), "qcow2") for d in spec.ordered_disks()]
         morph = resolve(spec.guest_os.family, self.target.platform_family).run(
             MorphRequest(spec, self.target.platform_family, self.target.target_bus(spec), placeholders,
-                         dict(self.job.osmorph)),
+                         self._morph_options()),
             self.ctx,
         )
         c.plan("osmorph", status=morph.status, strategy=morph.strategy, steps=morph.steps)
@@ -183,6 +196,46 @@ class MigrationRunner:
         safety.check_snapshot_disks(spec, self.source.snapshot_disk_count(snap))
         return safety.require_snapshot(snap)
 
+    # ------------------------------------------------------------------ cluster shared disks
+    def _check_shared(self, spec: VmSpec) -> None:
+        shared = [d for d in spec.disks if d.shared_id]
+        if not shared:
+            return
+        ids = ", ".join(f"{d.address} ({d.shared_id})" for d in shared)
+        if not self.job.cluster:
+            raise SafetyGateError(f"{spec.name}: disk(s) {ids} are shared with other VMs (cluster). Migrate every "
+                                  "member with the same options.cluster so each shared disk is copied once and "
+                                  "attached to all of them.")
+        if any(d.is_boot for d in shared):
+            raise SafetyGateError(f"{spec.name}: the boot disk is shared; not supported")
+        ok, why = self.target.supports_shared_disks()
+        if not ok:
+            raise SafetyGateError(f"{spec.name}: shared disks {ids}: {why}")
+
+    def _shared_wait(self, d: DiskSpec, want: set[str], timeout: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while True:
+            row = self.shared.get(self.job.cluster, d.shared_id)
+            if row and row["status"] in want:
+                return row
+            if row and row["status"] == "failed":
+                raise VerificationError(f"shared disk {d.shared_id}: the owner migration {row['owner']} failed it")
+            if time.monotonic() > deadline:
+                raise TransientProviderError(f"shared disk {d.shared_id}: still {row and row['status']} after "
+                                             f"{int(timeout)}s (owner {row and row['owner']})")
+            if self.cancel_hook is not None:
+                self.cancel_hook()
+            time.sleep(self.shared_poll)
+
+    def _step(self, d: DiskSpec, msg: str) -> None:
+        if self.step_hook is not None:
+            self.step_hook(d.id, msg)
+
+    def _is_member(self, d: DiskSpec) -> bool:
+        """True when this migration attaches a shared disk another migration copies."""
+        return bool(d.shared_id and self.state.disks[d.id].shared_owner
+                    and self.state.disks[d.id].shared_owner != self.migration_id)
+
     def _create_disks(self, spec: VmSpec) -> dict[str, TargetDiskRef]:
         refs: dict[str, TargetDiskRef] = {}
         for d in spec.ordered_disks():
@@ -190,10 +243,25 @@ class MigrationRunner:
             if ds.target:
                 refs[d.id] = _tdisk(ds.target)
                 continue
-            name = self._disk_name(d)
+            if d.shared_id:
+                row = self.shared.claim(self.job.cluster, d.shared_id, self.migration_id, d.size_bytes)
+                with self._lock:
+                    ds.shared_owner = row["owner"]
+                if row["owner"] != self.migration_id:
+                    self.log.info("disk %s: shared disk %s is copied by migration %s; waiting for its target disk",
+                                  d.address, d.shared_id, row["owner"])
+                    row = self._shared_wait(d, {"created", "done"}, self.shared_create_wait)
+                    ref = _tdisk(row["target"])
+                    with self._lock:
+                        ds.target = _ref_to_dict(ref)        # NOT in created[]: a member never deletes it
+                    self._save()
+                    refs[d.id] = ref
+                    continue
+            name = self._disk_name(d) if not d.shared_id else f"{self.job.cluster}-shared-{d.shared_id}"[:200]
             ref = self.target.find_disk(name) or self.target.create_disk(
                 name, d.size_bytes, DiskHints(bus=d.bus, is_boot=d.is_boot, order=d.order,
-                                              storage_pool=self.job.target_options.get("storage_pool"))
+                                              storage_pool=self.job.target_options.get("storage_pool"),
+                                              shared=bool(d.shared_id))
             )
             ok, msg = check_size(d.size_bytes, ref.size_bytes)
             if not ok:
@@ -202,6 +270,9 @@ class MigrationRunner:
                 ds.target = _ref_to_dict(ref)
                 self.state.created["target_disks"].append(_ref_to_dict(ref))
             self._save()
+            if d.shared_id:
+                self.shared.update(self.job.cluster, d.shared_id, self.migration_id, status="created",
+                                   target=_ref_to_dict(ref))
             refs[d.id] = ref
         if not self._done(Phase.DISKS_CREATED):
             self._phase(Phase.DISKS_CREATED)
@@ -219,6 +290,16 @@ class MigrationRunner:
     def _copy_one(self, snap: SnapshotRef, d: DiskSpec, ref: TargetDiskRef) -> None:
         """copy -> verify staged -> commit -> verify committed -> free staging (one disk)."""
         ds = self.state.disks[d.id]
+        if self._is_member(d):
+            if not ds.copied:
+                self._step(d, f"waiting for shared disk {d.shared_id} (copied by migration {ds.shared_owner})")
+                row = self._shared_wait(d, {"done"}, self.shared_copy_wait)
+                with self._lock:
+                    ds.copied = ds.committed = True
+                    ds.bytes_copied = d.size_bytes
+                    ds.verify = {"ok": True, "shared": f"copied and verified by migration {row['owner']}"}
+                    self.store.save(self.state)
+            return
         if not ds.copied:
             start = ds.bytes_copied
             last_pct = [-1]
@@ -261,6 +342,7 @@ class MigrationRunner:
                 staged = writer.staged_path
             verify: dict[str, Any] = {"size": check_size(d.size_bytes, ref.size_bytes)[1]}
             if staged is not None:
+                self._step(d, "copied; verifying samples against the source")
                 verify["staged_samples"] = self._verify_against_source(snap, d, RawFileReader(staged))
             with self._lock:
                 ds.copied = True
@@ -271,15 +353,39 @@ class MigrationRunner:
             self.log.info("disk %02d copied: %.1f MB/s, %d B zero-skipped",
                           d.order, stats.mb_per_s, stats.bytes_zero_skipped)
         if not ds.committed:
+            self._step(d, "committing to the target disk")
             self.target.commit_disk(ref, Path(ds.staged_path) if ds.staged_path else None)
             reader = self.target.open_disk_reader(ref)
             if reader is not None:
+                self._step(d, "verifying the committed disk")
                 res = self._verify_against_source(snap, d, reader)
                 with self._lock:
                     ds.verify = {**(ds.verify or {}), "target_samples": res}
             with self._lock:
                 ds.committed = True
                 self.store.save(self.state)
+            if self.engine.verify_full:
+                self.log.info("disk %02d: full SHA-256 verification (reads source and target completely)", d.order)
+                last = [-1]
+
+                def fv_progress(done: int, total: int) -> None:
+                    pct = done * 100 // max(total, 1)
+                    if pct != last[0]:
+                        last[0] = pct
+                        self._step(d, f"full SHA-256 checksum {pct}%")
+                with self.source.open_disk(snap, d) as src:
+                    res = full_verify(src, self.target.open_disk_reader(ref), d.size_bytes, chunk=self.engine.chunk_size,
+                                      progress=fv_progress)
+                with self._lock:
+                    ds.verify = {**(ds.verify or {}), "full": res}
+                    self.store.save(self.state)
+                if res.get("skipped"):
+                    self.log.warning("disk %02d: %s", d.order, res["skipped"])
+                elif not res["ok"]:
+                    raise VerificationError(f"disk {d.id}: full checksum mismatch "
+                                            f"(source {res['source_sha256'][:16]}..., target {res['target_sha256'][:16]}...)")
+            if d.shared_id:
+                self.shared.update(self.job.cluster, d.shared_id, self.migration_id, status="done")
             self.target.discard_staging(ref)
             self.log.info("disk %02d committed", d.order)
 
@@ -298,16 +404,24 @@ class MigrationRunner:
         # Pitfall 10: single-stream reads cap out; parallelize ACROSS disks (largest first).
         # Each disk is committed as soon as it is copied, so staging only ever holds
         # max_parallel_disks images at once.
-        todo = sorted(spec.disks, key=lambda d: -d.size_bytes)
+        # cluster members wait for shared disks LAST, after every disk they copy themselves
+        todo = sorted(spec.disks, key=lambda d: (self._is_member(d), -d.size_bytes))
         self._parallel(lambda d: self._copy_one(snap, d, refs[d.id]), [(d,) for d in todo])
         self._phase(Phase.DISKS_COPIED)
 
+    def _morph_options(self) -> dict:
+        """OSMorph options plus the target facts a strategy needs (MACs kept on the target?)."""
+        o = dict(self.job.osmorph)
+        o.setdefault("preserve_mac", bool(self.job.target_options.get("preserve_mac", False)))
+        return o
+
     def _morph(self, spec: VmSpec, refs: dict[str, TargetDiskRef]) -> None:
-        images = [self.target.morph_image(refs[d.id]) for d in spec.ordered_disks()]
+        # shared cluster disks are never edited by OSMorph (another member owns / uses them)
+        images = [self.target.morph_image(refs[d.id]) for d in spec.ordered_disks() if not d.shared_id]
         usable = [i for i in images if i is not None] if all(images) else []
         bus = self.target.target_bus(spec)
         strategy = resolve(spec.guest_os.family, self.target.platform_family)
-        res = strategy.run(MorphRequest(spec, self.target.platform_family, bus, usable, dict(self.job.osmorph)), self.ctx)
+        res = strategy.run(MorphRequest(spec, self.target.platform_family, bus, usable, self._morph_options()), self.ctx)
         with self._lock:
             self.state.morph = res.to_dict()
         self._save()

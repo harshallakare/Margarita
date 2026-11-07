@@ -113,6 +113,14 @@ $disks = @($snap.GetRelated('Msvm_StorageAllocationSettingData') | Where-Object 
 [pscustomobject]@{ id = $snap.InstanceID; type = $snap.VirtualSystemType; disks = $disks } | ConvertTo-Json -Compress -Depth 4
 """
 
+STOP_VM = r"""
+$vm = Get-VM -Id $p.id
+if ($vm.State -eq 'Off') { '{"state":"Off","already":true}'; return }
+if ($p.force) { Stop-VM -VM $vm -TurnOff -Force -Confirm:$false } else { Stop-VM -VM $vm -Force -Confirm:$false }
+$vm = Get-VM -Id $p.id
+(@{state = "$($vm.State)"; already = $false} | ConvertTo-Json -Compress)
+"""
+
 DESTROY_SNAPSHOT = r"""
 $snap = Get-WmiObject -Namespace $ns -Class Msvm_VirtualSystemSettingData -Filter "InstanceID='$($p.snapshot_id)'"
 if (-not $snap) { '{"removed":false}'; return }
@@ -195,6 +203,9 @@ class HypervClient:
 
     def create_snapshot(self, vm_id: str, consistency: int) -> dict[str, Any]:
         return self.ps(CREATE_SNAPSHOT, {"id": vm_id, "consistency": consistency})
+
+    def stop_vm(self, vm_id: str, *, force: bool) -> dict[str, Any]:
+        return self.ps(STOP_VM, {"id": vm_id, "force": bool(force)})
 
     def destroy_snapshot(self, vm_id: str, snapshot_id: str) -> None:
         self.ps(DESTROY_SNAPSHOT, {"snapshot_id": snapshot_id})

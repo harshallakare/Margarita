@@ -7,7 +7,8 @@ export type Role = "viewer" | "operator" | "admin";
 export interface Me { user_id: string; username: string; role: Role; project: string }
 
 export interface Field {
-  name: string; label: string; kind: "text" | "url" | "password" | "bool" | "int" | "json" | "textarea";
+  name: string; label: string; kind: "text" | "url" | "password" | "bool" | "int" | "json" | "textarea" | "select";
+  options?: string[];
   secret?: boolean; required?: boolean; help?: string; default?: unknown;
 }
 export interface ProviderRow { type: string; status: string; notes: string; fields: Field[] }
@@ -16,20 +17,25 @@ export interface Providers { sources: ProviderRow[]; targets: ProviderRow[] }
 export interface Endpoint {
   id: string; name: string; type: string; project: string; description: string;
   config: Record<string, unknown>; has_credentials: boolean; credential_keys: string[];
+  region?: string | null; required_tags?: string[];
   created_at: number; updated_at: number;
 }
 
 export interface Execution {
   id: string; migration_id: string; kind: ExecKind; dry_run: boolean; status: ExecStatus;
   params?: Record<string, unknown> | null;
+  region?: string | null; waiting_reason?: string | null;
   error: string | null; cancel_requested: boolean; lease_owner: string | null; runs: number;
   created_at: number; started_at: number | null; finished_at: number | null;
   task_counts: Record<string, number>;
+  transfer?: Transfer | null;
 }
-export type ExecKind = "migration" | "replica_sync" | "replica_deploy" | "replica_delete";
+/** Disk bytes moved by an execution's copy tasks (migrations, replica syncs, cutovers). */
+export interface Transfer { total_bytes: number; done_bytes: number; disks: number; disks_done: number; disks_running: number }
+export type ExecKind = "migration" | "replica_sync" | "replica_deploy" | "replica_delete" | "replica_cutover";
 export const KIND_LABEL: Record<string, string> = {
   migration: "Migration run", replica_sync: "Replica sync", replica_deploy: "Deploy (failover)",
-  replica_delete: "Delete replica disks",
+  replica_delete: "Delete replica disks", replica_cutover: "Cutover",
 };
 export type ExecStatus = "pending" | "queued" | "running" | "completed" | "failed" | "canceled";
 
@@ -176,6 +182,12 @@ export const fmt = {
     if (s < 3600) return `${Math.floor(s / 60)}m ago`;
     if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
     return `${Math.floor(s / 86400)}d ago`;
+  },
+  secs(s: number): string {
+    if (!isFinite(s) || s < 0) return "—";
+    if (s < 60) return `${Math.ceil(s)}s`;
+    if (s < 3600) return `${Math.floor(s / 60)}m ${Math.floor(s % 60)}s`;
+    return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
   },
   dur(a: number | null | undefined, b: number | null | undefined): string {
     if (!a) return "—";

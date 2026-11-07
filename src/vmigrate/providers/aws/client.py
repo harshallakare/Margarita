@@ -53,6 +53,14 @@ class AwsClient:
                 out += r["Instances"]
         return out
 
+    def stop_instance(self, iid: str, *, force: bool, timeout: int) -> str:
+        if self.instance(iid)["State"]["Name"] == "stopped":
+            return "already stopped"
+        self.ec2.stop_instances(InstanceIds=[iid], Force=bool(force))
+        self.ec2.get_waiter("instance_stopped").wait(
+            InstanceIds=[iid], WaiterConfig={"Delay": 10, "MaxAttempts": max(timeout // 10, 1)})
+        return "stopped"
+
     def instance(self, iid: str) -> dict[str, Any]:
         r = self.ec2.describe_instances(InstanceIds=[iid])["Reservations"]
         if not r:

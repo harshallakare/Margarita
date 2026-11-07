@@ -12,6 +12,8 @@ seeded pseudo-random offsets, so re-runs check the same places.
 
 from __future__ import annotations
 
+from typing import Any
+
 import hashlib
 import random
 from dataclasses import dataclass, field
@@ -53,6 +55,38 @@ def compare_samples(src: DiskReader, dst: DiskReader, offsets: list[int], *, len
         mismatches=bad,
         detail="all samples match" if not bad else f"{len(bad)}/{len(offsets)} sampled regions differ",
     )
+
+
+def full_digest(reader: DiskReader, size: int, *, chunk: int = 64 << 20,
+                progress: Any = None) -> str:
+    """SHA-256 over the first `size` bytes (the source disk's exact size; targets may be GiB-rounded)."""
+    h = hashlib.sha256()
+    off = 0
+    while off < size:
+        n = min(chunk, size - off)
+        buf = reader.read(off, n)
+        if len(buf) != n:
+            raise IOError(f"short read at {off} while hashing ({len(buf)}/{n})")
+        h.update(buf)
+        off += n
+        if progress:
+            progress(off, size)
+    return h.hexdigest()
+
+
+def full_verify(src: DiskReader, dst: DiskReader | None, size: int, *, chunk: int = 64 << 20,
+                progress: Any = None) -> dict[str, Any]:
+    """Full end-to-end comparison. Raises nothing itself; callers decide (mismatch => failure)."""
+    if dst is None:
+        return {"ok": False, "skipped": "target cannot be read back for a full checksum"}
+    try:
+        a = full_digest(src, size, chunk=chunk, progress=(lambda o, n: progress(o, 2 * n)) if progress else None)
+        b = full_digest(dst, size, chunk=chunk, progress=(lambda o, n: progress(n + o, 2 * n)) if progress else None)
+    finally:
+        close = getattr(dst, "close", None)
+        if close:
+            close()
+    return {"ok": a == b, "source_sha256": a, "target_sha256": b, "bytes": size}
 
 
 def check_size(source_size: int, target_size: int) -> tuple[bool, str]:

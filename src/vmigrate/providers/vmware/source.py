@@ -6,7 +6,8 @@ Usage (endpoint config; password goes in the encrypted credentials):
     username: migrate@vsphere.local
     password: ...
     verify_tls: true
-    transport: auto                    # vddk | http | auto (vddk when nbdkit + VDDK are installed)
+    transport: auto                    # vddk | openvix | http | auto (vddk when nbdkit + VDDK are installed)
+                                       # openvix: Cloudbase OpenVixDiskLib over NFC, vSphere 8 only, no VDDK
     vddk_libdir: /opt/vmware-vix-disklib-distrib
     vddk_transports: nbdssl:nbd        # add hotadd only when the worker is a VM on the same vSphere
     thumbprint: AA:BB:...              # optional pin; else taken from the (verified) TLS certificate
@@ -40,7 +41,7 @@ from ...core.ranges import ByteRange
 from ...ir import DiskSpec, VmSpec
 from . import mapping
 from .client import SNAP_PREFIX, server_thumbprint
-from .transports import HttpFlatReader, VddkExport, vddk_problems
+from .transports import HttpFlatReader, OpenVixReader, VddkExport, vddk_problems
 
 
 class _AllocatedReader(DiskReader):
@@ -75,8 +76,8 @@ class VmwareSource(SourceProvider):
         self.port = int(config.get("port", 443))
         self.verify_tls = bool(config.get("verify_tls", True))
         self.transport = config.get("transport", "auto")
-        if self.transport not in ("auto", "vddk", "http"):
-            raise ConfigError("vmware transport must be auto, vddk or http")
+        if self.transport not in ("auto", "vddk", "openvix", "http"):
+            raise ConfigError("vmware transport must be auto, vddk, openvix or http")
         self.nbdkit = config.get("nbdkit", "nbdkit")
         self.libdir = config.get("vddk_libdir")
         self._client = client
@@ -98,7 +99,7 @@ class VmwareSource(SourceProvider):
     def _use_vddk(self) -> bool:
         if self.transport == "vddk":
             return True
-        if self.transport == "http":
+        if self.transport in ("http", "openvix"):
             return False
         return not vddk_problems(self.nbdkit, self.libdir)
 
@@ -160,7 +161,16 @@ class VmwareSource(SourceProvider):
     def disk_count_crosscheck(self, vm: VmRef) -> dict[str, int]:
         return mapping.crosscheck(self.info(vm))
 
+    def shutdown_vm(self, vm: VmRef, *, force: bool = False, timeout: int = 900) -> str:
+        self.ctx.require_execute("vsphere power off", vm=vm.name, force=force)
+        return f"{vm.name}: {self.client.shutdown(vm.id, force=force, timeout=timeout)}"
+
     def create_snapshot(self, vm: VmRef, app_consistent: bool) -> SnapshotRef:
+        shared = [d for d in self.inspect_vm(vm).disks if d.shared_id]
+        if shared:
+            raise SafetyGateError(f"{vm.name}: vSphere cannot snapshot multi-writer (shared) disks "
+                                  f"{[d.label for d in shared]}. Power the cluster off and use a cold method, or "
+                                  "detach the shared disks and migrate them separately.")
         name = f"{SNAP_PREFIX}{self.ctx.run_id}"
         self.ctx.require_execute("vsphere create snapshot", vm=vm.name, name=name, quiesce=app_consistent)
         smoref = self.client.create_snapshot(vm.id, name, quiesce=app_consistent)
@@ -183,8 +193,13 @@ class VmwareSource(SourceProvider):
             raise LiveDiskReadRefused("vmware: reads require a vmigrate snapshot")
         sd = self._snap_disk(snapshot, disk)
         vm_moref = snapshot.data["vm_moref"]
-        if self._use_vddk():
-            inner: DiskReader = VddkExport(
+        if self.transport == "openvix":
+            inner: DiskReader = OpenVixReader(
+                server=self.host, user=self.config["username"], password=self.config.get("password", ""),
+                thumbprint=self._thumbprint(), vm_moref=vm_moref, file_name=sd["file_name"], size=disk.size_bytes,
+                transports=self.config.get("vddk_transports", "nbdssl"))
+        elif self._use_vddk():
+            inner = VddkExport(
                 nbdkit=self.nbdkit, libdir=self.libdir or "", server=self.host, user=self.config["username"],
                 password=self.config.get("password", ""), thumbprint=self._thumbprint(), vm_moref=vm_moref,
                 snapshot_moref=snapshot.id, file_name=sd["file_name"],

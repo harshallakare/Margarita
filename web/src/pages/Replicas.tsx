@@ -3,7 +3,7 @@
 
 import { useNavigate } from "react-router-dom";
 import { api, fmt, KIND_LABEL, type Endpoint, type Replica } from "../api";
-import { ErrorBox, Icon, Loading, Status, useAuth, useLoad } from "../ui";
+import { ErrorBox, Icon, Loading, Status, TransferBar, useAuth, useLoad } from "../ui";
 
 export function ConsistencyPill({ r }: { r: Replica }) {
   if (!r.last_sync && !r.current_sync) return <span className="pill plain">never synced</span>;
@@ -52,7 +52,9 @@ export default function Replicas() {
                 <td className="small name">{epName(r.source_endpoint_id)} → {epName(r.target_endpoint_id)}</td>
                 <td className="num">{r.disks ?? "—"}</td>
                 <td><ConsistencyPill r={r} /></td>
-                <td className="small">{r.last_sync ? <>{fmt.ago(r.last_sync.finished)}<div className="muted">{r.last_sync.modes.join("+")} · wrote {fmt.bytes(r.last_sync.bytes_written)}</div></> : <span className="muted">—</span>}</td>
+                <td className="small">{x && x.status === "running" && !x.dry_run && x.transfer && x.transfer.total_bytes > 0 ? <>
+                  <div className="muted" style={{ marginBottom: 3 }}>{KIND_LABEL[x.kind] ?? x.kind} running</div>
+                  <TransferBar id={x.id} x={x.transfer} status={x.status} compact /></> : r.last_sync ? <>{fmt.ago(r.last_sync.finished)}<div className="muted">{r.last_sync.modes.join("+")} · wrote {fmt.bytes(r.last_sync.bytes_written)}</div></> : <span className="muted">—</span>}</td>
                 <td className="small">{next ? fmt.time(next) : <span className="muted">manual</span>}</td>
                 <td>{x ? <div className="small"><Status s={x.status} /> <span className="muted">{KIND_LABEL[x.kind] ?? x.kind}{x.dry_run ? " (dry-run)" : ""}</span></div> : <span className="muted">never</span>}</td>
               </tr>

@@ -100,7 +100,8 @@ def _gen_vm(i: int, v: Mapping[str, Any]) -> VmSpec:
             id=f"{v['name']}-d{n}", bus=DiskBus(d.get("bus", "scsi")), size_bytes=parse_size(d.get("size", "16MiB")),
             order=n, is_boot=bool(d.get("boot", n == 0)), bus_index=d.get("index", n),
             controller=d.get("controller", v.get("controller", "virtio-scsi")),
-            source_handle={"seed": f"{v['name']}:{n}"},
+            source_handle={"seed": f"shared:{d['shared']}" if d.get("shared") else f"{v['name']}:{n}"},
+            shared_id=d.get("shared"),
         ))
     return VmSpec(
         name=v["name"], source_id=f"fake-{i}", cpu=CpuSpec(v.get("sockets", 1), v.get("cores", 2)),
@@ -130,6 +131,14 @@ class FakeSource(SourceProvider):
     def list_vms(self) -> list[VmRef]:
         return [VmRef(s.source_id, s.name, self.name) for s in self.vms.values()]
 
+    def shutdown_vm(self, vm: VmRef, *, force: bool = False, timeout: int = 900) -> str:
+        self.ctx.require_execute("fake shutdown", vm=vm.name, force=force)
+        if self.config.get("fail_shutdown"):
+            raise ProviderError(str(self.config["fail_shutdown"]))
+        self.powered_off = getattr(self, "powered_off", [])
+        self.powered_off.append((vm.name, force))
+        return f"{vm.name} powered off ({'hard' if force else 'guest shutdown'})"
+
     def find_vm(self, name_or_id: str) -> VmRef:
         for r in self.list_vms():
             if name_or_id in (r.id, r.name):
@@ -157,8 +166,18 @@ class FakeSource(SourceProvider):
     def open_disk(self, snapshot: SnapshotRef, disk: DiskSpec) -> DiskReader:
         if not snapshot.id:
             raise LiveDiskReadRefused("fake: snapshot required")
-        return PatternDisk(disk.source_handle["seed"], disk.size_bytes, fail_at=self.fail_read_at,
-                           generation=int(snapshot.data.get("generation", 0)))
+        r = PatternDisk(disk.source_handle["seed"], disk.size_bytes, fail_at=self.fail_read_at,
+                        generation=int(snapshot.data.get("generation", 0)))
+        delay = float(self.config.get("read_delay") or 0)     # demos: make copies slow enough to watch
+        if delay > 0:
+            import time as _time
+            inner_read = r.read
+
+            def slow_read(offset: int, length: int) -> bytes:
+                _time.sleep(delay)
+                return inner_read(offset, length)
+            r.read = slow_read  # type: ignore[method-assign]
+        return r
 
     def supports_cbt(self) -> bool:
         return self.cbt
@@ -209,6 +228,19 @@ class FakeTarget(TargetProvider):
     def check_connection(self) -> list[str]:
         return [str(self.config["fail_connection"])] if self.config.get("fail_connection") else []
 
+    def supports_shared_disks(self) -> tuple[bool, str]:
+        return (False, "fake: shared disks disabled") if self.config.get("no_shared") else (True, "")
+
+    def list_networks(self) -> list[dict[str, Any]]:
+        return [{"id": f"net-{n}", "name": n} for n in self.config.get("networks", ["prod-net", "backup-net"])]
+
+    def list_storage(self) -> list[dict[str, Any]]:
+        return [{"id": s, "name": s} for s in self.config.get("storage", ["vmds-ssd", "vmds-hdd"])]
+
+    def list_flavors(self) -> list[dict[str, Any]]:
+        return [{"id": "f-2x4", "name": "small", "vcpus": 2, "ram_mb": 4096},
+                {"id": "f-4x16", "name": "large", "vcpus": 4, "ram_mb": 16384}]
+
     def _staged(self, ref: TargetDiskRef) -> Path:
         return self.staging / "staging" / f"{ref.name}.raw"
 
@@ -218,7 +250,8 @@ class FakeTarget(TargetProvider):
     def create_disk(self, name: str, size_bytes: int, hints: DiskHints) -> TargetDiskRef:
         self.ctx.require_execute("fake create disk", name=name)
         self.calls.append(f"create_disk:{name}")
-        ref = TargetDiskRef(id=f"vol-{name}", name=name, size_bytes=size_bytes, data={"bus": hints.bus.value})
+        ref = TargetDiskRef(id=f"vol-{name}", name=name, size_bytes=size_bytes,
+                            data={"bus": hints.bus.value, **({"shared": True} if hints.shared else {})})
         self.disks[name] = ref
         self._save()
         return ref

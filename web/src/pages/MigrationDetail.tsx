@@ -5,7 +5,7 @@
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, fmt, token, type Endpoint, type Execution, type Migration, type Report } from "../api";
-import { ConfirmExecute, ErrorBox, Loading, Modal, Status, Toast, errText, useAuth, useLoad } from "../ui";
+import { ConfirmExecute, ErrorBox, Loading, Modal, Status, Toast, TransferBar, errText, useAuth, useLoad } from "../ui";
 
 const ACTIVE = ["pending", "queued", "running"];
 
@@ -78,6 +78,14 @@ export default function MigrationDetail() {
         )}
       </div>
       <ErrorBox error={err} title="Action failed" />
+      {active && !active.dry_run && active.transfer && active.transfer.total_bytes > 0 && (
+        <div className="card" style={{ marginBottom: 16 }}>
+          <div className="spread" style={{ marginBottom: 8 }}>
+            <h2 style={{ margin: 0 }}>Migration in progress</h2>
+            <Link className="small" to={`/executions/${active.id}`}>details</Link></div>
+          <TransferBar id={active.id} x={active.transfer} status={active.status} />
+        </div>)}
+
       {!dryOk && !active && m.phase !== "done" && <div className="alert info" style={{ marginBottom: 16 }}>
         Run a <b>dry-run</b> first. It validates both endpoints, re-checks the disk counts and shows the full plan without changing anything.</div>}
       {lastReal?.status === "failed" && !active && <div className="alert bad" style={{ marginBottom: 16 }}>

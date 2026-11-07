@@ -3,7 +3,7 @@
 
 import { useNavigate } from "react-router-dom";
 import { api, fmt, type Endpoint, type Migration } from "../api";
-import { Bar, ErrorBox, Icon, Loading, Status, useAuth, useLoad } from "../ui";
+import { Bar, ErrorBox, Icon, Loading, Status, TransferBar, useAuth, useLoad } from "../ui";
 
 export default function Migrations() {
   const nav = useNavigate();
@@ -35,7 +35,7 @@ export default function Migrations() {
           {can("operator") && <button className="btn primary" onClick={() => nav("/migrations/new")}>New migration</button>}</div>
       ) : (
         <div className="card"><div className="table-wrap"><table>
-          <thead><tr><th>Name</th><th>VM</th><th>Route</th><th className="num">Disks</th><th>Phase</th><th>Latest run</th><th style={{ width: 160 }}>Tasks</th><th>Updated</th></tr></thead>
+          <thead><tr><th>Name</th><th>VM</th><th>Route</th><th className="num">Disks</th><th>Phase</th><th>Latest run</th><th style={{ width: 240 }}>Progress</th><th>Updated</th></tr></thead>
           <tbody>{list.map((m) => {
             const x = m.last_execution;
             const total = x ? Object.values(x.task_counts).reduce((a, b) => a + b, 0) : 0;
@@ -48,7 +48,9 @@ export default function Migrations() {
                 <td className="num">{m.disks ?? "—"}</td>
                 <td><Status s={m.phase} /></td>
                 <td>{x ? <div className="row"><Status s={x.status} />{x.dry_run && <span className="tag">dry-run</span>}</div> : <span className="muted">never</span>}</td>
-                <td>{x && total ? <div className="row" style={{ flexWrap: "nowrap" }}>
+                <td>{x && !x.dry_run && x.transfer && x.transfer.total_bytes > 0 ? (
+                  <TransferBar id={x.id} x={x.transfer} status={x.status} compact />
+                ) : x && total ? <div className="row" style={{ flexWrap: "nowrap" }}>
                   <div style={{ flex: 1 }}><Bar pct={(comp / total) * 100} tone={x.status === "failed" ? "bad" : x.status === "completed" ? "ok" : undefined} /></div>
                   <span className="small muted">{comp}/{total}</span></div> : null}</td>
                 <td className="small muted">{fmt.ago(m.updated_at)}</td>

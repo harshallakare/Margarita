@@ -153,6 +153,102 @@ def create_app(services: Services | None = None) -> FastAPI:
         now = time.time()
         return [{**w, "alive": now - w["heartbeat_at"] < 3 * svc.settings.lease_seconds} for w in repo.list_workers()]
 
+    # ------------------------------------------------------------------ pools
+    from ..platform import pools as _pools
+
+    def pool_out(pl: dict[str, Any]) -> dict[str, Any]:
+        mem = _pools.members(pl, repo.list_workers(), time.time() - 3 * svc.settings.lease_seconds)
+        st = pl.get("state") or {}
+        return {**{k: pl[k] for k in ("id", "name", "region", "description", "min_size", "max_size", "provision",
+                                       "created_at", "updated_at")},
+                "tag": _pools.tag(pl["name"]), "members": mem, "busy": sum(1 for x in mem if x["busy"]),
+                "minions": st.get("minions", []), "last_error": st.get("last_error")}
+
+    def get_pool_or_404(pid: str) -> dict[str, Any]:
+        pl = repo.get_pool(pid)
+        if pl is None:
+            raise HTTPException(404, "pool not found")
+        return pl
+
+    @app.get("/pools", tags=["pools"])
+    def list_pools(_: Principal = Depends(viewer)) -> list[dict[str, Any]]:
+        return [pool_out(x) for x in repo.list_pools()]
+
+    @app.post("/pools", status_code=201, tags=["pools"])
+    def create_pool(body: m.PoolCreate, p: Principal = Depends(admin)) -> dict[str, Any]:
+        if repo.get_pool_by_name(body.name):
+            raise HTTPException(409, "a pool with this name exists")
+        if body.max_size < body.min_size:
+            raise HTTPException(422, "max_size must be >= min_size")
+        if body.provision is not None and repo.get_endpoint(body.provision.endpoint_id) is None:
+            raise HTTPException(422, "provision.endpoint_id not found")
+        pid = repo.create_pool(body.name, region=body.region, description=body.description, min_size=body.min_size,
+                               max_size=body.max_size, provision=body.provision.model_dump() if body.provision else None)
+        repo.add_event("pool.created", {"name": body.name, "by": p.username})
+        return pool_out(get_pool_or_404(pid))
+
+    @app.get("/pools/{pid}", tags=["pools"])
+    def get_pool(pid: str, _: Principal = Depends(viewer)) -> dict[str, Any]:
+        return pool_out(get_pool_or_404(pid))
+
+    @app.patch("/pools/{pid}", tags=["pools"])
+    def update_pool(pid: str, body: m.PoolUpdate, _: Principal = Depends(admin)) -> dict[str, Any]:
+        pl = get_pool_or_404(pid)
+        vals = body.model_dump(exclude_unset=True)
+        if "provision" in vals and vals["provision"] is not None:
+            vals["provision"] = body.provision.model_dump()  # type: ignore[union-attr]
+        lo, hi = vals.get("min_size", pl["min_size"]), vals.get("max_size", pl["max_size"])
+        if hi < lo:
+            raise HTTPException(422, "max_size must be >= min_size")
+        repo.update_pool(pid, **vals)
+        return pool_out(get_pool_or_404(pid))
+
+    @app.delete("/pools/{pid}", status_code=204, tags=["pools"])
+    def delete_pool(pid: str, _: Principal = Depends(admin)) -> None:
+        pl = get_pool_or_404(pid)
+        out = pool_out(pl)
+        if out["members"] or any(x.get("status") in ("booting", "joined", "stuck") for x in out["minions"]):
+            raise HTTPException(409, "pool still has live members or minions; stop/delete them first")
+        repo.delete_pool(pid)
+
+    @app.post("/pools/{pid}/enroll-token", tags=["pools"])
+    def enroll_token(pid: str, body: m.EnrollTokenRequest | None = None, p: Principal = Depends(admin)) -> dict[str, Any]:
+        pl = get_pool_or_404(pid)
+        tok, exp = repo.create_enroll_token(pid, (body or m.EnrollTokenRequest()).ttl_minutes * 60, p.user_id)
+        return {"token": tok, "expires_at": exp, "pool": pl["name"],
+                "command": f"sudo bash deploy.sh --enroll <https-url-of-this-api> --enroll-token {tok}"}
+
+    @app.delete("/pools/{pid}/minions/{server_id}", status_code=204, tags=["pools"])
+    def delete_minion(pid: str, server_id: str, _: Principal = Depends(admin)) -> None:
+        pl = get_pool_or_404(pid)
+        st = dict(pl.get("state") or {})
+        mins = list(st.get("minions") or [])
+        hit = next((x for x in mins if x["server_id"] == server_id), None)
+        if hit is None:
+            raise HTTPException(404, "not a minion of this pool")
+        svc.minion_provisioner(pl).delete(server_id)
+        hit["status"] = "deleted"
+        st["minions"] = mins
+        repo.update_pool(pid, state=st)
+
+    @app.post("/enroll", tags=["pools"])
+    def enroll(body: m.EnrollRequest, request: Request) -> dict[str, Any]:
+        """A new worker exchanges a single-use token for the shared DB URL + secret key."""
+        proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+        if proto != "https" and not svc.settings.allow_http_enroll:
+            raise HTTPException(403, "enrollment sends the secret key: use HTTPS (or set VMIGRATE_ALLOW_HTTP_ENROLL=1 "
+                                     "on a trusted lab network)")
+        if not svc.settings.database_url.startswith("postgres"):
+            raise HTTPException(409, "remote workers need a shared Postgres database; this server uses "
+                                     f"{svc.settings.database_url.split(':', 1)[0]}")
+        t = repo.consume_enroll_token(body.token, body.hostname or (request.client.host if request.client else "?"))
+        if t is None:
+            raise HTTPException(401, "invalid, used or expired enrollment token")
+        pl = repo.get_pool(t["pool_id"]) if t.get("pool_id") else None
+        repo.add_event("worker.enrolled", {"host": body.hostname, "pool": pl["name"] if pl else None})
+        return {"database_url": svc.settings.database_url, "secret_key": svc.settings.secret_key,
+                "region": pl.get("region") if pl else None, "tags": [_pools.tag(pl["name"])] if pl else []}
+
     @app.get("/secrets/status", tags=["meta"])
     def secret_status(_: Principal = Depends(admin)) -> dict[str, Any]:
         return svc.secrets.status()
@@ -162,7 +258,8 @@ def create_app(services: Services | None = None) -> FastAPI:
         keys = sorted(svc.secrets.get(e["secret_id"]).keys()) if e.get("secret_id") else []
         return m.EndpointOut(id=e["id"], name=e["name"], type=e["type"], project=e["project"],
                              description=e["description"], config=e["config"], has_credentials=bool(keys),
-                             credential_keys=keys, created_at=e["created_at"], updated_at=e["updated_at"])
+                             credential_keys=keys, created_at=e["created_at"], updated_at=e["updated_at"],
+                             region=e.get("region"), required_tags=list(e.get("required_tags") or []))
 
     def check_type(t: str) -> None:
         if t not in SOURCES and t not in TARGETS:
@@ -216,7 +313,8 @@ def create_app(services: Services | None = None) -> FastAPI:
             raise HTTPException(409, f"endpoint {body.name!r} exists")
         await require_connection(body.type, body.name, body.config, body.credentials)
         sid = svc.secrets.put(body.credentials) if body.credentials else None
-        eid = repo.create_endpoint(p.project, body.name, body.type, body.config, sid, body.description)
+        eid = repo.create_endpoint(p.project, body.name, body.type, body.config, sid, body.description,
+                                   region=body.region or None, required_tags=body.required_tags)
         return ep_out(repo.get_endpoint(eid))  # type: ignore[arg-type]
 
     @app.get("/endpoints/{eid}", response_model=m.EndpointOut, tags=["endpoints"])
@@ -230,6 +328,10 @@ def create_app(services: Services | None = None) -> FastAPI:
         vals: dict[str, Any] = {}
         if body.description is not None:
             vals["description"] = body.description
+        if body.region is not None:
+            vals["region"] = body.region or None
+        if body.required_tags is not None:
+            vals["required_tags"] = [t.strip() for t in body.required_tags if t.strip()]
         if body.config is not None:
             leaked = _secret_like(body.config)
             if leaked:
@@ -289,6 +391,29 @@ def create_app(services: Services | None = None) -> FastAPI:
         except ProviderNotImplemented as ex:
             raise HTTPException(400, str(ex)) from ex
 
+    @app.get("/endpoints/{eid}/resources", tags=["endpoints"])
+    async def target_resources(eid: str, p: Principal = Depends(viewer)) -> dict[str, Any]:
+        """Networks / storage / flavors on a TARGET endpoint, for the wizard's mapping dropdowns.
+        Each list is empty when the target does not enumerate it (the UI then offers free text)."""
+        e = scoped(repo.get_endpoint(eid), p, "endpoint")
+        if TARGETS.get(e["type"], (None,))[0] is None:
+            raise HTTPException(400, f"{e['type']!r} is not an implemented target provider")
+
+        def go() -> dict[str, Any]:
+            out: dict[str, Any] = {"networks": [], "storage": [], "flavors": [], "errors": {}}
+            tgt = svc.build_target(e, RunContext(dry_run=True))
+            try:
+                for key, fn in (("networks", tgt.list_networks), ("storage", tgt.list_storage),
+                                ("flavors", tgt.list_flavors)):
+                    try:
+                        out[key] = fn()
+                    except Exception as ex:  # noqa: BLE001 - report per list; the wizard falls back to text
+                        out["errors"][key] = f"{type(ex).__name__}: {ex}"
+            finally:
+                tgt.close()
+            return out
+        return await run_in_threadpool(go)
+
     @app.get("/endpoints/{eid}/instances", tags=["endpoints"])
     async def list_instances(eid: str, p: Principal = Depends(viewer)) -> list[dict[str, Any]]:
         e = scoped(repo.get_endpoint(eid), p, "endpoint")
@@ -325,10 +450,14 @@ def create_app(services: Services | None = None) -> FastAPI:
         return await run_in_threadpool(go)
 
     # ------------------------------------------------------------------ migrations
-    def ex_out(x: dict[str, Any], counts: dict[str, dict[str, int]] | None = None) -> m.ExecutionOut:
+    def ex_out(x: dict[str, Any], counts: dict[str, dict[str, int]] | None = None,
+               transfers: dict[str, dict[str, Any]] | None = None) -> m.ExecutionOut:
         counts = counts if counts is not None else repo.task_counts([x["id"]])
-        return m.ExecutionOut(**{k: x[k] for k in m.ExecutionOut.model_fields if k in x and k != "task_counts"},
-                              task_counts=counts.get(x["id"], {}))
+        transfers = transfers if transfers is not None else repo.transfer_summary([x["id"]])
+        return m.ExecutionOut(**{k: x[k] for k in m.ExecutionOut.model_fields
+                                 if k in x and k not in ("task_counts", "transfer")},
+                              task_counts=counts.get(x["id"], {}),
+                              transfer=transfers.get(x["id"]))
 
     def mig_out(r: dict[str, Any]) -> m.MigrationOut:
         st = r.get("state") or {}
@@ -355,6 +484,8 @@ def create_app(services: Services | None = None) -> FastAPI:
         if any(x["name"] == body.name for x in repo.list_migrations(p.project)):
             raise HTTPException(409, f"migration {body.name!r} exists")
         opts = body.options.model_dump(exclude_none=True)
+        if opts.get("pool") and repo.get_pool_by_name(opts["pool"]) is None:
+            raise HTTPException(422, f"worker pool {opts['pool']!r} does not exist")
         svc.engine_for({"options": opts})  # validates options.engine before anything is stored
         mid = repo.create_migration(p.project, body.name, "migration", src["id"], tgt["id"], body.vm, opts, p.user_id)
         return mig_out(repo.get_migration(mid))  # type: ignore[arg-type]
@@ -439,8 +570,9 @@ def create_app(services: Services | None = None) -> FastAPI:
         rows = repo.list_executions(migration_id, status)
         allowed = {x["id"] for x in repo.list_migrations(None if p.role == "admin" else p.project)}
         rows = [x for x in rows if x["migration_id"] in allowed]
-        counts = repo.task_counts([x["id"] for x in rows])
-        return [ex_out(x, counts) for x in rows]
+        ids = [x["id"] for x in rows]
+        counts, transfers = repo.task_counts(ids), repo.transfer_summary(ids)
+        return [ex_out(x, counts, transfers) for x in rows]
 
     @app.get("/executions/{xid}", response_model=m.ExecutionOut, tags=["executions"])
     def get_exec(xid: str, p: Principal = Depends(viewer)) -> m.ExecutionOut:
@@ -517,6 +649,7 @@ def create_app(services: Services | None = None) -> FastAPI:
             crosscheck=st.get("crosscheck"), consistent=bool(st.get("consistent")), current_sync=cur,
             last_sync=(st.get("syncs") or [None])[-1], syncs=list(reversed(st.get("syncs", [])))[:50],
             restore_points=list(reversed(st.get("restore_points", []))), deployments=list(reversed(deps)),
+            cutovers=list(reversed(st.get("cutovers", []))),
             errors=list(reversed(st.get("errors", [])))[:10],
             schedules=[sched_out(x) for x in repo.list_schedules(r["id"])],
             created_at=r["created_at"], updated_at=r["updated_at"], last_execution=ex_out(execs[0]) if execs else None)
@@ -546,6 +679,8 @@ def create_app(services: Services | None = None) -> FastAPI:
             raise HTTPException(409, f"{body.name!r} exists")
         cron = cron_or_400(body.schedule) if body.schedule else None
         opts = body.options.model_dump(exclude_none=True)
+        if opts.get("pool") and repo.get_pool_by_name(opts["pool"]) is None:
+            raise HTTPException(422, f"worker pool {opts['pool']!r} does not exist")
         svc.engine_for({"options": opts})
         rid = repo.create_migration(p.project, body.name, "replica", src["id"], tgt["id"], body.vm, opts, p.user_id)
         if cron:
@@ -562,6 +697,8 @@ def create_app(services: Services | None = None) -> FastAPI:
         if repo.active_execution(rid):
             raise HTTPException(409, "cannot change options while an execution is active")
         opts = body.options.model_dump(exclude_none=True)
+        if opts.get("pool") and repo.get_pool_by_name(opts["pool"]) is None:
+            raise HTTPException(422, f"worker pool {opts['pool']!r} does not exist")
         svc.engine_for({"options": opts})
         repo.update_migration(rid, options=opts)
         return rep_out(repo.get_migration(rid))  # type: ignore[arg-type]
@@ -593,6 +730,19 @@ def create_app(services: Services | None = None) -> FastAPI:
         params = {"restore_point": body.restore_point, "deployment_id": uuid.uuid4().hex[:12],
                   "deploy_name": body.deploy_name or f"{(r['options'] or {}).get('target_name') or r['vm']}-dr"}
         return start_kind(r, "replica_deploy", body.dry_run, p, params)
+
+    @app.post("/replicas/{rid}/cutover", response_model=m.ExecutionOut, status_code=202, tags=["replicas"])
+    def cutover_replica(rid: str, body: m.CutoverRequest, p: Principal = Depends(operator)) -> m.ExecutionOut:
+        """Planned failover: [shut the source down if asked] -> final sync -> deploy. Shutting the source
+        down is the only source state change Margarita makes, and only with shutdown_source=true."""
+        r = rep_scoped(rid, p)
+        if not (r.get("state") or {}).get("syncs"):
+            raise HTTPException(409, "cutover needs a completed initial sync; run the replica first")
+        params = {"shutdown_source": body.shutdown_source, "force_power_off": body.force_power_off,
+                  "shutdown_timeout": body.shutdown_timeout, "deployment_id": uuid.uuid4().hex[:12],
+                  "cutover_id": uuid.uuid4().hex[:12],
+                  "deploy_name": body.deploy_name or f"{(r['options'] or {}).get('target_name') or r['vm']}"}
+        return start_kind(r, "replica_cutover", body.dry_run, p, params)
 
     @app.post("/replicas/{rid}/delete-disks", response_model=m.ExecutionOut, status_code=202, tags=["replicas"])
     def delete_replica_disks(rid: str, body: m.StartRequest | None = None, p: Principal = Depends(operator)) -> m.ExecutionOut:

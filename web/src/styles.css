@@ -209,6 +209,9 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, .btn:focus-vi
 .bar { height: 6px; border-radius: 99px; background: var(--muted-soft); overflow: hidden; min-width: 80px; }
 .bar > i { display: block; height: 100%; background: var(--run); border-radius: 99px; transition: width .4s ease; }
 .bar.ok > i { background: var(--ok); }
+.transfer { display: grid; gap: 6px; min-width: 0; }
+.transfer.compact { gap: 3px; min-width: 160px; }
+.transfer .small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bar.bad > i { background: var(--bad); }
 .bar.lg { height: 10px; }
 

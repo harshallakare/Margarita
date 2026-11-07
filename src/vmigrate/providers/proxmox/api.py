@@ -91,6 +91,16 @@ class PveApi:
                 raise TransientProviderError(f"{what}: task {upid} still running after {self.task_timeout}s")
             time.sleep(2)
 
+    def status(self, node: str, vmid: int) -> str:
+        return str((self.get(f"/nodes/{node}/qemu/{vmid}/status/current") or {}).get("status", ""))
+
+    def shutdown(self, node: str, vmid: int, *, force: bool, timeout: int) -> None:
+        if force:
+            upid = self._call("POST", f"/nodes/{node}/qemu/{vmid}/status/stop")
+        else:
+            upid = self._call("POST", f"/nodes/{node}/qemu/{vmid}/status/shutdown", data={"timeout": timeout})
+        self.wait_task(node, upid, f"{'stop' if force else 'shutdown'} VM {vmid}")
+
     def create_snapshot(self, node: str, vmid: int, name: str, *, vmstate: bool = False) -> None:
         if not name.startswith(SNAP_PREFIX):
             raise SafetyGateError("snapshot names must start with vmigrate-")

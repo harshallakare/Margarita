@@ -35,6 +35,8 @@ function EndpointForm({ providers, existing, onClose, onSaved }: {
   const [type, setType] = useState(existing?.type ?? "");
   const [name, setName] = useState(existing?.name ?? "");
   const [desc, setDesc] = useState(existing?.description ?? "");
+  const [region, setRegion] = useState(existing?.region ?? "");
+  const [tags, setTags] = useState((existing?.required_tags ?? []).join(", "));
   const fields = fieldsFor(providers, type);
   const known = new Set(fields.map((f) => f.name));
   const init = (): Record<string, string | boolean> => {
@@ -98,15 +100,18 @@ function EndpointForm({ providers, existing, onClose, onSaved }: {
         Object.assign(config, x);
       }
     } catch (e) { setErr(errText(e)); return; }
+    const tagList = tags.split(",").map((t) => t.trim()).filter(Boolean);
     setBusy(true);
     try {
       if (existing) {
         await api.patch(`/endpoints/${existing.id}`, {
-          description: desc, config, ...(Object.keys(creds).length ? { credentials: creds } : {}),
+          description: desc, config, region, required_tags: tagList,
+          ...(Object.keys(creds).length ? { credentials: creds } : {}),
         });
         onSaved(`Saved ${existing.name}`);
       } else {
-        await api.post("/endpoints", { name, type, description: desc, config, credentials: creds });
+        await api.post("/endpoints", { name, type, description: desc, config, credentials: creds,
+          region: region || null, required_tags: tagList });
         onSaved(`Added ${name}`);
       }
     } catch (e) { setErr(errText(e)); setBusy(false); }
@@ -151,6 +156,10 @@ function EndpointForm({ providers, existing, onClose, onSaved }: {
                   <textarea value={String(vals[f.name] ?? "")} spellCheck={false} autoComplete="off"
                             placeholder={f.secret && existing?.credential_keys.includes(f.name) ? "•••••• (unchanged)" : ""}
                             onChange={(e) => setVals({ ...vals, [f.name]: e.target.value })} />
+                ) : f.kind === "select" ? (
+                  <select value={String(vals[f.name] ?? "")} onChange={(e) => setVals({ ...vals, [f.name]: e.target.value })}>
+                    {(f.options ?? []).map((o) => <option key={o} value={o}>{o}</option>)}
+                  </select>
                 ) : (
                   <input type={f.secret ? "password" : f.kind === "int" ? "number" : f.kind === "url" ? "url" : "text"}
                          value={String(vals[f.name] ?? "")} autoComplete={f.secret ? "new-password" : "off"}
@@ -160,6 +169,12 @@ function EndpointForm({ providers, existing, onClose, onSaved }: {
                 {f.help && <small>{f.help}</small>}
               </label>
             ))}
+            <label className="field"><span>Region / site (optional)</span>
+              <input type="text" value={region} placeholder="e.g. dc-pune" onChange={(e) => setRegion(e.target.value)} />
+              <small>Jobs for this endpoint run only on workers in the same region.</small></label>
+            <label className="field"><span>Required worker tags (optional)</span>
+              <input type="text" value={tags} placeholder="e.g. vstorage, site-a" onChange={(e) => setTags(e.target.value)} />
+              <small>Comma-separated capabilities a worker must have to use this endpoint.</small></label>
             <label className="field wide"><span>Advanced config (JSON)</span>
               <textarea value={extra} onChange={(e) => setExtra(e.target.value)} placeholder='{"poll_interval": 10}' />
               <small>Extra non-secret adapter keys. Password-like keys are rejected here; use the encrypted fields.</small>

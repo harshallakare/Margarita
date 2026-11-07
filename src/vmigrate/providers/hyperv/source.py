@@ -13,6 +13,9 @@ Usage (endpoint config; password goes in the encrypted credentials):
       "C:\\ClusterStorage\\Volume1": /mnt/hv/csv1
       "\\\\fs01\\vmstore": /mnt/hv/vmstore
     rct: false                               # experimental: RCT-based incremental replica reads
+    rct_service_url: https://hv01:6677       # optional: Cloudbase rct-service on the host (Apache-2.0):
+    rct_service_auth_key: ...                #   reads + RCT changes over HTTPS, no share_map needed
+    rct_service_fingerprint: <sha256 hex>    #   pinned certificate
 
 How it works:
   inspect  : Get-VM / Get-VMHardDiskDrive / Get-VHD / Get-VMNetworkAdapter / KVP (guest OS) -> IR
@@ -38,6 +41,8 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
+from .rctservice import RctServiceClient, RctServiceReader
+
 from ...core.context import RunContext
 from ...core.errors import ChangeTrackingUnavailable, ConfigError, LiveDiskReadRefused, ProviderError, SafetyGateError
 from ...core.formats.vhd import open_virtual_disk
@@ -57,6 +62,7 @@ class HypervSource(SourceProvider):
                 raise ConfigError(f"hyperv source {name}: missing {k!r}")
         self.share_map: dict[str, str] = dict(config.get("share_map") or {})
         self.rct = bool(config.get("rct", False))
+        self._rcts: Any = None
         self._client = client
         self._info: dict[str, dict[str, Any]] = {}
 
@@ -95,8 +101,15 @@ class HypervSource(SourceProvider):
         p: list[str] = []
         if not ping.get("hyperv"):
             p.append(f"{ping.get('host')}: the Hyper-V PowerShell module is not available")
+        if self.config.get("rct_service_url"):
+            try:
+                self.rct_service()
+            except Exception as e:  # noqa: BLE001
+                p.append(str(e))
+            return p                  # reads go through rct-service: no share mounts needed
         if not self.share_map:
-            p.append("share_map is empty: map the host's VM storage paths to mounts on this worker")
+            p.append("share_map is empty: map the host's VM storage paths to mounts on this worker "
+                     "(or use rct_service_url)")
         if spec is not None:
             for d in spec.disks:
                 try:
@@ -130,6 +143,14 @@ class HypervSource(SourceProvider):
     def disk_count_crosscheck(self, vm: VmRef) -> dict[str, int]:
         return mapping.crosscheck(self.info(vm))
 
+    def shutdown_vm(self, vm: VmRef, *, force: bool = False, timeout: int = 900) -> str:
+        """Stop-VM (guest shutdown via integration services) or Stop-VM -TurnOff when force."""
+        self.ctx.require_execute("hyper-v stop vm", vm=vm.name, force=force)
+        r = self.client.stop_vm(vm.id, force=force) or {}
+        if str(r.get("state")) != "Off":
+            raise ProviderError(f"{vm.name}: state {r.get('state')} after Stop-VM; retry with force_power_off")
+        return f"{vm.name} {'already off' if r.get('already') else 'stopped'}"
+
     def create_snapshot(self, vm: VmRef, app_consistent: bool) -> SnapshotRef:
         self.ctx.require_execute("hyper-v recovery snapshot", vm=vm.name, app_consistent=app_consistent)
         spec = mapping.to_vmspec(self.info(vm))
@@ -159,7 +180,8 @@ class HypervSource(SourceProvider):
         if (sd.get("vhd_type") or "").lower() == "differencing" or sd.get("parent"):
             raise SafetyGateError(f"{sd['path']} is a differencing disk (the VM already had checkpoints before ours); "
                                   "delete/merge the existing checkpoints, then retry")
-        r = open_virtual_disk(mapping.local_path(sd["path"], self.share_map))
+        svc = self.rct_service()
+        r = RctServiceReader(svc, sd["path"]) if svc else open_virtual_disk(mapping.local_path(sd["path"], self.share_map))
         if r.size < disk.size_bytes:
             r.close()
             raise SafetyGateError(f"{sd['path']}: image size {r.size} < inspected {disk.size_bytes}")
@@ -217,4 +239,13 @@ class HypervSource(SourceProvider):
         path = (cur.data.get("paths") or {}).get(disk.id)
         if not limit or not path:
             raise ChangeTrackingUnavailable(f"no RCT id recorded for {disk.label or disk.id}")
+        svc = self.rct_service()
+        if svc is not None:
+            return svc.changes(path, limit)
         return mapping.changed_ranges(lambda off, n: self.client.changed(path, limit, off, n), disk.size_bytes)
+
+    def rct_service(self) -> Any:
+        if self._rcts is None and self.config.get("rct_service_url"):
+            self._rcts = RctServiceClient(self.config["rct_service_url"], str(self.config.get("rct_service_auth_key") or ""),
+                                          fingerprint=self.config.get("rct_service_fingerprint") or None)
+        return self._rcts

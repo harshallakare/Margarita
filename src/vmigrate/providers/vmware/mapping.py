@@ -117,6 +117,7 @@ def to_vmspec(info: dict[str, Any]) -> VmSpec:
             bus_index=busno * per_bus + unit, label=f"{bus.value}{busno}:{unit}", controller=model,
             source_handle={"key": d["key"], "file_name": d["file_name"], "datastore": d.get("datastore"),
                            "backing_type": d.get("backing_type")},
+            shared_id=d["file_name"] if d.get("sharing") == "sharingMultiWriter" else None,
         ))
     nics = [NicSpec(id=str(n["key"]), network=n.get("network") or "", mac=n.get("mac"),
                     model=NIC_MODELS.get(n.get("type", ""), n.get("type"))) for n in info.get("nics") or []]

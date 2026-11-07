@@ -69,9 +69,13 @@ class DbLogHandler(logging.Handler):
 
 
 class Worker:
-    def __init__(self, services: Services, worker_id: str | None = None):
+    def __init__(self, services: Services, worker_id: str | None = None, *, region: str | None = None,
+                 capabilities: set[str] | None = None):
+        from ..core.routing import detect_capabilities
         self.svc = services
         self.repo = services.repo
+        self.region = region if region is not None else (os.environ.get("VMIGRATE_WORKER_REGION") or None)
+        self.capabilities = capabilities if capabilities is not None else detect_capabilities()
         self.host = socket.gethostname()
         self.id = worker_id or f"{self.host}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
         self._stop = threading.Event()
@@ -81,11 +85,13 @@ class Worker:
         self._stop.set()
 
     def heartbeat(self) -> None:
-        self.repo.worker_heartbeat(self.id, self.host, os.getpid(), self.current)
+        self.repo.worker_heartbeat(self.id, self.host, os.getpid(), self.current, region=self.region,
+                                   capabilities=sorted(self.capabilities))
 
     def tick(self) -> str | None:
         self.heartbeat()
-        xid = self.repo.claim_execution(self.id, self.svc.settings.lease_seconds)
+        xid = self.repo.claim_execution(self.id, self.svc.settings.lease_seconds, region=self.region,
+                                        caps=self.capabilities)
         if xid is None:
             return None
         self.run_execution(xid)
@@ -161,11 +167,12 @@ class Worker:
             if kind == "migration":
                 runner = self.svc.build_runner(mig, ctx)
                 handlers = migration_handlers(runner)
-            elif kind in ("replica_sync", "replica_deploy", "replica_delete"):
+            elif kind in ("replica_sync", "replica_deploy", "replica_delete", "replica_cutover"):
                 runner = self.svc.build_replica_runner(mig, ctx)
                 handlers = {"replica_sync": runner.sync_handlers,
                             "replica_deploy": lambda: runner.deploy_handlers(dict(ex.get("params") or {})),
-                            "replica_delete": runner.delete_handlers}[kind]()
+                            "replica_delete": runner.delete_handlers,
+                            "replica_cutover": lambda: runner.cutover_handlers(dict(ex.get("params") or {}))}[kind]()
             else:
                 raise RuntimeError(f"unknown execution kind {kind!r}")
             try:

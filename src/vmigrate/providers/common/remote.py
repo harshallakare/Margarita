@@ -37,12 +37,12 @@ RUN_DIR = "/run/vmigrate"
 
 class SshNode:
     def __init__(self, host: str, user: str, key_pem: str, known_hosts: str, *, port: int = 22, ssh: str = "ssh",
-                 timeout: float = 600):
+                 timeout: float = 600, who: str = "proxmox"):
         if not known_hosts.strip():
-            raise ConfigError("proxmox: ssh_known_hosts is required (pin the node's host key; e.g. output of "
-                              "`ssh-keyscan -t ed25519 <node>` checked against the node console)")
+            raise ConfigError(f"{who}: ssh_known_hosts is required (pin the host key; e.g. output of "
+                              "`ssh-keyscan -t ed25519 <host>` checked against the console)")
         if not key_pem.strip():
-            raise ConfigError("proxmox: ssh_private_key is required in the endpoint credentials")
+            raise ConfigError(f"{who}: ssh_private_key is required in the endpoint credentials")
         self.host, self.user, self.port, self.ssh, self.timeout = host, user, port, ssh, timeout
         self._dir = tempfile.mkdtemp(prefix="vmigrate-ssh-")
         os.chmod(self._dir, 0o700)
@@ -69,6 +69,14 @@ class SshNode:
         if check and p.returncode != 0:
             raise ProviderError(f"{self.host}: `{argv[0]}` failed ({p.returncode}): {p.stderr.strip()[-1000:]}")
         return p.stdout
+
+    def spawn(self, argv: list[str]) -> subprocess.Popen:
+        """Long-lived remote process with binary stdin/stdout pipes (disk reader streams)."""
+        remote = " ".join(shlex.quote(a) for a in argv)
+        if self.user != "root":
+            remote = "sudo -n " + remote
+        return subprocess.Popen([*self.base_argv(), "--", remote], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
 
     def forward(self, local_sock: str, remote_sock: str) -> subprocess.Popen:
         argv = [*self.base_argv()[:-1], "-N", "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes",

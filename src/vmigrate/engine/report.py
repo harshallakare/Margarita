@@ -12,6 +12,18 @@ from ..core.context import PlannedAction
 from .state import MigrationState
 
 
+def _verdict(v: dict) -> str:
+    if not v:
+        return "-"
+    out = "PASS" if v.get("ok") else "FAIL"
+    full = v.get("full") or {}
+    if full.get("skipped"):
+        return out + " (full: skipped)"
+    if "source_sha256" in full:
+        return out + (f" (sha256 {full['source_sha256'][:12]})" if full.get("ok") else " (sha256 MISMATCH)")
+    return out
+
+
 def _gib(n: int | None) -> str:
     return f"{(n or 0) / (1 << 30):,.2f} GiB"
 
@@ -45,7 +57,7 @@ def render_markdown(st: MigrationState, planned: list[PlannedAction] | None = No
             f"| {ds.order} | `{ds.disk_id}`{' (boot)' if d.get('is_boot') else ''} | {d.get('bus', '')}.{d.get('bus_index', '')} "
             f"| {_gib(ds.size_bytes)} | {'yes' if ds.copied else f'{ds.bytes_copied * 100 // max(ds.size_bytes, 1)}%'} "
             f"| {mbps} | {_gib(cs.get('bytes_zero_skipped'))} | {'yes' if ds.committed else 'no'} "
-            f"| {'yes' if ds.attached else 'no'} | {'PASS' if v.get('ok') else ('FAIL' if v else '-')} |"
+            f"| {'yes' if ds.attached else 'no'} | {_verdict(v)} |"
         )
     if st.morph:
         lines += ["", "## OSMorph", "", f"- status: `{st.morph.get('status')}`", f"- strategy: `{st.morph.get('strategy')}`"]

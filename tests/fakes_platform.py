@@ -172,6 +172,8 @@ class FakeOpenStack:
     def volume_action(self, vid, body): self.actions.append((vid, body))
     def flavors(self): return [{"id": "f-big", "vcpus": 16, "ram": 65536}, {"id": "f-8x16", "vcpus": 8, "ram": 16384}]
     def find_flavor(self, n): return next((f for f in self.flavors() if f["id"] == n), None)
+    def networks(self): return [{"id": "n-2", "name": "prod-net", "is_shared": True}, {"id": "n-1", "name": "backup"}]
+    def volume_types(self): return [{"name": "vmds"}, {"name": "vmds-hdd"}]
 
     def create_server(self, **kw):
         sid = self._id("srv")
