@@ -14,6 +14,9 @@ Usage (config):
         protection_domain: vmigrate-pd             # NFS transport only: PD used for OOB snapshots
         protect_vm_if_missing: false               # add VM to the PD automatically (PD config change)
         snapshot_retention_secs: 172800
+        crt: true                                  # replicas: read only changed regions (iSCSI transport)
+        crt_base_keep_hours: 336                   # how long the kept base recovery point lives (> sync interval)
+        crt_api_version: v4.0                      # dataprotection API version for the CRT calls
         # NFS access is AUTOMATIC: the worker mounts each needed container read-only from the
         # cluster (<prism_element host>:/<container>) and unmounts it afterwards. One-time cluster
         # step: add the worker's IP to the NFS whitelist. Optional overrides:
@@ -28,6 +31,13 @@ How it works (iSCSI transport, PC >= 7.3 / AOS >= 6.8 — the Coriolis method, n
   read     : iscsiadm login to the cluster Data Services IP; each LUN mapped to its disk and size-
              checked; the volume group's disk count and the visible LUN count join the disk gate
   cleanup  : iSCSI logout -> detach initiator -> delete volume group -> delete recovery point
+  replicas : CRT (changed region tracking). At the end of a sync the volume group and iSCSI session go,
+             but the recovery point is KEPT (expiry extended to crt_base_keep_hours) as the reference;
+             the next sync asks Prism for the regions that differ between the new and the kept recovery
+             point (discover-cluster on PC -> compute-changed-regions on the cluster with a 15-min JWT)
+             and reads only those. The old reference is then deleted; deleting the replica deletes the
+             last one. Any CRT error (base expired, unsupported AOS) -> that disk uses compare mode.
+             The NFS transport has no CRT: compare mode.
 How it works (NFS transport, any cluster; the manually proven path):
   inspect  : Prism v3 VM (paged list, full disk_list) joined with v2 vm_disk_info; both must agree
   gate     : disk_count_crosscheck = {prism_v3.disk_list, prism_v2.vm_disk_info}
@@ -49,9 +59,10 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ...core.context import RunContext
-from ...core.errors import ConfigError, LiveDiskReadRefused, ProviderError, SafetyGateError
+from ...core.errors import ChangeTrackingUnavailable, ConfigError, LiveDiskReadRefused, ProviderError, SafetyGateError
 from ...core.fileio import RawFileReader
-from ...core.interfaces import DiskReader, SnapshotRef, SourceProvider, VmRef
+from ...core.interfaces import CheckpointRef, DiskReader, SnapshotRef, SourceProvider, VmRef
+from ...core.ranges import ByteRange, normalize
 from ...core.retry import poll_until
 from ...ir import DiskSpec, VmSpec
 from .client import PrismClient
@@ -203,7 +214,8 @@ class NutanixSource(SourceProvider):
         if self._v4 is None:
             if not self.config.get("prism_central"):
                 raise ConfigError("the iSCSI transport needs prism_central (Prism Central v4 API)")
-            self._v4 = PrismV4(self.c.s, self.config["prism_central"])
+            self._v4 = PrismV4(self.c.s, self.config["prism_central"],
+                               crt_version=str(self.config.get("crt_api_version", "v4.0")))
         return self._v4
 
     def _v4_status(self) -> tuple[bool, str]:
@@ -307,7 +319,9 @@ class NutanixSource(SourceProvider):
         ref = SnapshotRef(id=name, vm=vm, app_consistent=app, data=data)
         try:
             data["recovery_point"] = v4.create_recovery_point(vm.id, name, app_consistent=app)
-            rp_disks = v4.recovery_point_disks(data["recovery_point"])
+            layout = v4.recovery_point_layout(data["recovery_point"])
+            data["vm_recovery_point"] = layout["vm_recovery_point"]
+            rp_disks = layout["disks"]
             pairs = []
             for d in spec.ordered_disks():
                 keys = {d.id, d.source_handle.get("v3_uuid"), d.source_handle.get("vmdisk_uuid")} - {None, ""}
@@ -316,6 +330,7 @@ class NutanixSource(SourceProvider):
                     raise SafetyGateError(f"recovery point has no unique copy of disk {d.address} ({sorted(keys)}); "
                                           f"it lists {sorted(rp_disks)}")
                 pairs.append((d, hit[0]))
+            data["disk_rps"] = {d.id: drp for d, drp in pairs}
             if len(rp_disks) != len(spec.disks):
                 raise SafetyGateError(f"recovery point covers {len(rp_disks)} disks, the VM has {len(spec.disks)}")
             data["volume_group"] = v4.create_volume_group(name, cluster)
@@ -430,6 +445,71 @@ class NutanixSource(SourceProvider):
         if not local.exists():
             raise ProviderError(f"snapshot disk file not visible over NFS: {local}")
         return RawFileReader(local, size=disk.size_bytes)
+
+    # ------------------------------------------------------------------ CRT (replica change tracking)
+    def supports_cbt(self) -> bool:
+        """CRT works on the iSCSI transport's v4 recovery points; any gap falls back to compare."""
+        return bool(self.config.get("crt", True)) and self.config.get("transport", "auto") != "nfs"
+
+    def keep_for_cbt(self) -> bool:
+        return False      # only the recovery point is kept (retire_snapshot), not the VG / iSCSI session
+
+    def checkpoint(self, snapshot: SnapshotRef) -> CheckpointRef:
+        d = snapshot.data
+        if d.get("transport") != "iscsi" or not d.get("disk_rps") or not d.get("vm_recovery_point"):
+            return CheckpointRef(id=snapshot.id, data={})
+        return CheckpointRef(id=d["recovery_point"], data={
+            "recovery_point": d["recovery_point"], "vm_recovery_point": d["vm_recovery_point"],
+            "disks": dict(d["disk_rps"]), "crt": True})
+
+    def retire_snapshot(self, snapshot: SnapshotRef, previous: CheckpointRef | None) -> CheckpointRef:
+        cp = self.checkpoint(snapshot)
+        if not (self.supports_cbt() and cp.data.get("crt")):
+            self.cleanup(snapshot)                          # recovery point deleted: nothing to reference
+            return CheckpointRef(id=snapshot.id, data={})
+        # tear down the read path but keep the recovery point as the next sync's CRT reference
+        keep = dict(snapshot.data)
+        keep.pop("recovery_point", None)
+        self._cleanup_iscsi(SnapshotRef(id=snapshot.id, vm=snapshot.vm, app_consistent=snapshot.app_consistent,
+                                        data=keep))
+        try:
+            self.ctx.require_execute("nutanix keep recovery point as CRT base", recovery_point=cp.id)
+            self.v4.set_expiration(cp.id, float(self.config.get("crt_base_keep_hours", 24 * 14)))
+        except Exception as e:  # noqa: BLE001 - never leave it half-kept; next sync falls back to compare
+            self.ctx.logger.warning("could not keep recovery point %s for CRT (%s); deleting it", cp.id, e)
+            self.v4.delete_recovery_point(cp.id)
+            return CheckpointRef(id=snapshot.id, data={})
+        if previous is not None and previous.data.get("crt") and previous.id != cp.id:
+            self.release_checkpoint(previous)
+        return cp
+
+    def release_checkpoint(self, checkpoint: CheckpointRef) -> None:
+        if checkpoint.data.get("crt") and checkpoint.data.get("recovery_point"):
+            self.ctx.require_execute("nutanix delete CRT base recovery point", recovery_point=checkpoint.id)
+            try:
+                self.v4.delete_recovery_point(checkpoint.data["recovery_point"])
+            except ProviderError as e:
+                if "404" not in str(e):        # already expired / deleted is fine
+                    raise
+
+    def changed_regions(self, disk: DiskSpec, base: CheckpointRef, cur: CheckpointRef) -> list[ByteRange]:
+        b, c = base.data, cur.data
+        if not (b.get("crt") and c.get("crt")):
+            raise ChangeTrackingUnavailable("no Nutanix recovery point recorded for CRT (first CRT sync, NFS "
+                                            "transport, or the base could not be kept)")
+        bd, cd = (b.get("disks") or {}).get(disk.id), (c.get("disks") or {}).get(disk.id)
+        if not bd or not cd:
+            raise ChangeTrackingUnavailable(f"disk {disk.address} is missing from a CRT recovery point")
+        ref = {"recovery_point": b["recovery_point"], "vm_recovery_point": b["vm_recovery_point"],
+               "disk_recovery_point": bd}
+        now = {"recovery_point": c["recovery_point"], "vm_recovery_point": c["vm_recovery_point"],
+               "disk_recovery_point": cd}
+        try:
+            regs = self.v4.changed_regions(now, ref, disk.size_bytes)
+        except ProviderError as e:      # base expired/deleted, CRT unsupported on this AOS, ...
+            raise ChangeTrackingUnavailable(f"Nutanix CRT failed for {disk.address}: {e}") from e
+        return normalize([ByteRange(o, min(n, disk.size_bytes - o)) for o, n, _ in regs
+                          if n > 0 and o < disk.size_bytes])
 
     # ------------------------------------------------------------------ cleanup
     def cleanup(self, snapshot: SnapshotRef) -> None:

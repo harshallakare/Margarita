@@ -77,9 +77,17 @@ delete: validate target → delete replica disks + restore points + source base 
 - **VHI incremental writes:** the local raw staging image is rebuilt from the VMDS backing
   (`qemu-img convert -f qcow2 -O raw`, a local vStorage read), the deltas are applied, and the image is converted
   back with the tuned options (pitfall 4). Source NFS reads are limited to what changed (with CBT).
-- **Nutanix change tracking:** not wired yet. The adapter has `supports_cbt() = False`, so Nutanix replicas
-  use `compare` (a full NFS read each sync, writing only what changed). Nutanix CRT works with v3/v4 recovery
-  points rather than the PD snapshots this adapter uses, and needs checking against your Prism Central version.
+- **Nutanix change tracking (CRT):** on the iSCSI transport, replica syncs read only the regions Prism reports
+  as changed since the previous sync. After each sync, the volume group and iSCSI session are removed. The
+  recovery point is kept as the next sync's reference, with its expiry extended to `crt_base_keep_hours`
+  (default 14 days). Set that longer than your sync interval. The next sync calls Prism Central's v4
+  `discover-cluster` and then the cluster's `compute-changed-regions`, reads those ranges, and deletes the old
+  reference. Deleting the replica deletes the last one.
+  - If CRT fails for a disk (the reference expired, or the AOS version doesn't support it), that disk falls
+    back to `compare`. The sync still completes correctly.
+  - The NFS transport has no CRT and always uses `compare`.
+  - API field names come from Nutanix's own v4 dataprotection SDK. They are untested against a live Prism
+    Central (needs PC 7.3+ / AOS 7.3+, or pc.2024.3+ per Nutanix's blog). `crt: false` turns CRT off.
 - **Schedules:** 5-field cron in **UTC** (`*/15 * * * *`, `0 2 * * 1-5`, `@daily`), run by the conductor.
   A slot that comes due while the replica has an active execution is skipped and recorded, never stacked.
   `GET /schedules/preview?cron=` returns the next run times.
@@ -631,7 +639,7 @@ place, plus range math in `src/vmigrate/core/ranges.py`. Orchestration of delta 
 | Migration mode via API → conductor → worker (task DAG, resume, cancel, retry, lease recovery) | **done** |
 | Endpoints, encrypted credentials, local users + RBAC, SSE events, per-task logs, reports | **done** |
 | Replica mode: incremental sync (full / cbt / compare), deploy from latest or restore point, schedules, retention, delete-disks | **done** (fake + VHI; VHI without restore points) |
-| Nutanix change tracking (CRT) for replicas | planned; Nutanix replicas use `compare` |
+| Nutanix change tracking (CRT) for replicas | **done** (iSCSI transport; fakes only, not yet run on a live Prism Central) |
 | Web UI: endpoints, wizard, live progress, reports, settings | **done** |
 | Worker routing (regions, capabilities), worker pools, enrollment tokens, auto-provisioned minions (VHI/OpenStack) | **done** (fakes only) |
 | Cross-site export agent, replica cutover, full checksum verification, shared-disk clusters | **done** (fakes only) |

@@ -75,6 +75,10 @@ FIELDS: dict[str, list[dict[str, Any]]] = {
                  "(whitelist the worker IP on the cluster once)"},
         {"name": "nfs_root", "label": "Pre-mounted root (optional)", "kind": "text",
          "help": "only if you mount containers yourself: <nfs_root>/<container>"},
+        {"name": "crt", "label": "Change tracking for replicas (CRT)", "kind": "bool", "default": True,
+         "help": "replica syncs read only changed regions (iSCSI transport); falls back to compare on any error"},
+        {"name": "crt_base_keep_hours", "label": "Keep CRT base recovery point (hours)", "kind": "int", "default": 336,
+         "help": "must be longer than the time between syncs, or the next sync falls back to compare"},
     ],
     "vhi": [
         {"name": "auth_url", "label": "Keystone URL", "kind": "url", "required": True,

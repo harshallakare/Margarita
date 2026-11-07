@@ -17,6 +17,19 @@ v4 conventions handled here: every mutating call carries a fresh NTNX-Request-Id
 long operations return a task id polled at /api/prism/v4.0/config/tasks/{id}, deletes send the
 entity's ETag as If-Match. Only objects named vmigrate-* are ever deleted.
 
+Changed regions (CRT, for incremental replica syncs), wire names taken from Nutanix's own v4
+dataprotection SDK (ntnx-dataprotection-py-client 4.4.2, read not vendored):
+    1. PC   POST {dp}/config/recovery-points/{rp}/$actions/discover-cluster
+            {"operation": "COMPUTE_CHANGED_REGIONS", "spec": {"$objectType":
+             "dataprotection.v4.content.ComputeChangedRegionsClusterDiscoverSpec",
+             "diskRecoveryPoint": {VmDiskRecoveryPointReference}, "referenceDiskRecoveryPoint": {...}}}
+            -> data.clusterIp.ipv4.value + data.jwtToken (15 min, bound to that disk recovery point)
+    2. PE   POST https://<clusterIp>:9440{dp}/content/recovery-points/{rp}/vm-recovery-points/{vmrp}/
+            disk-recovery-points/{drp}/$actions/compute-changed-regions   (Cookie NTNX_IGW_SESSION=<jwt>)
+            {"offset", "referenceRecoveryPointExtId", "referenceVmRecoveryPointExtId",
+             "referenceDiskRecoveryPointExtId"} -> data: [{offset, length, regionType: REGULAR|ZEROED}],
+            metadata.extraInfo: [{name: nextOffset}, {name: fileSize}]; up to 10,000 regions per call.
+
 VERIFY ON FIRST LIVE RUN: field names below follow the published v4.0 GA schemas
 (dataprotection / volumes / clustermgmt / prism). They are isolated in this module, and every
 response is checked for the fields we use, so a mismatch fails loudly with the raw payload.
@@ -34,6 +47,9 @@ from ...core.errors import ProviderError, SafetyGateError, TransientProviderErro
 PREFIX = "vmigrate-"
 CLUSTERS = "/api/clustermgmt/v4.0/config/clusters"
 RECOVERY_POINTS = "/api/dataprotection/v4.0/config/recovery-points"
+DP_CONTENT = "/api/dataprotection/{ver}/content/recovery-points"
+DP_CONFIG = "/api/dataprotection/{ver}/config/recovery-points"
+OT = "dataprotection.v4.content."
 VOLUME_GROUPS = "/api/volumes/v4.0/config/volume-groups"
 TASKS = "/api/prism/v4.0/config/tasks"
 
@@ -71,9 +87,40 @@ def vg_disk_body(rp_ext: str, disk_rp_ext: str, index: int) -> dict[str, Any]:
                                         "name": rp_ext}}
 
 
+def _disk_ref(r: dict[str, str]) -> dict[str, Any]:
+    return {"$objectType": OT + "VmDiskRecoveryPointReference", "recoveryPointExtId": r["recovery_point"],
+            "vmRecoveryPointExtId": r["vm_recovery_point"], "diskRecoveryPointExtId": r["disk_recovery_point"]}
+
+
+def discover_body(cur: dict[str, str], ref: dict[str, str] | None) -> dict[str, Any]:
+    spec: dict[str, Any] = {"$objectType": OT + "ComputeChangedRegionsClusterDiscoverSpec",
+                            "diskRecoveryPoint": _disk_ref(cur)}
+    if ref:
+        spec["referenceDiskRecoveryPoint"] = _disk_ref(ref)
+    return {"operation": "COMPUTE_CHANGED_REGIONS", "spec": spec}
+
+
+def compute_body(offset: int, ref: dict[str, str] | None) -> dict[str, Any]:
+    b: dict[str, Any] = {"$objectType": OT + "VmRecoveryPointChangedRegionsComputeSpec", "offset": offset}
+    if ref:
+        b.update(referenceRecoveryPointExtId=ref["recovery_point"],
+                 referenceVmRecoveryPointExtId=ref["vm_recovery_point"],
+                 referenceDiskRecoveryPointExtId=ref["disk_recovery_point"])
+    return b
+
+
+def _extra(meta: Any, name: str) -> str | None:
+    for kv in (meta or {}).get("extraInfo") or []:
+        if kv.get("name") == name:
+            v = kv.get("value")
+            return str(v.get("value") if isinstance(v, dict) else v)
+    return None
+
+
 class PrismV4:
     def __init__(self, session: Any, pc_url: str, *, timeout: float = 60, task_timeout: float = 3600,
-                 poll: float = 2, sleep: Any = time.sleep):
+                 poll: float = 2, sleep: Any = time.sleep, crt_version: str = "v4.0"):
+        self.crt_version = crt_version
         self.s, self.base = session, pc_url.rstrip("/")
         self.timeout, self.task_timeout, self.poll, self.sleep = timeout, task_timeout, poll, sleep
 
@@ -146,6 +193,70 @@ class PrismV4:
         resp, _ = self._call("POST", RECOVERY_POINTS, body=recovery_point_body(vm_ext, name, app_consistent))
         task = self._task(resp, f"recovery point {name}")
         return self._affected(task, "recovery-point")
+
+    def recovery_point_layout(self, rp_ext: str) -> dict[str, Any]:
+        """{vm_recovery_point: ext, disks: {vm disk ext: disk recovery point ext}} (single-VM recovery point)."""
+        data, _ = self._get(f"{RECOVERY_POINTS}/{rp_ext}")
+        vrps = _need(data, "data", "vmRecoveryPoints")
+        if len(vrps) != 1:
+            raise ProviderError(f"recovery point {rp_ext} has {len(vrps)} VM recovery points, expected 1")
+        return {"vm_recovery_point": _need(vrps[0], "extId"),
+                "disks": {_need(d, "diskExtId"): _need(d, "diskRecoveryPointExtId")
+                          for d in vrps[0].get("diskRecoveryPoints") or []}}
+
+    def set_expiration(self, rp_ext: str, hours: float) -> None:
+        """Keep a recovery point as the next sync's CRT reference (created with a 24 h expiry)."""
+        data, etag = self._get(f"{RECOVERY_POINTS}/{rp_ext}")
+        if not str((data.get("data") or {}).get("name", "")).startswith(PREFIX):
+            raise SafetyGateError(f"refusing to change recovery point {rp_ext}: not created by vmigrate")
+        exp = (datetime.now(timezone.utc) + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        resp, _ = self._call("POST", f"{RECOVERY_POINTS}/{rp_ext}/$actions/set-expiration-time",
+                             body={"expirationTime": exp}, etag=etag)
+        if resp:
+            self._task(resp, f"extend recovery point {rp_ext}")
+
+    def _discover(self, cur: dict[str, str], ref: dict[str, str] | None) -> tuple[str, str]:
+        path = DP_CONFIG.format(ver=self.crt_version) + f"/{cur['recovery_point']}/$actions/discover-cluster"
+        data, _ = self._call("POST", path, body=discover_body(cur, ref))
+        return str(_need(data, "data", "clusterIp", "ipv4", "value")), str(_need(data, "data", "jwtToken"))
+
+    def changed_regions(self, cur: dict[str, str], ref: dict[str, str] | None, size: int,
+                        *, max_pages: int = 100000) -> list[tuple[int, int, str]]:
+        """All regions of `cur` that differ from `ref` (None: everything allocated), as
+        (offset, length, REGULAR|ZEROED). Pages with nextOffset; re-discovers when the JWT expires."""
+        ip, jwt = self._discover(cur, ref)
+        path = (DP_CONTENT.format(ver=self.crt_version) + f"/{cur['recovery_point']}/vm-recovery-points/"
+                f"{cur['vm_recovery_point']}/disk-recovery-points/{cur['disk_recovery_point']}"
+                "/$actions/compute-changed-regions")
+        out: list[tuple[int, int, str]] = []
+        off, retried = 0, False
+        for _ in range(max_pages):
+            headers = {"Accept": "application/json", "Content-Type": "application/json",
+                       "NTNX-Request-Id": str(uuid.uuid4()), "Cookie": f"NTNX_IGW_SESSION={jwt}"}
+            try:
+                r = self.s.request("POST", f"https://{ip}:9440{path}", json=compute_body(off, ref), headers=headers,
+                                   timeout=self.timeout)
+            except Exception as e:  # noqa: BLE001
+                raise TransientProviderError(f"CRT {ip}: {e}") from e
+            if r.status_code == 401 and not retried:          # JWT expired (15 min): get a fresh one once
+                ip, jwt = self._discover(cur, ref)
+                retried = True
+                continue
+            if r.status_code >= 500 or r.status_code == 429:
+                raise TransientProviderError(f"CRT {ip}: HTTP {r.status_code} {r.text[:300]}")
+            if r.status_code >= 400:
+                raise ProviderError(f"CRT {ip}: HTTP {r.status_code} {r.text[:600]}")
+            retried = False
+            body = r.json() if r.content else {}
+            for reg in body.get("data") or []:
+                out.append((int(_need(reg, "offset")), int(_need(reg, "length")),
+                            str(reg.get("regionType") or "REGULAR")))
+            nxt = _extra(body.get("metadata"), "nextOffset")
+            n = int(nxt) if nxt not in (None, "", "None") else 0
+            if n <= off or n >= size:
+                return out
+            off = n
+        raise ProviderError(f"CRT: more than {max_pages} pages for disk recovery point {cur['disk_recovery_point']}")
 
     def recovery_point_disks(self, rp_ext: str) -> dict[str, str]:
         data, _ = self._get(f"{RECOVERY_POINTS}/{rp_ext}")
