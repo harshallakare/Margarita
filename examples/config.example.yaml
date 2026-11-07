@@ -1,0 +1,66 @@
+# Purpose: example vmigrate config for the reference vertical (Nutanix AHV -> Virtuozzo VHI).
+# Usage:   cp examples/config.example.yaml migrate.yaml ; edit ; export secrets ;
+#          vmigrate validate -c migrate.yaml
+#          vmigrate inspect  -c migrate.yaml --source ahv1 --vm RIS-Sainath
+#          vmigrate migrate  -c migrate.yaml                 # dry-run plan
+#          vmigrate migrate  -c migrate.yaml --execute       # do it
+# Secrets: only via ${ENV_VAR}. Run on a VHI node (root, vStorage mounted, Nutanix NFS mounted).
+# Every <PLACEHOLDER> below must be replaced with your values.
+
+engine:
+  state_dir: /var/lib/vmigrate/state
+  max_parallel_disks: 4          # pitfall 10: NFS single stream ~150 MB/s; fan out across disks
+  chunk_size: 64MiB              # dd bs=64M linear reads
+  checkpoint_every: 1GiB         # resume granularity
+  verify_samples: 32
+  verify_sample_bytes: 1MiB
+  app_consistent: true
+  cleanup_source_snapshot: true
+  on_failure: keep               # keep = resume later with the same command; cleanup = delete what we created
+  boot_check: true
+  boot_timeout: 1800
+
+sources:
+  ahv1:
+    type: nutanix
+    prism_element: https://<PE_IP>:9440
+    prism_central: https://<PC_IP>:9440          # optional; v3 calls go here
+    username: <PRISM_USER>
+    password: ${NUTANIX_PASSWORD}
+    verify_tls: false
+    protection_domain: <PD_NAME>
+    protect_vm_if_missing: false
+    snapshot_retention_secs: 172800
+    nfs_mounts:
+      <CONTAINER_NAME>: /mnt/ntnx/<CONTAINER_NAME>   # mount -t nfs <CVM_IP>:/<CONTAINER_NAME> ...
+
+targets:
+  vhi1:
+    type: vhi
+    auth_url: https://<VHI_ADMIN_VIP>:5000/v3
+    username: <VHI_USER>
+    password: ${VHI_PASSWORD}
+    user_domain_name: <USER_DOMAIN>
+    project_id: <TARGET_PROJECT_ID>              # ID, not name (pitfall 7)
+    verify_tls: false
+    volume_type: <VMDS_VOLUME_TYPE>
+    vstorage_mount: /mnt/vstorage
+    staging_dir: /var/lib/vmigrate/staging       # must hold max_parallel_disks largest disks
+    boot_bus: scsi                               # hw_disk_bus=scsi (pitfall 6) — keeps /dev/sdX
+    network_map:
+      VLAN-120: <NEUTRON_NETWORK_UUID>
+    preserve_mac: false
+    verify_after_commit: true
+
+migrations:
+  - name: ris-sainath
+    source: ahv1
+    target: vhi1
+    vm: RIS-Sainath
+    guest_os: {family: linux}
+    target_options:
+      flavor: <FLAVOR_ID_OR_NAME>                # omit to auto-pick smallest fitting flavor
+    osmorph:
+      fstab_harden: true                         # nofail + pass 0 on data mounts (pitfall 9)
+      disable_periodic_fsck: true                # tune2fs -c 0 -i 0
+      allow_manual: false

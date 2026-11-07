@@ -1,0 +1,43 @@
+# Purpose: packaging + tool config for vmigrate, the any-to-any VM migration framework.
+# Usage:   pip install -e '.[dev]'            (core + platform + tests)
+#          pip install -e '.[platform]'       (API / conductor / worker services)
+#          pip install -e '.[nutanix,vhi]'    (reference vertical runtime deps)
+#          pip install -e '.[postgres]'       (Postgres driver for production)
+# The engine core (ir/, core/, engine/, config/, osmorph/) depends only on PyYAML; the platform
+# services (api/, conductor/, worker/, db/, security/) add FastAPI, SQLAlchemy and cryptography.
+# Each provider's SDK is an optional extra and is imported only inside that provider.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vmigrate"
+version = "0.2.0"
+description = "Self-hosted any-to-any VM migration + DR platform (open Coriolis alternative)"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6"]
+
+[project.optional-dependencies]
+platform = ["fastapi>=0.110", "uvicorn>=0.29", "sqlalchemy>=2.0", "cryptography>=42"]
+postgres = ["psycopg[binary]>=3.1"]
+nutanix = ["requests>=2.31"]
+vhi = ["openstacksdk>=1.0"]
+openstack = ["openstacksdk>=1.0"]
+vmware = ["pyvmomi>=8", "requests>=2.31"]
+hyperv = ["pywinrm>=0.4"]
+proxmox = ["proxmoxer>=2", "requests>=2.31"]
+aws = ["boto3>=1.28"]
+azure = ["azure-identity", "azure-mgmt-compute"]
+dev = ["pytest>=7", "requests>=2.31", "httpx>=0.27", "fastapi>=0.110", "uvicorn>=0.29", "sqlalchemy>=2.0", "cryptography>=42"]
+
+[project.scripts]
+vmigrate = "vmigrate.cli.main:main"
+vmigrate-platform = "vmigrate.cli.platform_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

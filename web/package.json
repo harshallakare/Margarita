@@ -1,0 +1,25 @@
+{
+  "name": "vmigrate-web",
+  "private": true,
+  "version": "0.2.0",
+  "description": "vmigrate web UI: endpoints, migration wizard, live execution view, reports. Served by the API at /ui.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "react-router-dom": "7.6.2"
+  },
+  "devDependencies": {
+    "@types/react": "19.1.6",
+    "@types/react-dom": "19.1.6",
+    "@vitejs/plugin-react": "4.5.1",
+    "typescript": "5.8.3",
+    "vite": "6.3.5"
+  }
+}

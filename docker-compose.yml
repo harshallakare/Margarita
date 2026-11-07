@@ -1,0 +1,45 @@
+# Purpose: dev topology mirroring production: Postgres + API + conductor + worker as separate services.
+# Usage:
+#   echo "VMIGRATE_SECRET_KEY=$(vmigrate-platform gen-key)" > .env      # or any Fernet key
+#   echo "POSTGRES_PASSWORD=change-me" >> .env
+#   docker compose up --build -d
+#   docker compose run --rm api create-user admin --role admin        # prompts for a password
+#   open http://localhost:8080/docs
+# Scale workers: docker compose up -d --scale worker=3
+x-common: &common
+  build: .
+  restart: unless-stopped
+  environment:
+    VMIGRATE_DATABASE_URL: postgresql+psycopg://vmigrate:${POSTGRES_PASSWORD:?set in .env}@db/vmigrate
+    VMIGRATE_SECRET_KEY: ${VMIGRATE_SECRET_KEY:?set in .env}
+  volumes: [data:/data]
+  depends_on:
+    db: {condition: service_healthy}
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vmigrate
+      POSTGRES_DB: vmigrate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+    volumes: [pg:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vmigrate"]
+      interval: 3s
+      retries: 20
+  api:
+    <<: *common
+    command: ["api", "--host", "0.0.0.0", "--port", "8080"]
+    ports: ["8080:8080"]
+  conductor:
+    <<: *common
+    command: ["conductor"]
+  worker:
+    <<: *common
+    command: ["worker"]
+
+volumes:
+  pg: {}
+  data: {}

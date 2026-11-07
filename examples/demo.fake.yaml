@@ -1,0 +1,32 @@
+# Purpose: runnable demo of the engine using the loopback fake providers (no platforms needed).
+# Usage:   vmigrate migrate -c examples/demo.fake.yaml            # dry-run plan
+#          vmigrate migrate -c examples/demo.fake.yaml --execute  # full fake migration
+#          set secondary_enumeration_cap: 10 to watch the disk-count gate refuse (exit 3)
+
+engine:
+  state_dir: ./demo-state
+  max_parallel_disks: 4
+  chunk_size: 1MiB
+  boot_check: true
+
+sources:
+  demo-ahv:
+    type: fake
+    secondary_enumeration_cap: null
+    vms:
+      - name: RIS-Sainath
+        os: linux
+        disks: [{size: 8MiB, boot: true}, {size: 4MiB}, {size: 4MiB}, {size: 4MiB}, {size: 4MiB},
+                {size: 4MiB}, {size: 4MiB}, {size: 4MiB}, {size: 4MiB}, {size: 4MiB},
+                {size: 4MiB}, {size: 4MiB}, {size: 4MiB}]
+
+targets:
+  demo-vhi:
+    type: fake
+    staging_dir: ./demo-state/target
+
+migrations:
+  - name: ris-sainath-demo
+    source: demo-ahv
+    target: demo-vhi
+    vm: RIS-Sainath

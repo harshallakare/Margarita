@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.egg-info/
+demo-state*/
+vmigrate-state/
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+vmigrate-data/
+.env
+vmigrate-demo/
+*.log
+*.key
+.DS_Store
+.claude/
