@@ -305,7 +305,10 @@ EOF
 fi
 
 trap - ERR
-HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+# Display only — must never fail the install: minimal RHEL-family images have no `hostname` binary,
+# and with `set -o pipefail` a missing command here would abort the script after a good install.
+HOST_IP="$( { hostname -I 2>/dev/null || ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="src") print $(i+1)}' \
+            || awk '/32 host/ {print f} {f=$2}' /proc/net/fib_trie 2>/dev/null | grep -v '^127\.'; } | awk 'NF {print $1; exit}' || true )"
 echo
 log "Margarita is installed ($(git -C "$APP" rev-parse --short HEAD) on $BRANCH)"
 echo "    UI:        http://${HOST_IP:-<this-host>}:$PORT/ui/"

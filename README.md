@@ -94,6 +94,8 @@ One command on a fresh Linux VM or host (Ubuntu/Debian with `apt`, RHEL/Rocky/VH
 curl -fsSL https://raw.githubusercontent.com/harshallakare/Margarita/main/scripts/deploy.sh | sudo bash
 ```
 
+Already root (minimal images often have no `sudo`)? Pipe to `bash` instead of `sudo bash`.
+
 `scripts/deploy.sh` installs the OS packages it needs (only those missing). It finds or installs Python ≥ 3.11,
 clones to `/opt/margarita/app`, builds the UI (with a pinned, checksum-verified Node if the system has none),
 creates `/etc/margarita/{secret.key,margarita.env}` and `/var/lib/margarita`, and creates an `admin` user with a
