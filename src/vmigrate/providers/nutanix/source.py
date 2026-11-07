@@ -12,8 +12,12 @@ Usage (config):
         protection_domain: vmigrate-pd             # PD used for app-consistent OOB snapshots
         protect_vm_if_missing: false               # add VM to the PD automatically (PD config change)
         snapshot_retention_secs: 172800
-        nfs_mounts: {ctr-prod: /mnt/ntnx/ctr-prod} # container name -> local NFS mount (whitelisted)
-        # or nfs_root: /mnt/ntnx                   # local path = nfs_root + ndfs_filepath
+        # NFS access is AUTOMATIC: the worker mounts each needed container read-only from the
+        # cluster (<prism_element host>:/<container>) and unmounts it afterwards. One-time cluster
+        # step: add the worker's IP to the NFS whitelist. Optional overrides:
+        # nfs_host: 10.0.0.11                      # NFS address if not the Prism Element host
+        # nfs_mounts: {ctr-prod: /mnt/ntnx/ctr-prod}   # use these pre-mounted paths instead
+        # nfs_root: /mnt/ntnx                      # or: pre-mounted under nfs_root/<container>
 
 How it works:
   inspect  : Prism v3 VM (paged list, full disk_list) joined with v2 vm_disk_info; both must agree
@@ -33,6 +37,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from ...core.context import RunContext
 from ...core.errors import ConfigError, LiveDiskReadRefused, ProviderError, SafetyGateError
@@ -41,6 +46,7 @@ from ...core.interfaces import DiskReader, SnapshotRef, SourceProvider, VmRef
 from ...core.retry import poll_until
 from ...ir import DiskSpec, VmSpec
 from .client import PrismClient
+from .nfs import NfsMounter
 from .mapping import disks_v2, disks_v3, to_vmspec
 
 PAGE = 250
@@ -50,8 +56,10 @@ V2_DISK_PARAMS = {"include_vm_disk_config": "true", "include_vm_nic_config": "tr
 class NutanixSource(SourceProvider):
     type_name = "nutanix"
 
-    def __init__(self, name: str, config: Mapping[str, Any], ctx: RunContext, client: PrismClient | None = None):
+    def __init__(self, name: str, config: Mapping[str, Any], ctx: RunContext, client: PrismClient | None = None,
+                 mounter: NfsMounter | None = None):
         super().__init__(name, config, ctx)
+        self._mounter = mounter
         for k in ("prism_element", "username"):
             if k not in config and client is None:
                 raise ConfigError(f"sources.{name}: missing {k!r}")
@@ -64,6 +72,30 @@ class NutanixSource(SourceProvider):
         self.pd = config.get("protection_domain")
         self.poll_interval = float(config.get("poll_interval", 10))
         self.snapshot_timeout = float(config.get("snapshot_timeout", 3600))
+
+    # ------------------------------------------------------------------ connection
+    def check_connection(self) -> list[str]:
+        # interactive save-time check: one attempt, fail fast (migrations keep the client's retries)
+        if hasattr(self.c, "attempts"):
+            self.c.attempts = 1
+        p: list[str] = []
+        try:
+            cl = self.c.v2_get("/cluster") or {}
+        except Exception as e:  # noqa: BLE001 - surface any reachability/auth problem
+            return [f"cannot reach Prism Element {self.config.get('prism_element')}: {e}"]
+        if self.config.get("prism_central"):
+            try:
+                self.c.v3_post("/clusters/list", {"kind": "cluster", "length": 1})
+            except Exception as e:  # noqa: BLE001
+                p.append(f"cannot reach Prism Central {self.config['prism_central']}: {e}")
+        if not self.pd:
+            p.append("protection_domain is required (used for app-consistent snapshots)")
+        else:
+            try:
+                self.c.v2_get(f"/protection_domains/{self.pd}")
+            except Exception as e:  # noqa: BLE001
+                p.append(f"protection domain {self.pd!r} not found on cluster {cl.get('name', '?')}: {e}")
+        return p
 
     # ------------------------------------------------------------------ inventory
     def _v3_all_vms(self) -> list[dict[str, Any]]:
@@ -120,7 +152,20 @@ class NutanixSource(SourceProvider):
             return Path(mounts[parts[0]]) / parts[1]
         if self.config.get("nfs_root"):
             return Path(self.config["nfs_root"]) / parts[0] / parts[1]
-        raise ConfigError(f"sources.{self.name}: no nfs_mounts entry for container {parts[0]!r} (and no nfs_root)")
+        return self.mounter.path_for(parts[0]) / parts[1]    # default: mount it ourselves
+
+    @property
+    def mounter(self) -> NfsMounter:
+        if self._mounter is None:
+            host = self.config.get("nfs_host") or urlparse(str(self.config.get("prism_element", ""))).hostname
+            if not host:
+                raise ConfigError(f"sources.{self.name}: cannot derive the NFS host; set nfs_host")
+            self._mounter = NfsMounter(host)
+        return self._mounter
+
+    def close(self) -> None:
+        if self._mounter is not None:
+            self._mounter.unmount_all()
 
     def preflight(self, spec: VmSpec | None = None) -> list[str]:
         problems: list[str] = []
@@ -133,9 +178,9 @@ class NutanixSource(SourceProvider):
                 except (ConfigError, ProviderError) as e:
                     problems.append(str(e))
                     continue
-                if not root.parent.is_dir():
-                    problems.append(f"NFS mount for container {ctr!r} not present at {root.parent} "
-                                    "(mount it and whitelist this host on the Nutanix cluster)")
+                if not root.is_dir():
+                    problems.append(f"container {ctr!r} is not readable at {root.parent} (no .acropolis directory); "
+                                    "check the NFS export and this worker's whitelist entry on the Nutanix cluster")
         return problems
 
     # ------------------------------------------------------------------ snapshot

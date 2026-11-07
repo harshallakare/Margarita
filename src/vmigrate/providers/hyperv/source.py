@@ -80,6 +80,13 @@ class HypervSource(SourceProvider):
         return self._info[vm.id]
 
     # ------------------------------------------------------------------ contract
+    def check_connection(self) -> list[str]:
+        try:
+            ping = self.client.ping()
+        except Exception as e:  # noqa: BLE001
+            return [f"cannot reach Hyper-V host {self.config['host']} over WinRM: {e}"]
+        return [] if ping.get("hyperv") else [f"{ping.get('host')}: the Hyper-V PowerShell module is not available"]
+
     def preflight(self, spec: VmSpec | None = None) -> list[str]:
         try:
             ping = self.client.ping()

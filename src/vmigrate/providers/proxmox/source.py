@@ -118,6 +118,14 @@ class ProxmoxSource(SourceProvider):
         return self._vm.get(vm_id) or self._load(VmRef(vm_id, "", self.name))
 
     # ------------------------------------------------------------------ contract
+    def check_connection(self) -> list[str]:
+        try:
+            self.api.version()
+            self.api.vms()          # proves the token can list VMs (VM.Audit)
+        except Exception as e:  # noqa: BLE001
+            return [f"cannot use the Proxmox API at {self.config['url']} with this token: {e}"]
+        return []
+
     def preflight(self, spec: VmSpec | None = None) -> list[str]:
         try:
             self.api.version()

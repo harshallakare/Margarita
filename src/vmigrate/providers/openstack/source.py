@@ -179,6 +179,14 @@ class OpenstackSource(SourceProvider):
         self._vm[vm.id] = d
         return d
 
+    def check_connection(self) -> list[str]:
+        try:
+            pid = self.cloud.project_id()
+        except Exception as e:  # noqa: BLE001
+            return [f"cannot authenticate to OpenStack: {e}"]
+        return [] if pid == self.config.get("project_id") else [
+            f"token scoped to project {pid}, expected {self.config.get('project_id')}"]
+
     def preflight(self, spec: VmSpec | None = None) -> list[str]:
         try:
             self.cloud.project_id()

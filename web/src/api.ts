@@ -123,6 +123,8 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
       msg = typeof j.detail === "string" ? j.detail
         : Array.isArray(j.detail) ? j.detail.map((d: { loc?: string[]; msg: string }) =>
             `${(d.loc ?? []).slice(1).join(".")}: ${d.msg}`).join("; ")
+        : j.detail && typeof j.detail.message === "string"      // {message, problems[]} (e.g. endpoint validation)
+          ? [j.detail.message, ...((j.detail.problems ?? []) as string[]).map((p) => `• ${p}`)].join("\n")
         : JSON.stringify(j);
     } catch { /* not json */ }
     throw new ApiError(r.status, msg);

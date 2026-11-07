@@ -147,6 +147,19 @@ class VhiTarget(TargetProvider):
                 "network_map": {**(self.config.get("network_map") or {}),
                                 **((spec.extra.get("target_options") or {}).get("network_map") or {})}}
 
+    def check_connection(self) -> list[str]:
+        try:
+            pid = self.api.current_project_id()
+        except Exception as e:  # noqa: BLE001
+            return [f"cannot authenticate to VHI/Keystone: {e}"]
+        p = []
+        if pid != self.config.get("project_id"):
+            p.append(f"token scoped to project {pid}, expected {self.config.get('project_id')} "
+                     "(grant the user a role on the target project)")
+        if self.volume_type and not self.api.find_volume_type(self.volume_type):
+            p.append(f"volume type {self.volume_type!r} not found")
+        return p
+
     def preflight(self, spec: VmSpec | None = None) -> list[str]:
         p: list[str] = []
         try:

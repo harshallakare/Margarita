@@ -164,8 +164,16 @@ class _Provider(ABC):
         self.ctx = ctx
 
     def preflight(self, spec: VmSpec | None = None) -> list[str]:
-        """Return human-readable blocking problems (empty list = ready). Read-only."""
+        """Return human-readable blocking problems (empty list = ready). Read-only. Runs on the
+        WORKER, so it may check worker-host prerequisites (mounts, local tools, sockets)."""
         return []
+
+    def check_connection(self) -> list[str]:
+        """Save-time validation of an endpoint: reach the platform and prove the credentials (and
+        named objects like a project/protection domain) work. Read-only and fast. Must NOT check
+        worker-host prerequisites: the API that saves endpoints may run on another machine.
+        Returns problems (empty = OK). Every adapter overrides this."""
+        return [f"{self.type_name}: connection check not implemented"]
 
     def close(self) -> None:
         pass

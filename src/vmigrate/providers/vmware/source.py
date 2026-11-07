@@ -117,6 +117,14 @@ class VmwareSource(SourceProvider):
         return self._info[vm.id]
 
     # ------------------------------------------------------------------ contract
+    def check_connection(self) -> list[str]:
+        try:
+            self.client.about()
+            self.client.list_vms()
+        except Exception as e:  # noqa: BLE001
+            return [f"cannot log in to vSphere {self.host}: {e}"]
+        return []
+
     def preflight(self, spec: VmSpec | None = None) -> list[str]:
         p: list[str] = []
         try:

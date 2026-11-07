@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -44,11 +45,12 @@ from ..engine.safety import LEGACY_DISK_CAP, check_disk_counts
 from ..engine.state import MigrationState
 from ..platform.factory import Services
 from ..platform.settings import Settings
-from ..providers import FIELDS, SOURCES, TARGETS, support_matrix
+from ..providers import FIELDS, SOURCES, TARGETS, build_source, build_target, support_matrix
 from ..security.auth import Principal, hash_password, new_token, token_hash, verify_password
 from . import schemas as m
 
 bearer = HTTPBearer(auto_error=False)
+VALIDATE_TIMEOUT = float(os.environ.get("VMIGRATE_VALIDATE_TIMEOUT", "60"))
 
 
 def _secret_like(d: dict[str, Any], path: str = "config") -> list[str]:
@@ -172,14 +174,47 @@ def create_app(services: Services | None = None) -> FastAPI:
     def list_endpoints(p: Principal = Depends(viewer)) -> list[m.EndpointOut]:
         return [ep_out(e) for e in repo.list_endpoints(None if p.role == "admin" else p.project)]
 
+    def connection_problems(type_: str, name: str, config: dict[str, Any], creds: dict[str, Any]) -> list[str]:
+        """Build the provider from the SUBMITTED settings (nothing stored yet) and run its
+        connection check. Worker-host prerequisites are deliberately not checked here."""
+        cfg = {**config, **creds, "type": type_}
+        for table, build in ((SOURCES, build_source), (TARGETS, build_target)):
+            if table.get(type_, (None,))[0] is None:
+                continue
+            try:
+                prov = build(name, cfg, RunContext(dry_run=True))
+            except Exception as ex:  # noqa: BLE001 - bad/missing settings
+                return [f"{type(ex).__name__}: {ex}"]
+            try:
+                return prov.check_connection()
+            except Exception as ex:  # noqa: BLE001
+                return [f"{type(ex).__name__}: {ex}"]
+            finally:
+                try:
+                    prov.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        return [f"provider {type_!r} is not implemented yet"]
+
+    async def require_connection(type_: str, name: str, config: dict[str, Any], creds: dict[str, Any]) -> None:
+        try:
+            problems = await asyncio.wait_for(
+                run_in_threadpool(connection_problems, type_, name, config, creds), timeout=VALIDATE_TIMEOUT)
+        except TimeoutError:
+            problems = [f"no answer within {VALIDATE_TIMEOUT:.0f}s (host unreachable or firewalled?)"]
+        if problems:
+            raise HTTPException(422, {"message": "connection check failed; endpoint not saved", "problems": problems})
+
     @app.post("/endpoints", response_model=m.EndpointOut, status_code=201, tags=["endpoints"])
-    def create_endpoint(body: m.EndpointCreate, p: Principal = Depends(operator)) -> m.EndpointOut:
+    async def create_endpoint(body: m.EndpointCreate, p: Principal = Depends(operator)) -> m.EndpointOut:
+        """Validates the connection with the submitted settings first; saves only if it works."""
         check_type(body.type)
         leaked = _secret_like(body.config)
         if leaked:
             raise HTTPException(400, f"secret-looking keys must go in 'credentials', not 'config': {leaked}")
         if any(e["name"] == body.name for e in repo.list_endpoints(p.project)):
             raise HTTPException(409, f"endpoint {body.name!r} exists")
+        await require_connection(body.type, body.name, body.config, body.credentials)
         sid = svc.secrets.put(body.credentials) if body.credentials else None
         eid = repo.create_endpoint(p.project, body.name, body.type, body.config, sid, body.description)
         return ep_out(repo.get_endpoint(eid))  # type: ignore[arg-type]
@@ -189,7 +224,8 @@ def create_app(services: Services | None = None) -> FastAPI:
         return ep_out(scoped(repo.get_endpoint(eid), p, "endpoint"))
 
     @app.patch("/endpoints/{eid}", response_model=m.EndpointOut, tags=["endpoints"])
-    def update_endpoint(eid: str, body: m.EndpointUpdate, p: Principal = Depends(operator)) -> m.EndpointOut:
+    async def update_endpoint(eid: str, body: m.EndpointUpdate, p: Principal = Depends(operator)) -> m.EndpointOut:
+        """Validates the connection with the MERGED settings first; saves only if it works."""
         e = scoped(repo.get_endpoint(eid), p, "endpoint")
         vals: dict[str, Any] = {}
         if body.description is not None:
@@ -199,6 +235,11 @@ def create_app(services: Services | None = None) -> FastAPI:
             if leaked:
                 raise HTTPException(400, f"secret-looking keys must go in 'credentials': {leaked}")
             vals["config"] = body.config
+        if body.config is not None or body.credentials is not None:
+            creds = body.credentials if body.credentials is not None else (
+                svc.secrets.get(e["secret_id"]) if e.get("secret_id") else {})
+            await require_connection(e["type"], e["name"], body.config if body.config is not None else e["config"],
+                                     creds)
         if body.credentials is not None:
             if e.get("secret_id"):
                 svc.secrets.replace(e["secret_id"], body.credentials)
@@ -226,7 +267,7 @@ def create_app(services: Services | None = None) -> FastAPI:
             try:
                 prov = build(e, ctx)
                 try:
-                    problems = prov.preflight(None)
+                    problems = prov.check_connection() or prov.preflight(None)
                 finally:
                     prov.close()
             except (MigrationError, Exception) as ex:  # noqa: BLE001 - report connection problems

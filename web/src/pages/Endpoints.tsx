@@ -116,7 +116,7 @@ function EndpointForm({ providers, existing, onClose, onSaved }: {
     <Modal title={existing ? `Edit ${existing.name}` : "Add endpoint"} onClose={onClose} footer={<>
       <button className="btn" onClick={onClose}>Cancel</button>
       <button className="btn primary" disabled={busy || !type || !name} onClick={submit}>
-        {busy ? "Saving…" : existing ? "Save" : "Add endpoint"}</button>
+        {busy ? "Validating connection…" : existing ? "Validate & save" : "Validate & add"}</button>
     </>}>
       <div className="stack">
         {!existing && (
@@ -166,7 +166,9 @@ function EndpointForm({ providers, existing, onClose, onSaved }: {
             </label>
           </div>
         )}
-        <ErrorBox error={err} title="Could not save" />
+        {busy && <div className="alert info">Checking that the platform is reachable and the credentials work. The
+          endpoint is saved only if this succeeds.</div>}
+        <ErrorBox error={err} title="Not saved" />
       </div>
     </Modal>
   );

@@ -197,6 +197,15 @@ Typical flow: `POST /auth/token` → `POST /endpoints` (non-secret `config` + wr
 | `VMIGRATE_TOKEN_TTL_HOURS` | 12 | |
 | `VMIGRATE_ALLOWED_PROVIDERS` / `VMIGRATE_CORS_ORIGINS` | — | comma lists |
 
+**Endpoints are validated before they are saved.** Creating an endpoint, or editing its settings or
+credentials, first connects to the platform with the submitted values and proves the credentials work. This
+also checks named objects such as the project or protection domain. Only then is the endpoint stored. On
+failure, the API answers `422 {"detail": {"message", "problems": [...]}}` and nothing is written, not even
+the encrypted secret. This save-time check deliberately ignores worker-host prerequisites (NFS mounts,
+nbdkit, the vStorage path), because the API may run on a different machine than the workers; those are checked
+by each migration's dry-run/preflight on the worker. The endpoint page's **Test** button runs both.
+`VMIGRATE_VALIDATE_TIMEOUT` (default 60 s) bounds the check.
+
 Roles: `viewer` can read. `operator` can also manage endpoints and migrations and start, cancel or retry executions.
 `admin` can also manage users and sees every project. Credentials are encrypted at rest and never returned; the API
 rejects secret-looking keys in `config`.
@@ -331,7 +340,13 @@ Secrets: use `${VAR}` / `${VAR:-default}`. `validate` warns about literal secret
    so must the target attachment list. Volume-group disks fail loudly instead of being dropped.
 2. **Live disks are never read.** A PD out-of-band snapshot is restored as a powered-off clone,
    `vmigrate-<run>-<name>`, and its vmdisks are what gets read. Reading a source vmdisk uuid raises `LiveDiskReadRefused`.
-3. **No qemu-img against Nutanix NFS.** Hole probing on those vdisks hangs. The reader uses plain
+3. **Nutanix disk data is read over NFS, mounted automatically.** Prism has no API that streams a
+   vmdisk's bytes, so the worker reads the snapshot clone's files from the storage container. You don't
+   configure mounts: the worker mounts each container it needs **read-only** from the Prism Element address
+   (`nfs_host` overrides it), and unmounts it afterwards. The one-time cluster step is to add the worker's IP
+   to the cluster's or container's NFS whitelist. A refused mount names the exact IP to whitelist. Pre-mounted
+   paths (`nfs_root`, `nfs_mounts`) are still honored. Mounting needs root, as the worker runs in `deploy.sh` installs.
+   **No qemu-img against Nutanix NFS.** Hole probing on those vdisks hangs. The reader uses plain
    `pread` in 64 MiB blocks. qemu-img only ever touches local staging and the vStorage backing.
 4. **Tuned qcow2 writes:** `qemu-img convert -p -W -m 16 -f raw -O qcow2 -o compat=1.1,cluster_size=1048576`.
 5. **VMDS backing stays Cinder-consistent.** The volume must be detached and available, and the backing must

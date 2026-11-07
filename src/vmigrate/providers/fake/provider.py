@@ -124,6 +124,9 @@ class FakeSource(SourceProvider):
         self.snapshots: dict[str, SnapshotRef] = {}
         self.cleaned: list[str] = []
 
+    def check_connection(self) -> list[str]:
+        return [str(self.config["fail_connection"])] if self.config.get("fail_connection") else []
+
     def list_vms(self) -> list[VmRef]:
         return [VmRef(s.source_id, s.name, self.name) for s in self.vms.values()]
 
@@ -202,6 +205,9 @@ class FakeTarget(TargetProvider):
                  for k, v in self.disks.items()}
         vms = {k: {kk: vv for kk, vv in v.items() if kk != "spec"} for k, v in self.vms.items()}
         self._registry().write_text(json.dumps({"disks": disks, "vms": vms}, indent=1))
+
+    def check_connection(self) -> list[str]:
+        return [str(self.config["fail_connection"])] if self.config.get("fail_connection") else []
 
     def _staged(self, ref: TargetDiskRef) -> Path:
         return self.staging / "staging" / f"{ref.name}.raw"

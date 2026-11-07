@@ -77,6 +77,14 @@ class AwsSource(SourceProvider):
             raise SafetyGateError(str(e)) from e
 
     # ------------------------------------------------------------------ contract
+    def check_connection(self) -> list[str]:
+        try:
+            self.client.identity()
+            self.client.instances()   # proves ec2:DescribeInstances in the configured region
+        except Exception as e:  # noqa: BLE001
+            return [f"cannot use AWS in {self.config['region']} with these credentials: {e}"]
+        return []
+
     def preflight(self, spec: VmSpec | None = None) -> list[str]:
         try:
             self.client.identity()

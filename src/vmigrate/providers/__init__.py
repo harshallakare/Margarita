@@ -66,10 +66,11 @@ FIELDS: dict[str, list[dict[str, Any]]] = {
         {"name": "protection_domain", "label": "Protection domain", "kind": "text", "required": True,
          "help": "PD used for app-consistent out-of-band snapshots"},
         {"name": "protect_vm_if_missing", "label": "Add VM to PD if missing", "kind": "bool", "default": False},
-        {"name": "nfs_root", "label": "NFS root", "kind": "text",
-         "help": "local path = nfs_root + ndfs path (or use nfs_mounts below)"},
-        {"name": "nfs_mounts", "label": "NFS mounts", "kind": "json",
-         "help": '{"<container>": "/mnt/ntnx/<container>"}; the export must whitelist this host'},
+        {"name": "nfs_host", "label": "NFS address (optional)", "kind": "text",
+         "help": "leave empty: workers mount containers from the Prism Element host automatically "
+                 "(whitelist the worker IP on the cluster once)"},
+        {"name": "nfs_root", "label": "Pre-mounted root (optional)", "kind": "text",
+         "help": "only if you mount containers yourself: <nfs_root>/<container>"},
     ],
     "vhi": [
         {"name": "auth_url", "label": "Keystone URL", "kind": "url", "required": True,
