@@ -86,6 +86,47 @@ delete: validate target → delete replica disks + restore points + source base 
 - Disks added, removed or resized on the source make the sync fail loudly. Create a new replica in that case
   (resizing replicas is not supported yet).
 
+### Deploy on a VM (production-style)
+
+One command on a fresh Linux VM or host (Ubuntu/Debian with `apt`, RHEL/Rocky/VHI with `dnf`/`yum`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/harshallakare/Margarita/main/scripts/deploy.sh | sudo bash
+```
+
+`scripts/deploy.sh` installs the OS packages it needs (only those missing). It finds or installs Python ≥ 3.11,
+clones to `/opt/margarita/app`, builds the UI (with a pinned, checksum-verified Node if the system has none),
+creates `/etc/margarita/{secret.key,margarita.env}` and `/var/lib/margarita`, and creates an `admin` user with a
+random password (printed once, saved to `/root/margarita-admin-password`). It then starts three systemd services
+and waits for `/health`. The API and conductor run as user `margarita`; the worker runs as root because it writes
+VHI vStorage backings and uses mounts, qemu-img and ssh. Options: `--port`, `--bind`, `--branch`, `--db-url`
+(Postgres), `--full` (nbdkit, guestfish, cifs-utils), `--no-web`, `--no-systemd`. Re-running is safe: the key,
+config and users are kept.
+
+**Back up `/etc/margarita/secret.key`.** Without it, stored endpoint credentials cannot be decrypted.
+
+Update to the latest commit of the deployed branch:
+
+```bash
+sudo bash /opt/margarita/app/scripts/update.sh            # --check to preview, --ref <tag|commit> to pin
+```
+
+`scripts/update.sh` works as follows:
+
+- It refuses to run if the VM's checkout has local edits, and only fast-forwards.
+- It waits for running migrations and syncs to finish (`--wait-timeout`, default 30 min).
+- It reinstalls, rebuilds the UI only if `web/` changed, upgrades the DB schema (additive only), and restarts.
+- It health-checks the API, conductor and worker.
+- If the install or health check fails, it **rolls back to the previous commit** automatically.
+
+Both scripts were tested in containers:
+
+- **Ubuntu 24.04 with systemd:** fresh deploy, a migration, a normal update, rollback after a crash on start,
+  rollback after a failed install, refusal on local edits, the wait for running work, and an idempotent re-deploy.
+- **Rocky Linux 9:** deploy, including the automatic Python 3.12 install, an update and a migration.
+
+They have not yet been run on a real VHI node.
+
 ### Demo (fake providers, no infrastructure)
 
 ```bash
@@ -174,7 +215,7 @@ rejects secret-looking keys in `config`.
 | `src/vmigrate/cli/` | `vmigrate` (single-host CLI), `vmigrate-platform` (services/admin) | done |
 | `src/vmigrate/minions/` | worker-VM pools for pairs without direct storage access | planned |
 | `web/` | React + Vite UI (served at `/ui`) | done |
-| `scripts/` | `demo.sh` + `demo_seed.py` (local demo on fake providers) | done |
+| `scripts/` | `deploy.sh` / `update.sh` (VM install + safe updates), `demo.sh` + `demo_seed.py` (local demo) | done |
 
 ## Engine architecture
 
