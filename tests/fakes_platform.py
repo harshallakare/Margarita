@@ -163,6 +163,7 @@ class FakeOpenStack:
         (d / f"volume-{vid}").write_bytes(qcow2_header(size_gib << 30))
         (d / ".info").write_text("sidecar")
         v = {"id": vid, "name": name, "size": size_gib, "status": "available", "metadata": dict(metadata), "attachments": []}
+        v["volume_type"] = volume_type or "__default__"
         self.volumes[vid] = v
         return dict(v)
 

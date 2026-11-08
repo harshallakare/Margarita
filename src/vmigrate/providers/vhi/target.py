@@ -11,7 +11,7 @@ Usage (config):
         user_domain_name: Default
         project_id: 0123abcd...               # scope by ID (pitfall 7)
         verify_tls: false
-        volume_type: vmds                     # VMDS-backed Cinder volume type
+        volume_type: vmds                     # optional: Cinder volume type (default: Cinder's default type)
         multiattach_volume_type: vmds-shared  # optional: type with multiattach="<is> True" (cluster shared disks)
         vstorage_mount: /mnt/vstorage
         cinder_datastore: vols/datastores/cinder   # default
@@ -120,13 +120,11 @@ class VhiTarget(TargetProvider):
         self.vstorage = Path(config.get("vstorage_mount", "/mnt/vstorage"))
         self.datastore = config.get("cinder_datastore", "vols/datastores/cinder")
         self.staging = Path(config.get("staging_dir", "/var/lib/vmigrate/staging"))
-        self.volume_type = config.get("volume_type")
+        self.volume_type = config.get("volume_type") or None   # None -> Cinder's default volume type
         self.group = config.get("vstorage_group", "vstorage-users")
         self.poll = float(config.get("poll_interval", 5))
         self.op_timeout = float(config.get("op_timeout", 1800))
         self.set_owner = config.get("chown_backing", True)
-        if not self.volume_type:
-            raise ConfigError(f"targets.{name}: volume_type (the VMDS volume type) is required")
 
     @property
     def api(self) -> Any:
@@ -185,7 +183,7 @@ class VhiTarget(TargetProvider):
         except Exception as e:  # noqa: BLE001 - report, don't crash preflight
             p.append(f"cannot authenticate to VHI/Keystone: {e}")
             return p
-        if not self.api.find_volume_type(self.volume_type):
+        if self.volume_type and not self.api.find_volume_type(self.volume_type):
             p.append(f"volume type {self.volume_type!r} not found")
         ds = self.vstorage / self.datastore
         if not ds.is_dir():

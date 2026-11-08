@@ -31,9 +31,11 @@ class OpenStackApi:
         t = self.conn.block_storage.find_type(name, ignore_missing=True)
         return _d(t) if t else None
 
-    def create_volume(self, name: str, size_gib: int, volume_type: str, metadata: dict[str, str],
+    def create_volume(self, name: str, size_gib: int, volume_type: str | None, metadata: dict[str, str],
                       availability_zone: str | None = None, source_volid: str | None = None) -> dict[str, Any]:
-        kw: dict[str, Any] = dict(name=name, size=size_gib, volume_type=volume_type, metadata=metadata)
+        kw: dict[str, Any] = dict(name=name, size=size_gib, metadata=metadata)
+        if volume_type:                 # omitted -> Cinder picks its default volume type
+            kw["volume_type"] = volume_type
         if availability_zone:
             kw["availability_zone"] = availability_zone
         if source_volid:
