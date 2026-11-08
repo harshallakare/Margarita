@@ -106,6 +106,9 @@ class OpenStackApi:
         self.conn.network.delete_port(port_id, ignore_missing=True)
 
     # ---- helper VM (write_mode helper_vm) ------------------------------------------------
+    def images(self) -> list[dict[str, Any]]:
+        return [_d(i) for i in self.conn.image.images()]
+
     def find_image(self, name_or_id: str) -> dict[str, Any] | None:
         i = self.conn.image.find_image(name_or_id, ignore_missing=True)
         return _d(i) if i else None

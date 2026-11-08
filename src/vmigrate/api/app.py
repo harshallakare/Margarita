@@ -488,6 +488,43 @@ def create_app(services: Services | None = None) -> FastAPI:
         except ProviderNotImplemented as ex:
             raise HTTPException(400, str(ex)) from ex
 
+    def _resources(tgt: Any) -> dict[str, Any]:
+        out: dict[str, Any] = {"networks": [], "storage": [], "flavors": [], "images": [], "errors": {}}
+        try:
+            for key, fn in (("networks", tgt.list_networks), ("storage", tgt.list_storage),
+                            ("flavors", tgt.list_flavors), ("images", tgt.list_images)):
+                try:
+                    out[key] = fn()
+                except Exception as ex:  # noqa: BLE001 - report per list; the form falls back to text
+                    out["errors"][key] = f"{type(ex).__name__}: {ex}"
+        finally:
+            tgt.close()
+        return out
+
+    @app.post("/endpoints/discover", tags=["endpoints"])
+    async def discover_resources(body: m.EndpointDiscover, p: Principal = Depends(operator)) -> dict[str, Any]:
+        """Images / networks / flavors / storage on a TARGET, from the settings typed in the endpoint
+        form, so helper image/network and similar fields can be picked from a list. Nothing is saved."""
+        check_type(body.type)
+        if TARGETS.get(body.type, (None,))[0] is None:
+            raise HTTPException(400, f"{body.type!r} is not an implemented target provider")
+        creds: dict[str, Any] = {}
+        if body.endpoint_id:
+            e = scoped(repo.get_endpoint(body.endpoint_id), p, "endpoint")
+            if e["type"] != body.type:
+                raise HTTPException(400, "endpoint type mismatch")
+            creds = svc.secrets.get(e["secret_id"]) if e.get("secret_id") else {}
+        creds.update({k: v for k, v in body.credentials.items() if v not in (None, "")})
+        cfg = {**body.config, **creds, "type": body.type}
+
+        def go() -> dict[str, Any]:
+            return _resources(build_target("discover", cfg, RunContext(dry_run=True)))
+        try:
+            return await asyncio.wait_for(provider_call(f"listing resources on {body.type}", go),
+                                          timeout=VALIDATE_TIMEOUT)
+        except TimeoutError as ex:
+            raise HTTPException(504, f"no answer within {VALIDATE_TIMEOUT:.0f}s") from ex
+
     @app.get("/endpoints/{eid}/resources", tags=["endpoints"])
     async def target_resources(eid: str, p: Principal = Depends(viewer)) -> dict[str, Any]:
         """Networks / storage / flavors on a TARGET endpoint, for the wizard's mapping dropdowns.
@@ -496,20 +533,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         if TARGETS.get(e["type"], (None,))[0] is None:
             raise HTTPException(400, f"{e['type']!r} is not an implemented target provider")
 
-        def go() -> dict[str, Any]:
-            out: dict[str, Any] = {"networks": [], "storage": [], "flavors": [], "errors": {}}
-            tgt = svc.build_target(e, RunContext(dry_run=True))
-            try:
-                for key, fn in (("networks", tgt.list_networks), ("storage", tgt.list_storage),
-                                ("flavors", tgt.list_flavors)):
-                    try:
-                        out[key] = fn()
-                    except Exception as ex:  # noqa: BLE001 - report per list; the wizard falls back to text
-                        out["errors"][key] = f"{type(ex).__name__}: {ex}"
-            finally:
-                tgt.close()
-            return out
-        return await run_in_threadpool(go)
+        return await run_in_threadpool(lambda: _resources(svc.build_target(e, RunContext(dry_run=True))))
 
     elog = logging.getLogger("vmigrate.api.endpoints")
 

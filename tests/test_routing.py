@@ -100,3 +100,27 @@ def test_vhi_target_lists_resources(tmp_path):
     assert [n["name"] for n in t.list_networks()] == ["backup", "prod-net"]
     assert [v["name"] for v in t.list_storage()] == ["vmds", "vmds-hdd"]
     assert [f["vcpus"] for f in t.list_flavors()] == [8, 16]          # smallest first
+    assert [i["name"] for i in t.list_images()] == ["Cirros", "ubuntu-24.04"]   # active only, by name
+
+
+def test_discover_lists_for_the_endpoint_form(plat):  # noqa: F811
+    c, h = plat.c, plat.admin
+    cfg = {"staging_dir": str(plat.tmp / "x"), "networks": ["dmz", "lan"], "images_need_password": True}
+    # unsaved settings, as typed in the form
+    r = c.post("/endpoints/discover", headers=h, json={"type": "fake", "config": cfg, "credentials": {"password": "p"}})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert [n["name"] for n in d["networks"]] == ["dmz", "lan"] and [i["name"] for i in d["images"]] == ["ubuntu-24.04", "rocky-9"]
+    # no password -> that list reports its error, the others still load
+    d = c.post("/endpoints/discover", headers=h, json={"type": "fake", "config": cfg}).json()
+    assert "not authenticated" in d["errors"]["images"] and d["networks"]
+    # editing a saved endpoint: the stored password is used when the form leaves it empty
+    ep = c.post("/endpoints", headers=h, json={"name": "t1", "type": "fake", "config": cfg,
+                                               "credentials": {"password": "stored"}}).json()
+    d = c.post("/endpoints/discover", headers=h, json={"type": "fake", "config": cfg, "endpoint_id": ep["id"]}).json()
+    assert d["images"] and not d["errors"]
+    assert c.post("/endpoints/discover", headers=plat.viewer, json={"type": "fake", "config": cfg}).status_code == 403
+    assert c.post("/endpoints/discover", headers=h, json={"type": "nope"}).status_code in (400, 422)
+    rows = c.get("/audit?q=discover", headers=h).json()
+    assert rows and "stored" not in str(rows) and '"p"' not in str(rows)
+    assert any((r["details"] or {}).get("request", {}).get("credentials") == "***" for r in rows)   # masked

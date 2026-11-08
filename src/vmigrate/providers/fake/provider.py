@@ -241,6 +241,11 @@ class FakeTarget(TargetProvider):
         return [{"id": "f-2x4", "name": "small", "vcpus": 2, "ram_mb": 4096},
                 {"id": "f-4x16", "name": "large", "vcpus": 4, "ram_mb": 16384}]
 
+    def list_images(self) -> list[dict[str, Any]]:
+        if self.config.get("images_need_password") and not self.config.get("password"):
+            raise ProviderError("fake: not authenticated (no password)")
+        return [{"id": f"img-{n}", "name": n} for n in self.config.get("images", ["ubuntu-24.04", "rocky-9"])]
+
     def _staged(self, ref: TargetDiskRef) -> Path:
         return self.staging / "staging" / f"{ref.name}.raw"
 

@@ -2,11 +2,28 @@
 // adapter via GET /providers), validate (test connection), delete. Secret fields are write-only:
 // on edit they start empty and are only sent when you type a new value.
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, fmt, type Endpoint, type Field, type Providers } from "../api";
 import { ErrorBox, Icon, Loading, Modal, Status, Toast, errText, useAuth, useLoad } from "../ui";
 
 interface Validation { ok: boolean; roles: Record<string, { ok: boolean; problems: string[] }> }
+interface Item { id: string; name: string; external?: boolean; vcpus?: number; ram_mb?: number }
+interface Lists { images: Item[]; networks: Item[]; flavors: Item[]; storage: Item[]; errors: Record<string, string> }
+
+/** Dropdown choices for a field tagged with `resource`, as [value, label]. */
+function choices(lists: Lists | null, resource: string): [string, string][] | null {
+  if (!lists) return null;
+  const nets = lists.networks ?? [];
+  const src: Item[] = resource === "images" ? lists.images
+    : resource === "networks" ? nets
+    : resource === "external_networks" ? (nets.some((n) => n.external) ? nets.filter((n) => n.external) : nets)
+    : resource === "flavors" ? lists.flavors
+    : resource === "storage" ? lists.storage : [];
+  if (!src?.length) return null;
+  return src.map((i) => [i.id, resource === "flavors" && i.vcpus != null
+    ? `${i.name} (${i.vcpus} vCPU, ${Math.round((i.ram_mb ?? 0) / 1024)} GiB)`
+    : resource.endsWith("networks") && i.external ? `${i.name} · external` : i.name]);
+}
 
 function fieldsFor(p: Providers | null, type: string): Field[] {
   if (!p) return [];
@@ -68,37 +85,64 @@ function EndpointForm({ providers, existing, onClose, onSaved }: {
     setVals(v);
   };
 
-  const submit = async () => {
-    setErr(null);
+  const [lists, setLists] = useState<Lists | null>(null);
+  const [listBusy, setListBusy] = useState(false);
+  const [listErr, setListErr] = useState<string | null>(null);
+  const hasResources = fields.some((f) => f.resource);
+
+  /** Current form values as {config, creds}; strict=false skips required checks (for listing). */
+  const collect = (strict: boolean) => {
     const config: Record<string, unknown> = {};
     const creds: Record<string, unknown> = {};
+    for (const f of fields) {
+      const v = vals[f.name];
+      if (f.secret) {
+        if (v) creds[f.name] = v;
+        else if (strict && f.required && !existing?.credential_keys.includes(f.name)) throw new Error(`${f.label} is required`);
+        continue;
+      }
+      if (f.kind === "bool") { config[f.name] = Boolean(v); continue; }
+      if (v === "" || v === undefined) {
+        if (strict && f.required) throw new Error(`${f.label} is required`);
+        continue;
+      }
+      if (f.kind === "int") {
+        const n = Number(v);
+        if (!Number.isInteger(n)) throw new Error(`${f.label} must be a whole number`);
+        config[f.name] = n;
+      } else if (f.kind === "json") {
+        try { config[f.name] = JSON.parse(String(v)); } catch { throw new Error(`${f.label} is not valid JSON`); }
+      } else config[f.name] = String(v).trim();
+    }
+    if (extra.trim()) {
+      let x: unknown;
+      try { x = JSON.parse(extra); } catch { throw new Error("Advanced config is not valid JSON"); }
+      if (typeof x !== "object" || x === null || Array.isArray(x)) throw new Error("Advanced config must be a JSON object");
+      Object.assign(config, x);
+    }
+    return { config, creds };
+  };
+
+  const loadLists = async () => {
+    setListErr(null);
+    setListBusy(true);
     try {
-      for (const f of fields) {
-        const v = vals[f.name];
-        if (f.secret) {
-          if (v) creds[f.name] = v;
-          else if (f.required && !existing?.credential_keys.includes(f.name)) throw new Error(`${f.label} is required`);
-          continue;
-        }
-        if (f.kind === "bool") { config[f.name] = Boolean(v); continue; }
-        if (v === "" || v === undefined) {
-          if (f.required) throw new Error(`${f.label} is required`);
-          continue;
-        }
-        if (f.kind === "int") {
-          const n = Number(v);
-          if (!Number.isInteger(n)) throw new Error(`${f.label} must be a whole number`);
-          config[f.name] = n;
-        } else if (f.kind === "json") {
-          try { config[f.name] = JSON.parse(String(v)); } catch { throw new Error(`${f.label} is not valid JSON`); }
-        } else config[f.name] = String(v).trim();
-      }
-      if (extra.trim()) {
-        let x: unknown;
-        try { x = JSON.parse(extra); } catch { throw new Error("Advanced config is not valid JSON"); }
-        if (typeof x !== "object" || x === null || Array.isArray(x)) throw new Error("Advanced config must be a JSON object");
-        Object.assign(config, x);
-      }
+      const { config, creds } = collect(false);
+      const r = await api.post<Lists>("/endpoints/discover", { type, config, credentials: creds, endpoint_id: existing?.id ?? null });
+      setLists(r);
+      const errs = Object.entries(r.errors ?? {});
+      if (errs.length) setListErr(errs.map(([k, v]) => `${k}: ${v}`).join("\n"));
+    } catch (e) { setListErr(errText(e)); }
+    setListBusy(false);
+  };
+  // editing a saved endpoint: its credentials are stored, so fetch the lists straight away
+  useEffect(() => { if (existing && hasResources) void loadLists(); }, []);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  const submit = async () => {
+    setErr(null);
+    let config: Record<string, unknown>, creds: Record<string, unknown>;
+    try {
+      ({ config, creds } = collect(true));
     } catch (e) { setErr(errText(e)); return; }
     const tagList = tags.split(",").map((t) => t.trim()).filter(Boolean);
     setBusy(true);
@@ -142,6 +186,16 @@ function EndpointForm({ providers, existing, onClose, onSaved }: {
                      placeholder="ahv-prod" /></label>
             <label className="field"><span>Description</span>
               <input type="text" value={desc} onChange={(e) => setDesc(e.target.value)} /></label>
+            {hasResources && (
+              <div className="wide alert info" style={{ display: "flex", gap: 12, alignItems: "center", justifyContent: "space-between" }}>
+                <span>{lists ? "Image, network, flavor and volume-type fields are dropdowns filled from the platform."
+                  : existing ? "Loading images, networks, flavors and volume types from the platform…"
+                  : "Fill in the connection details, then load images, networks, flavors and volume types to pick from."}</span>
+                <button type="button" className="btn sm" disabled={listBusy} onClick={loadLists}>
+                  {listBusy ? "Loading…" : lists ? "Reload lists" : "Load lists"}</button>
+              </div>
+            )}
+            {listErr && <div className="wide"><ErrorBox error={listErr} title="Could not load all lists (those fields stay as text)" /></div>}
             {fields.map((f) => f.kind === "bool" ? (
               <label key={f.name} className="check wide">
                 <input type="checkbox" checked={Boolean(vals[f.name])}
@@ -156,6 +210,13 @@ function EndpointForm({ providers, existing, onClose, onSaved }: {
                   <textarea value={String(vals[f.name] ?? "")} spellCheck={false} autoComplete="off"
                             placeholder={f.secret && existing?.credential_keys.includes(f.name) ? "•••••• (unchanged)" : ""}
                             onChange={(e) => setVals({ ...vals, [f.name]: e.target.value })} />
+                ) : f.resource && choices(lists, f.resource) ? (
+                  <select value={String(vals[f.name] ?? "")} onChange={(e) => setVals({ ...vals, [f.name]: e.target.value })}>
+                    <option value="">{f.required ? "— choose —" : "— not set —"}</option>
+                    {vals[f.name] && !choices(lists, f.resource)!.some(([v]) => v === vals[f.name]) &&
+                      <option value={String(vals[f.name])}>{String(vals[f.name])} (current, not in list)</option>}
+                    {choices(lists, f.resource)!.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                  </select>
                 ) : f.kind === "select" ? (
                   <select value={String(vals[f.name] ?? "")} onChange={(e) => setVals({ ...vals, [f.name]: e.target.value })}>
                     {(f.options ?? []).map((o) => <option key={o} value={o}>{o}</option>)}

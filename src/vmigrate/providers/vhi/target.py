@@ -216,6 +216,10 @@ class VhiTarget(TargetProvider):
     def list_storage(self) -> list[dict[str, Any]]:
         return sorted(({"id": t["name"], "name": t["name"]} for t in self.api.volume_types()), key=lambda t: t["name"])
 
+    def list_images(self) -> list[dict[str, Any]]:
+        return sorted(({"id": i["id"], "name": i.get("name") or i["id"]} for i in self.api.images()
+                       if str(i.get("status", "active")).lower() == "active"), key=lambda i: i["name"].lower())
+
     def list_flavors(self) -> list[dict[str, Any]]:
         return sorted(({"id": f["id"], "name": f.get("name") or f["id"], "vcpus": f.get("vcpus"),
                         "ram_mb": f.get("ram")} for f in self.api.flavors()),

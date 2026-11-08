@@ -175,6 +175,8 @@ class FakeOpenStack:
     def find_flavor(self, n): return next((f for f in self.flavors() if f["id"] == n), None)
     def networks(self): return [{"id": "n-2", "name": "prod-net", "is_shared": True}, {"id": "n-1", "name": "backup"}]
     def volume_types(self): return [{"name": "vmds"}, {"name": "vmds-hdd"}]
+    def images(self): return [{"id": "i2", "name": "ubuntu-24.04", "status": "active"},
+                              {"id": "i1", "name": "Cirros", "status": "active"}, {"id": "i3", "name": "x", "status": "queued"}]
 
     def create_server(self, **kw):
         sid = self._id("srv")

@@ -82,6 +82,15 @@ class EndpointCreate(BaseModel):
     required_tags: list[str] = Field(default_factory=list, description="worker capabilities this endpoint needs")
 
 
+class EndpointDiscover(BaseModel):
+    """Settings as typed in the endpoint form (nothing saved). With endpoint_id, stored credentials
+    fill any secret left empty, so an edit needs no password re-entry."""
+    type: str
+    config: dict[str, Any] = Field(default_factory=dict)
+    credentials: dict[str, Any] = Field(default_factory=dict)
+    endpoint_id: str | None = None
+
+
 class EndpointUpdate(BaseModel):
     description: str | None = None
     config: dict[str, Any] | None = None
