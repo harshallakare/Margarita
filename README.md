@@ -327,14 +327,14 @@ endpoint (`write_mode`).
 | `helper_image` | yes | A Linux cloud image in VHI with python3 and cloud-init (Ubuntu 22.04/24.04, Rocky/Alma 9, Debian 12). Nothing is installed on it. |
 | `helper_network` | yes | Network the helper is attached to. The worker must reach the helper's address on it over SSH (port 22). |
 | `helper_floating_network` | no | External network to allocate a floating IP from, when the helper's network isn't routable from the worker. |
-| `helper_ssh_cidr` | no | Source range allowed in the helper's temporary security group (default `0.0.0.0/0`). Set it to the worker's address. |
-| `helper_security_groups` | no | Use these existing security groups instead of creating a temporary one (advanced config). |
+| `helper_security_groups` | no | Existing security group(s) for the helper, comma-separated (default: the project's `default`, as Coriolis does). They must allow SSH (TCP 22) from the worker. Nothing is created. |
+| `helper_create_security_group`, `helper_ssh_cidr` | no | Advanced: create a temporary group allowing TCP 22 from `helper_ssh_cidr` instead, deleted after the run. |
 | `helper_flavor` | no | Default: the smallest flavor with 2 vCPU and 2 GiB RAM. |
 | `helper_root_gib`, `helper_boot_timeout` | no | Helper root volume size (10) and SSH wait (600 s). |
 
 **What happens in a run:**
-1. On the first disk, the worker creates an SSH client key and an SSH host key, a security group allowing
-   TCP/22, and boots the helper from `helper_image` on a 10 GiB volume. cloud-init adds user `vmigrate`
+1. On the first disk, the worker creates an SSH client key and an SSH host key and boots the helper from
+   `helper_image` on a 10 GiB volume, in the project's `default` security group (or the ones you chose). cloud-init adds user `vmigrate`
    with the client key and installs the host key, which the worker pins, so the connection is verified from
    the first packet.
 2. Each new volume is attached to the helper and found by its virtio serial (the volume ID).
@@ -344,7 +344,8 @@ endpoint (`write_mode`).
 4. OSMorph runs on the worker as usual: guestfish (and virt-v2v for Windows) open each volume through a local
    Unix socket that is bridged to the helper. The worker needs libguestfs (`deploy.sh --full`).
 5. Before the real VM is created, every volume is detached from the helper. When the run ends, or fails, the
-   helper VM, its root volume, the floating IP, the security group and the keys are deleted.
+   helper VM, its root volume, the floating IP and the keys are deleted (and a temporary security group, if you asked for one). Cleanup
+   keeps going if an API call fails and names anything left behind.
 
 There is one helper per run, shared by all disks; disks are still copied in parallel. Everything the helper
 path creates is tagged `vmigrate:managed`/`vmigrate:helper`, and volumes that aren't Margarita's are never

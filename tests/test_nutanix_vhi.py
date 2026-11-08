@@ -198,6 +198,7 @@ def test_auth_scoping():
     assert kw["project_id"] == "pid" and "project_name" not in kw   # the ID wins when both are given
     kw = auth_kwargs({"auth_url": "u", "username": "a", "password": "p", "project_id": "pid", "user_domain_name": "corp"})
     assert kw["project_id"] == "pid" and kw["load_envvars"] is False and "project_name" not in kw
+    assert kw["connect_retries"] == 5 and kw["status_code_retries"] == 3    # dropped connections are retried
     env = {"OS_PROJECT_NAME": "x", "OS_PROJECT_DOMAIN_ID": "y", "OS_AUTH_URL": "keep"}
     assert sorted(scrub_env(env)) == ["OS_PROJECT_DOMAIN_ID", "OS_PROJECT_NAME"] and env == {"OS_AUTH_URL": "keep"}
 

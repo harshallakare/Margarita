@@ -43,6 +43,7 @@ class FakeHelperOpenStack(FakeOpenStack):
         self.devdir = devdir
         self.devdir.mkdir(parents=True, exist_ok=True)
         self.sgs: dict[str, dict] = {}
+        self.project_sgs = {"default", "ssh-from-dc"}                   # pre-existing in the project
         self.fips: dict[str, dict] = {}
         self.log: list[str] = []
 
@@ -98,7 +99,12 @@ class FakeHelperOpenStack(FakeOpenStack):
     def create_ssh_security_group(self, name, cidr):
         gid = self._id("sg"); self.sgs[gid] = {"name": name, "cidr": cidr}
         return {"id": gid, "name": name}
-    def find_security_group(self, name): return next(({"id": k} for k, v in self.sgs.items() if v["name"] == name), None)
+    def find_security_group(self, name):
+        if name in self.project_sgs:
+            return {"id": f"sg-{name}", "name": name}
+        return next(({"id": k} for k, v in self.sgs.items() if v["name"] == name), None)
+    def security_groups(self): return [{"id": f"sg-{n}", "name": n} for n in sorted(self.project_sgs)]
+    def servers_by_name(self, name): return [dict(s) for s in self.servers.values() if s["name"] == name]
     def delete_security_group(self, gid): self.sgs.pop(gid, None)
 
 
@@ -188,7 +194,8 @@ def test_write_read_back_and_cleanup_through_helper(tmp_path):
     assert helper["kw"]["block_device_mapping"][0]["delete_on_termination"] is True
     known = (t.helper.dir / "known_hosts").read_text()
     assert known.startswith("vmigrate-helper ssh-ed25519 AAAAhost_ed25519")     # pinned host key
-    assert hosts == ["10.9.0.5"] and len(api.sgs) == 1 and next(iter(api.sgs.values()))["cidr"] == "0.0.0.0/0"
+    assert hosts == ["10.9.0.5"] and not api.sgs                          # nothing created ...
+    assert helper["kw"]["security_groups"] == [{"name": "default"}]          # ... the project's default group
     hdir = t.helper.dir
     t.close()
     assert not any(s["name"].startswith("vmigrate-helper") for s in api.servers.values())
@@ -218,6 +225,36 @@ def test_floating_ip_and_existing_security_group(tmp_path):
     assert helper["kw"]["security_groups"] == [{"name": "ssh-from-dc"}]
     t.close()
     assert not api.fips
+
+
+def test_security_group_options(tmp_path):
+    t, api, _ = _tgt(tmp_path, helper_security_groups="nope")
+    assert any("security group 'nope' not found" in p for p in t.preflight(None))
+    t, api, _ = _tgt(tmp_path / "b", helper_create_security_group=True, helper_ssh_cidr="10.65.49.92/32")
+    ref = t.create_disk("d", 1 << 20, DiskHints(bus=DiskBus.SCSI))
+    with t.open_disk_writer(ref) as w:
+        w.write(0, b"x")
+    assert [v["cidr"] for v in api.sgs.values()] == ["10.65.49.92/32"]         # only when asked for
+    t.close()
+    assert not api.sgs
+    assert [g["name"] for g in t.list_security_groups()] == ["default", "ssh-from-dc"]   # default first
+
+
+def test_cleanup_keeps_going_and_removes_duplicate_helpers(tmp_path):
+    t, api, _ = _tgt(tmp_path)
+    ref = t.create_disk("d", 1 << 20, DiskHints(bus=DiskBus.SCSI))
+    with t.open_disk_writer(ref) as w:
+        w.write(0, b"x")
+    h = t.helper
+    dup = dict(next(s for s in api.servers.values() if s["name"] == h.name), id="helper-dup")
+    api.servers["helper-dup"] = dup                       # a retried create made a second helper
+
+    def boom(sid, vid):
+        raise ProviderError("Connection aborted")
+    api.detach_volume = boom
+    with pytest.raises(ProviderError, match="cleanup incomplete.*vmigrate-helper-run-abcdef12"):
+        t.close()
+    assert not api.servers_by_name(h.name)               # both helpers deleted despite the failure
 
 
 def test_dry_run_never_creates_a_helper(tmp_path):

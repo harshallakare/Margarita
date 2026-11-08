@@ -286,6 +286,10 @@ class TargetProvider(_Provider):
         """[{id, name}] bootable images (e.g. for a helper VM). Empty = not applicable."""
         return []
 
+    def list_security_groups(self) -> list[dict[str, Any]]:
+        """[{id, name}] security groups (e.g. for a helper VM). Empty = not applicable."""
+        return []
+
     # ---- replica support (optional) -------------------------------------------------------
     def supports_replica(self) -> bool:
         """True when open_disk_writer(incremental=True) and clone_disk are implemented."""

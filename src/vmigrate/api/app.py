@@ -489,10 +489,12 @@ def create_app(services: Services | None = None) -> FastAPI:
             raise HTTPException(400, str(ex)) from ex
 
     def _resources(tgt: Any) -> dict[str, Any]:
-        out: dict[str, Any] = {"networks": [], "storage": [], "flavors": [], "images": [], "errors": {}}
+        out: dict[str, Any] = {"networks": [], "storage": [], "flavors": [], "images": [], "security_groups": [],
+                               "errors": {}}
         try:
             for key, fn in (("networks", tgt.list_networks), ("storage", tgt.list_storage),
-                            ("flavors", tgt.list_flavors), ("images", tgt.list_images)):
+                            ("flavors", tgt.list_flavors), ("images", tgt.list_images),
+                            ("security_groups", tgt.list_security_groups)):
                 try:
                     out[key] = fn()
                 except Exception as ex:  # noqa: BLE001 - report per list; the form falls back to text

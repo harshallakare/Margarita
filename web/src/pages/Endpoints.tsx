@@ -8,7 +8,8 @@ import { ErrorBox, Icon, Loading, Modal, Status, Toast, errText, useAuth, useLoa
 
 interface Validation { ok: boolean; roles: Record<string, { ok: boolean; problems: string[] }> }
 interface Item { id: string; name: string; external?: boolean; vcpus?: number; ram_mb?: number }
-interface Lists { images: Item[]; networks: Item[]; flavors: Item[]; storage: Item[]; errors: Record<string, string> }
+interface Lists { images: Item[]; networks: Item[]; flavors: Item[]; storage: Item[]; security_groups?: Item[];
+  errors: Record<string, string> }
 
 /** Dropdown choices for a field tagged with `resource`, as [value, label]. */
 function choices(lists: Lists | null, resource: string): [string, string][] | null {
@@ -18,7 +19,8 @@ function choices(lists: Lists | null, resource: string): [string, string][] | nu
     : resource === "networks" ? nets
     : resource === "external_networks" ? (nets.some((n) => n.external) ? nets.filter((n) => n.external) : nets)
     : resource === "flavors" ? lists.flavors
-    : resource === "storage" ? lists.storage : [];
+    : resource === "storage" ? lists.storage
+    : resource === "security_groups" ? (lists.security_groups ?? []) : [];
   if (!src?.length) return null;
   return src.map((i) => [i.id, resource === "flavors" && i.vcpus != null
     ? `${i.name} (${i.vcpus} vCPU, ${Math.round((i.ram_mb ?? 0) / 1024)} GiB)`
@@ -188,7 +190,7 @@ function EndpointForm({ providers, existing, onClose, onSaved }: {
               <input type="text" value={desc} onChange={(e) => setDesc(e.target.value)} /></label>
             {hasResources && (
               <div className="wide alert info" style={{ display: "flex", gap: 12, alignItems: "center", justifyContent: "space-between" }}>
-                <span>{lists ? "Image, network, flavor and volume-type fields are dropdowns filled from the platform."
+                <span>{lists ? "Image, network, flavor, security-group and volume-type fields are dropdowns filled from the platform."
                   : existing ? "Loading images, networks, flavors and volume types from the platform…"
                   : "Fill in the connection details, then load images, networks, flavors and volume types to pick from."}</span>
                 <button type="button" className="btn sm" disabled={listBusy} onClick={loadLists}>
