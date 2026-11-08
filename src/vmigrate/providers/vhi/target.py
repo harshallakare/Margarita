@@ -216,6 +216,11 @@ class VhiTarget(TargetProvider):
     def list_storage(self) -> list[dict[str, Any]]:
         return sorted(({"id": t["name"], "name": t["name"]} for t in self.api.volume_types()), key=lambda t: t["name"])
 
+    def list_security_groups(self) -> list[dict[str, Any]]:
+        # value = name: Nova takes security groups by name, and "default" is what operators expect
+        return sorted(({"id": g.get("name") or g["id"], "name": g.get("name") or g["id"]}
+                       for g in self.api.security_groups()), key=lambda g: (g["name"] != "default", g["name"]))
+
     def list_images(self) -> list[dict[str, Any]]:
         return sorted(({"id": i["id"], "name": i.get("name") or i["id"]} for i in self.api.images()
                        if str(i.get("status", "active")).lower() == "active"), key=lambda i: i["name"].lower())

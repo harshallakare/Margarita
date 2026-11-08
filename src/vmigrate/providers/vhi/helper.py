@@ -5,7 +5,9 @@ helper over SSH).
 Lifecycle (one helper per run, created on first use, destroyed by close()/cleanup):
   1. generate a throwaway SSH client key AND an SSH host key locally (ssh-keygen); the host key is
      injected with cloud-init and pinned, so the first connection is authenticated (no TOFU)
-  2. security group allowing TCP/22 from `helper_ssh_cidr` (unless helper_security_groups is given)
+  2. security groups: the project's `default` group unless `helper_security_groups` names others (the
+     Coriolis behaviour); a temporary group allowing TCP/22 from `helper_ssh_cidr` only when
+     `helper_create_security_group: true`
   3. boot `helper_image` from a small volume (helper_root_gib) on `helper_network`, optional floating
      IP from `helper_floating_network`; cloud-init creates user `vmigrate` with passwordless sudo
   4. wait for SSH and python3
@@ -151,10 +153,19 @@ class HelperVm:
         fl = self.cfg.get("helper_flavor")
         if fl and not self.api.find_flavor(fl):
             p.append(f"helper flavor {fl!r} not found")
+        if not self.cfg.get("helper_create_security_group"):
+            for g in self.security_groups():
+                if not self.api.find_security_group(g):
+                    p.append(f"helper security group {g!r} not found in the project")
         for tool in ("ssh", "ssh-keygen"):
             if shutil.which(tool) is None:
                 p.append(f"{tool} not found on this worker (install openssh-client)")
         return p
+
+    def security_groups(self) -> list[str]:
+        g = self.cfg.get("helper_security_groups") or "default"
+        names = [x.strip() for x in (g.split(",") if isinstance(g, str) else g) if str(x).strip()]
+        return names or ["default"]
 
     # ------------------------------------------------------------------ lifecycle
     def ensure(self) -> Any:
@@ -178,11 +189,12 @@ class HelperVm:
         known.write_text(f"{HOST_ALIAS} {' '.join(host_pub.split()[:2])}\n")
         known.chmod(0o600)
 
-        sgs = [{"name": g} for g in self.cfg.get("helper_security_groups") or []]
-        if not sgs:
+        if self.cfg.get("helper_create_security_group"):
             sg = self.api.create_ssh_security_group(f"{self.name}-ssh", self.cfg.get("helper_ssh_cidr", "0.0.0.0/0"))
             self.sg_id = sg["id"]
             sgs = [{"name": sg["name"]}]
+        else:                                      # the project's own groups, nothing created
+            sgs = [{"name": g} for g in self.security_groups()]
         img = self.api.find_image(self.cfg["helper_image"])
         net = self.api.find_network(self.cfg["helper_network"])
         flavor = self._flavor()
@@ -247,8 +259,10 @@ class HelperVm:
                 last = str(e)
                 time.sleep(self.poll)
         raise ProviderError(f"helper VM {self.name}: no SSH to {host}:{self.cfg.get('helper_ssh_port', 22)} within "
-                            f"{self.cfg.get('helper_boot_timeout', 600)}s (is it reachable from this worker? set "
-                            f"helper_network / helper_floating_network). Last error: {last[:400]}")
+                            f"{self.cfg.get('helper_boot_timeout', 600)}s. Check that this worker can reach it and that the "
+                            f"helper's security group(s) {self.security_groups()} allow TCP/22 from this worker "
+                            f"(helper_network / helper_floating_network / helper_security_groups). "
+                            f"Last error: {last[:400]}")
 
     def _delete_leftover(self) -> None:
         old = self.api.find_server(self.name)
@@ -317,22 +331,39 @@ class HelperVm:
             self._destroy()
 
     def _destroy(self) -> None:
+        """Best effort, every step: a failing API call must not leave the rest behind. Errors are
+        collected and raised at the end with the names to remove by hand."""
         if self.server is None and not self.dir.exists():
             return
-        try:
-            self.detach_all()
-        finally:
-            if self.server is not None:
-                self.api.delete_server(self.server["id"])
-                poll_until(lambda: self.api.find_server(self.name), lambda x: x is None,
+        errors: list[str] = []
+
+        def step(what: str, fn: Callable[[], Any]) -> None:
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001 - keep cleaning
+                errors.append(f"{what}: {e}")
+                self.ctx.logger.warning("helper cleanup: %s failed: %s", what, e)
+
+        step("detach volumes", self.detach_all)
+        if self.server is not None:
+            # every helper of this run (a retried create may have made a second one)
+            def delete_all() -> None:
+                for s in self.api.servers_by_name(self.name):
+                    if (s.get("metadata") or {}).get(HELPER) == "true":
+                        self.api.delete_server(s["id"])
+                poll_until(lambda: self.api.servers_by_name(self.name), lambda x: not x,
                            timeout=self.op_timeout, interval=self.poll, what="helper VM delete")
-                self.server = None
-            if self.fip_id:
-                self.api.delete_floating_ip(self.fip_id)
-                self.fip_id = None
-            if self.sg_id:
-                self.api.delete_security_group(self.sg_id)
-                self.sg_id = None
-            self.transport = None
-            shutil.rmtree(self.dir, ignore_errors=True)
+            step(f"delete helper VM {self.name}", delete_all)
+            self.server = None
+        if self.fip_id:
+            step("delete floating IP", lambda: self.api.delete_floating_ip(self.fip_id))
+            self.fip_id = None
+        if self.sg_id:
+            step("delete temporary security group", lambda: self.api.delete_security_group(self.sg_id))
+            self.sg_id = None
+        self.transport = None
+        shutil.rmtree(self.dir, ignore_errors=True)
+        if errors:
+            raise ProviderError(f"helper VM cleanup incomplete; remove by hand anything named {self.name}*: "
+                                + "; ".join(errors))
             self.ctx.logger.info("helper VM %s removed", self.name)

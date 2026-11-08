@@ -110,8 +110,10 @@ FIELDS: dict[str, list[dict[str, Any]]] = {
          "help": "helper_vm, optional: allocate a floating IP from this external network"},
         {"name": "helper_flavor", "label": "Helper VM flavor", "kind": "text", "resource": "flavors",
          "help": "optional: default is the smallest flavor with 2 vCPU / 2 GiB"},
-        {"name": "helper_ssh_cidr", "label": "Helper SSH source CIDR", "kind": "text", "default": "0.0.0.0/0",
-         "help": "who may SSH to the helper (temporary security group); narrow it to the worker's address"},
+        {"name": "helper_security_groups", "label": "Helper security group", "kind": "text", "default": "default",
+         "resource": "security_groups",
+         "help": "the helper VM uses this existing group (default: the project's 'default'); it must allow "
+                 "SSH (TCP 22) from the Margarita worker. Nothing is created."},
         {"name": "vstorage_mount", "label": "vStorage mount", "kind": "text", "default": "/mnt/vstorage",
          "help": "vstorage mode only"},
         {"name": "staging_dir", "label": "Staging directory", "kind": "text", "default": "/var/lib/vmigrate/staging",

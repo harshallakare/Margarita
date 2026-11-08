@@ -132,6 +132,12 @@ class OpenStackApi:
                                                      port_range_max=22, remote_ip_prefix=cidr)
         return sg
 
+    def servers_by_name(self, name: str) -> list[dict[str, Any]]:
+        return [_d(s) for s in self.conn.compute.servers(details=True, name=f"^{name}$")]
+
+    def security_groups(self) -> list[dict[str, Any]]:
+        return [_d(g) for g in self.conn.network.security_groups()]
+
     def find_security_group(self, name: str) -> dict[str, Any] | None:
         g = self.conn.network.find_security_group(name, ignore_missing=True)
         return _d(g) if g else None

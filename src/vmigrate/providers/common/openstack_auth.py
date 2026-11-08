@@ -49,6 +49,10 @@ def auth_kwargs(cfg: Mapping[str, Any], who: str = "openstack") -> dict[str, Any
         "load_envvars": False,
         "load_yaml_config": False,
         "identity_interface": cfg.get("interface", "public"),
+        # retry dropped/reset connections (seen live: Nova/Neutron "Remote end closed connection
+        # without response" on reused keep-alive connections) and 503s, with backoff
+        "connect_retries": int(cfg.get("connect_retries", 5)),
+        "status_code_retries": int(cfg.get("status_code_retries", 3)),
     }
     if cfg.get("user_domain_id"):
         kw["user_domain_id"] = cfg["user_domain_id"]
