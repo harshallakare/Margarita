@@ -255,7 +255,10 @@ def test_list_changed_blocks_replica(tmp_path):
     last = rr.state.syncs[-1]
     # EBS tracks 512 KiB blocks; the fake rewrites ~1/8 of 64 KiB pieces, so ~2/3 of EBS blocks change.
     # What matters: exactly the ListChangedBlocks bytes are read — never the whole disk.
-    assert last["modes"] == ["cbt"] and last["bytes_read"] == last["changed_bytes"] < 13 * UNIT
+    # changed regions are grown to whole 1 MiB checksum blocks (bounded: <= 1.5x + small slack) so the
+    # replica's block checksums stay current for a later compare fallback
+    assert last["modes"] == ["cbt"] and last["changed_bytes"] <= last["bytes_read"] <= last["changed_bytes"] * 1.5 + (13 << 20)
+    assert last["changed_bytes"] < 13 * UNIT
     assert len(fake.deleted) == 13 and len(fake.ebs.snaps) == 13  # base rotated
     for k in range(13):
         assert tgt._final(tgt.disks[f"rep-r{k:02d}"]).read_bytes() == PatternDisk(f"RIS-Sainath:{k}", UNIT, generation=1).read(0, UNIT)

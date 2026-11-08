@@ -65,7 +65,18 @@ delete: validate target → delete replica disks + restore points + source base 
 |---|---|---|---|
 | `full` | first sync of the disk | everything | everything (zero-skip) |
 | `cbt` | source has change tracking and a previous sync exists | changed regions only | changed regions only |
-| `compare` | no change tracking | everything | only 64 KiB blocks that differ from the replica |
+| `compare` | no change tracking | everything | only 1 MiB blocks whose checksum differs (the replica is not read) |
+
+- **Block checksums:** every sync records a SHA-256 per 1 MiB block of each replica disk (8 MB per
+  250 GiB, in the `replica_hashes` table). A `compare` sync checks the source against them instead of
+  reading the replica back over the network, the approach Coriolis uses. They are cleared when a sync
+  starts and saved only when it completes, so an interrupted sync never leaves checksums to trust; the
+  next `compare` then reads the replica once ("compare (reading replica)") and rebuilds them. `cbt` syncs
+  keep them current by re-reading whole blocks around each change, unless that would read more than 1.5x
+  what changed (scattered small writes); then they are marked unknown instead.
+- **Pipelined copy:** a reader thread prefetches the next chunks (`prefetch_chunks`, default 2) while the
+  current one is written, and the helper-VM writer keeps up to 16 NBD writes in flight. Progress shows the
+  current speed over the last 10 seconds next to the average.
 
 - **Consistency:** replica disks are being changed while a sync runs. A failed sync leaves the replica
   marked *inconsistent*, and the next sync **resumes it with the same source snapshot**. Until then only a
@@ -493,6 +504,7 @@ See `examples/config.example.yaml` (fully commented). For provider keys, see the
 | `max_parallel_disks` | 4 | Disks copied concurrently. Staging must hold this many of the largest disks. |
 | `chunk_size` | 64MiB | linear read size |
 | `checkpoint_every` | 1GiB | resume watermark granularity |
+| `prefetch_chunks` | 2 | Chunks read ahead from the source while the current one is written (0 turns pipelining off). |
 | `verify_samples` / `verify_sample_bytes` | 32 / 1MiB | Sampled checksums. Samples always include the first and last MiB. |
 | `app_consistent` | true | snapshot mode (per-migration override allowed) |
 | `cleanup_source_snapshot` | true | remove the snapshot/clone after success |

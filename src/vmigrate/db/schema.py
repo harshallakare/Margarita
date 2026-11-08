@@ -21,6 +21,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     MetaData,
     String,
     Table,
@@ -244,6 +245,15 @@ shared_disks = Table(
     Column("status", String(16), nullable=False),       # claimed | created | done | failed
     Column("target", JSON, nullable=True),
     Column("size_bytes", Integer, nullable=True),
+    Column("updated_at", Float, nullable=False),
+)
+
+replica_hashes = Table(                  # SHA-256 per 4 MiB block of each replica disk, as last written
+    "replica_hashes", metadata,
+    Column("migration_id", String(32), primary_key=True),
+    Column("disk_id", String(256), primary_key=True),
+    Column("block_size", Integer, nullable=False),
+    Column("data", LargeBinary, nullable=False),
     Column("updated_at", Float, nullable=False),
 )
 

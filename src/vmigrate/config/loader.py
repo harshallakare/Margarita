@@ -82,6 +82,7 @@ class EngineConfig:
     max_parallel_disks: int = 4
     chunk_size: int = 64 << 20
     checkpoint_every: int = 1 << 30
+    prefetch_chunks: int = 2          # chunks read ahead while the current one is written (0 = off)
     verify_samples: int = 32
     verify_sample_bytes: int = 1 << 20
     app_consistent: bool = True

@@ -5,8 +5,17 @@ Usage:
     stats = copy_disk(reader, writer, chunk_size=64 << 20, start_offset=state.bytes_copied,
                       on_checkpoint=lambda off: state.save_watermark(off))
 
-Compare mode (replica sync without source change tracking): pass `compare=<reader of the current
-replica>`; every chunk is still read from the source, but only chunks that differ are written.
+Pipelined: a reader thread prefetches the next `prefetch` chunks while the current one is checked and
+written, so source reads and target writes overlap (they used to alternate; seen live: ~110 MB/s on
+real data over a 10G link). Order of writes, checkpoints and progress is unchanged.
+
+Compare mode (replica sync without source change tracking):
+  * `hashes` with stored checksums (BlockHashes.has_base) — each 1 MiB block of the source is hashed
+    and compared with the checksum recorded when that block was last written; only differing blocks
+    are written. The replica is never read back (the Coriolis approach: checksums kept from the
+    previous run instead of re-reading the target).
+  * `compare=<reader of the replica>` — no usable checksums: read the replica back and compare.
+`hashes` is also maintained on full / changed-range copies so the next fallback can use it.
 
 Resume contract: on_checkpoint(offset) is called only AFTER writer.flush(), so a persisted
 watermark always means "everything below this offset is durable on the target".
@@ -14,15 +23,19 @@ watermark always means "everything below this offset is durable on the target".
 
 from __future__ import annotations
 
+import hashlib
+import queue
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 
 from ..core.interfaces import DiskReader, DiskWriter
 from ..core.ranges import ByteRange, clip, split
 
 DEFAULT_CHUNK = 64 << 20  # dd bs=64M — what worked on the reference path
+HASH_BLOCK = 1 << 20      # checksum granularity for replica compare (8 MB of SHA-256 per 250 GiB)
+DIGEST = 32
 
 
 class CopyCancelled(Exception):
@@ -52,6 +65,126 @@ def _is_zero(buf: bytes, _cache: dict[int, bytes] = {}) -> bool:
     return buf == z  # memcmp speed
 
 
+def _zero_digest(n: int, _cache: dict[int, bytes] = {}) -> bytes:
+    d = _cache.get(n)
+    if d is None:
+        d = _cache.setdefault(n, hashlib.sha256(bytes(n)).digest())
+    return d
+
+
+class BlockHashes:
+    """SHA-256 per HASH_BLOCK of one disk, as written to the replica. `base` = checksums from the
+    previous completed sync (None/empty = unknown). `known` tracks which blocks this run hashed."""
+
+    def __init__(self, size: int, base: bytes | None = None, block: int = HASH_BLOCK):
+        self.size, self.block = size, block
+        self.n = -(-size // block) if size else 0
+        ok = base is not None and len(base) == self.n * DIGEST
+        self.data = bytearray(base) if ok else bytearray(self.n * DIGEST)
+        self.has_base = ok
+        self.known = bytearray([1 if ok else 0]) * self.n
+
+    def get(self, i: int) -> bytes | None:
+        return bytes(self.data[i * DIGEST:(i + 1) * DIGEST]) if self.has_base or self.known[i] else None
+
+    def set(self, i: int, digest: bytes) -> None:
+        self.data[i * DIGEST:(i + 1) * DIGEST] = digest
+        self.known[i] = 1
+
+    def fill_zero(self) -> None:
+        """A fresh, zeroed target: every block not written below reads as zeros."""
+        for i in range(self.n):
+            self.set(i, _zero_digest(min(self.block, self.size - i * self.block)))
+
+    def complete(self) -> bool:
+        return all(self.known)
+
+    def to_bytes(self) -> bytes:
+        return bytes(self.data)
+
+
+def align_ranges(ranges: Iterable[ByteRange], block: int, size: int) -> list[ByteRange]:
+    """Grow changed ranges to whole checksum blocks (so each touched block can be re-hashed)."""
+    out: list[ByteRange] = []
+    for r in sorted(ranges, key=lambda r: r.offset):
+        a, b = (r.offset // block) * block, min(size, -(-r.end // block) * block)
+        if out and a <= out[-1].end:
+            out[-1] = ByteRange(out[-1].offset, max(out[-1].end, b) - out[-1].offset)
+        else:
+            out.append(ByteRange(a, b - a))
+    return out
+
+
+class RateMeter:
+    """Current throughput over a sliding window (the UI used to show the average since start, which
+    looked like a slow ramp after a data-heavy beginning)."""
+
+    def __init__(self, window: float = 10.0, clock: Callable[[], float] = time.monotonic):
+        self.window, self.clock = window, clock
+        self.samples: list[tuple[float, int]] = []
+        self.t0: float | None = None
+        self.first: int | None = None
+
+    def update(self, position: int) -> float:
+        now = self.clock()
+        if self.t0 is None:
+            self.t0, self.first = now, position
+        self.samples.append((now, position))
+        while len(self.samples) > 2 and now - self.samples[0][0] > self.window:
+            self.samples.pop(0)
+        t, p = self.samples[0]
+        return ((position - p) / (1 << 20)) / (now - t) if now - t > 0.5 else self.average(position)
+
+    def average(self, position: int) -> float:
+        if self.t0 is None:
+            return 0.0
+        el = self.clock() - self.t0
+        return ((position - (self.first or 0)) / (1 << 20)) / el if el > 0 else 0.0
+
+
+_END = object()
+
+
+def _prefetch(reader: DiskReader, pieces: list[ByteRange], depth: int,
+              stop: threading.Event) -> Iterator[tuple[ByteRange, bytes]]:
+    """Yield (piece, data) in order while a background thread reads ahead `depth` chunks."""
+    if depth <= 0:
+        for p in pieces:
+            yield p, reader.read(p.offset, p.length)
+        return
+    q: queue.Queue = queue.Queue(maxsize=depth)
+
+    def run() -> None:
+        try:
+            for p in pieces:
+                if stop.is_set():
+                    return
+                buf = reader.read(p.offset, p.length)
+                while not stop.is_set():
+                    try:
+                        q.put((p, buf), timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+            q.put(_END)
+        except BaseException as e:  # noqa: BLE001 - re-raised in the consumer
+            q.put(e)
+
+    t = threading.Thread(target=run, name="disk-prefetch", daemon=True)
+    t.start()
+    try:
+        while True:
+            item = q.get()
+            if item is _END:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        stop.set()
+        t.join(timeout=30)
+
+
 def copy_disk(
     reader: DiskReader,
     writer: DiskWriter,
@@ -65,45 +198,72 @@ def copy_disk(
     cancel: threading.Event | None = None,
     compare: DiskReader | None = None,
     compare_block: int = 64 << 10,
+    hashes: BlockHashes | None = None,
+    prefetch: int = 2,
 ) -> CopyStats:
     if writer.size < reader.size:
         raise ValueError(f"target disk ({writer.size} B) smaller than source ({reader.size} B)")
     size = reader.size
+    if hashes is not None and (chunk_size % hashes.block or start_offset % hashes.block):
+        hashes = None                     # misaligned: never record checksums we cannot trust
     if ranges is None:
         work = [ByteRange(start_offset, size - start_offset)] if start_offset < size else []
     else:
+        if hashes is not None:            # changed ranges: re-hash whole blocks they touch
+            ranges = align_ranges(ranges, hashes.block, size)
         work = [r for r in clip(ranges, size) if r.end > start_offset]
         work = [ByteRange(max(r.offset, start_offset), r.end - max(r.offset, start_offset)) for r in work]
     pieces = split(work, chunk_size)
+    by_hash = hashes is not None and hashes.has_base and compare is None and ranges is None
 
     stats = CopyStats(bytes_total=size, resumed_from=start_offset)
     t0 = time.monotonic()
     since_ckpt = 0
     high = start_offset
-    for p in pieces:
+    stop = threading.Event()
+    for p, buf in _prefetch(reader, pieces, prefetch, stop):
         if cancel is not None and cancel.is_set():
+            stop.set()
             raise CopyCancelled()
-        buf = reader.read(p.offset, p.length)
         if len(buf) != p.length:
             raise IOError(f"short read at {p.offset}: wanted {p.length}, got {len(buf)}")
         stats.bytes_read += p.length
-        if compare is not None:
-            old = compare.read(p.offset, p.length)
-            if old == buf:
-                stats.bytes_unchanged += p.length
-            else:  # write only the sub-blocks that differ
-                for o in range(0, p.length, compare_block):
-                    nb = buf[o:o + compare_block]
-                    if old[o:o + compare_block] == nb:
-                        stats.bytes_unchanged += len(nb)
-                    else:
-                        writer.write(p.offset + o, nb)
-                        stats.bytes_written += len(nb)
-        elif writer.prezeroed and _is_zero(buf):
-            stats.bytes_zero_skipped += p.length
+        if by_hash:
+            # compare against the checksums recorded when each block was last written
+            for o in range(0, p.length, hashes.block):  # type: ignore[union-attr]
+                nb = buf[o:o + hashes.block]  # type: ignore[union-attr]
+                i = (p.offset + o) // hashes.block  # type: ignore[union-attr]
+                dg = hashlib.sha256(nb).digest()
+                if hashes.get(i) == dg:  # type: ignore[union-attr]
+                    stats.bytes_unchanged += len(nb)
+                else:
+                    writer.write(p.offset + o, nb)
+                    stats.bytes_written += len(nb)
+                    hashes.set(i, dg)  # type: ignore[union-attr]
         else:
-            writer.write(p.offset, buf)
-            stats.bytes_written += p.length
+            if compare is not None:
+                old = compare.read(p.offset, p.length)
+                if old == buf:
+                    stats.bytes_unchanged += p.length
+                else:  # write only the sub-blocks that differ
+                    for o in range(0, p.length, compare_block):
+                        nb = buf[o:o + compare_block]
+                        if old[o:o + compare_block] == nb:
+                            stats.bytes_unchanged += len(nb)
+                        else:
+                            writer.write(p.offset + o, nb)
+                            stats.bytes_written += len(nb)
+            elif writer.prezeroed and _is_zero(buf):
+                stats.bytes_zero_skipped += p.length
+            else:
+                writer.write(p.offset, buf)
+                stats.bytes_written += p.length
+            if hashes is not None:        # record what the replica now holds, block by block
+                zero = _is_zero(buf)
+                for o in range(0, p.length, hashes.block):
+                    nb_len = min(hashes.block, p.length - o)
+                    dg = _zero_digest(nb_len) if zero else hashlib.sha256(buf[o:o + hashes.block]).digest()
+                    hashes.set((p.offset + o) // hashes.block, dg)
         high = p.end
         since_ckpt += p.length
         if on_progress:

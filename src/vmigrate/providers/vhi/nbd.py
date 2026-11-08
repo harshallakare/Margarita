@@ -27,7 +27,7 @@ from ...core.errors import ProviderError
 from ...core.interfaces import DiskReader, DiskWriter
 from . import nbd_agent as A
 
-MAX_REQ = 32 << 20          # split large writes/reads into NBD requests of at most this size
+MAX_REQ = 8 << 20           # NBD request size; up to `window` of them in flight
 
 _AGENT_SRC = Path(A.__file__).read_text()
 
@@ -42,13 +42,35 @@ class NbdError(ProviderError):
     pass
 
 
+class _Pending:
+    __slots__ = ("ctype", "length", "done", "err", "data", "wait")
+
+    def __init__(self, ctype: int, length: int, wait: bool):
+        self.ctype, self.length, self.wait = ctype, length, wait
+        self.done = threading.Event()
+        self.err: BaseException | None = None
+        self.data = b""
+
+
 class NbdClient:
-    def __init__(self, rfile: IO[bytes], wfile: IO[bytes], closer: Callable[[], None] | None = None):
+    """NBD client with pipelined requests: up to `window` commands in flight, replies matched by
+    handle on a receiver thread. Writes do not wait for their reply (the round trip to the helper
+    used to stall every 32 MiB); errors from them surface on the next call or at flush/close."""
+
+    def __init__(self, rfile: IO[bytes], wfile: IO[bytes], closer: Callable[[], None] | None = None,
+                 *, window: int = 16):
         self.r, self.w = rfile, wfile
         self._closer = closer
         self._handle = 0
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # serialises request sends
+        self._plock = threading.Lock()         # guards _pending
+        self._pending: dict[int, _Pending] = {}
+        self._slots = threading.Semaphore(window)
+        self._err: BaseException | None = None
+        self._closing = False
         self.size, self.flags = self._handshake()
+        self._rx = threading.Thread(target=self._recv_loop, name="nbd-rx", daemon=True)
+        self._rx.start()
 
     @classmethod
     def over_process(cls, proc: subprocess.Popen) -> NbdClient:
@@ -111,23 +133,80 @@ class NbdClient:
             raise NbdError("NBD server sent no export size")
         return size, flags or 0
 
-    def _cmd(self, ctype: int, off: int, ln: int, data: bytes = b"", flags: int = 0) -> bytes:
+    # ------------------------------------------------------------------ pipelining
+    def _recv_loop(self) -> None:
+        try:
+            while True:
+                magic, err, handle = struct.unpack(">IIQ", self._read(16))
+                with self._plock:
+                    pend = self._pending.pop(handle, None)
+                if magic != A.SIMPLE_REPLY or pend is None:
+                    raise NbdError("bad NBD reply (magic or unknown handle)")
+                if err:
+                    pend.err = NbdError(f"NBD command {pend.ctype} failed: errno {err}")
+                    if not pend.wait:                       # nobody waits on a pipelined write
+                        self._err = self._err or pend.err
+                elif pend.ctype == A.CMD_READ:
+                    pend.data = self._read(pend.length)
+                pend.done.set()
+                self._slots.release()
+        except BaseException as e:  # noqa: BLE001 - fail every waiter, never hang
+            if not self._closing:
+                self._err = self._err or (e if isinstance(e, NbdError) else NbdError(f"NBD connection lost: {e}"))
+            with self._plock:
+                left, self._pending = list(self._pending.values()), {}
+            for p in left:
+                p.err = self._err or NbdError("NBD connection closed")
+                p.done.set()
+                self._slots.release()
+
+    def _check(self) -> None:
+        if self._err is not None:
+            raise self._err
+
+    def _submit(self, ctype: int, off: int, ln: int, data: bytes = b"", flags: int = 0, *, wait: bool = True) -> bytes:
+        self._check()
+        while not self._slots.acquire(timeout=1):
+            self._check()
+            if not self._rx.is_alive():
+                raise NbdError("NBD connection closed")
+        pend = _Pending(ctype, ln, wait)
         with self._lock:
             self._handle += 1
             h = self._handle
-            self._send(struct.pack(">IHHQQI", A.REQ_MAGIC, flags, ctype, h, off, ln) + data)
-            magic, err, handle = struct.unpack(">IIQ", self._read(16))
-            if magic != A.SIMPLE_REPLY or handle != h:
-                raise NbdError("bad NBD reply")
-            if err:
-                raise NbdError(f"NBD command {ctype} at {off}+{ln} failed: errno {err}")
-            return self._read(ln) if ctype == A.CMD_READ else b""
+            with self._plock:
+                self._pending[h] = pend
+            try:
+                self._send(struct.pack(">IHHQQI", A.REQ_MAGIC, flags, ctype, h, off, ln) + data)
+            except (OSError, ValueError) as e:
+                with self._plock:
+                    self._pending.pop(h, None)
+                self._slots.release()
+                raise NbdError(f"NBD send failed: {e}") from e
+        if not wait:
+            return b""
+        pend.done.wait()
+        if pend.err is not None:
+            raise pend.err
+        return pend.data
 
+    def _drain(self) -> None:
+        """Wait until every in-flight request has been answered."""
+        while True:
+            with self._plock:
+                left = list(self._pending.values())
+            if not left:
+                break
+            for p in left:
+                p.done.wait()
+        self._check()
+
+    # ------------------------------------------------------------------ commands
     def pread(self, off: int, ln: int) -> bytes:
         out = []
         while ln > 0:
             n = min(ln, MAX_REQ)
-            out.append(self._cmd(A.CMD_READ, off, n))
+            out.append(self._submit(A.CMD_READ, off, n))
             off, ln = off + n, ln - n
         return b"".join(out)
 
@@ -135,26 +214,31 @@ class NbdClient:
         view = memoryview(data)
         while view:
             n = min(len(view), MAX_REQ)
-            self._cmd(A.CMD_WRITE, off, n, bytes(view[:n]))
+            self._submit(A.CMD_WRITE, off, n, bytes(view[:n]), wait=False)
             off, view = off + n, view[n:]
 
     def write_zeroes(self, off: int, ln: int) -> None:
         while ln > 0:
             n = min(ln, 1 << 30)
-            self._cmd(A.CMD_WRITE_ZEROES, off, n)
+            self._submit(A.CMD_WRITE_ZEROES, off, n, wait=False)
             off, ln = off + n, ln - n
 
     def flush(self) -> None:
-        self._cmd(A.CMD_FLUSH, 0, 0)
+        self._drain()                          # every earlier write acknowledged first
+        self._submit(A.CMD_FLUSH, 0, 0)
 
     def close(self) -> None:
         try:
-            with self._lock:
-                self._send(struct.pack(">IHHQQI", A.REQ_MAGIC, 0, A.CMD_DISC, 0, 0, 0))
-        except (OSError, ValueError):
-            pass
-        if self._closer:
-            self._closer()
+            self._drain()
+        finally:
+            self._closing = True
+            try:
+                with self._lock:
+                    self._send(struct.pack(">IHHQQI", A.REQ_MAGIC, 0, A.CMD_DISC, 0, 0, 0))
+            except (OSError, ValueError):
+                pass
+            if self._closer:
+                self._closer()
 
 
 class NbdDiskWriter(DiskWriter):
