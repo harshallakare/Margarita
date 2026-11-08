@@ -148,7 +148,24 @@ class Repo:
 
     def delete_migration(self, mid: str) -> None:
         with self.engine.begin() as c:
+            c.execute(delete(s.replica_hashes).where(s.replica_hashes.c.migration_id == mid))
             c.execute(delete(s.migrations).where(s.migrations.c.id == mid))
+
+    # ------------------------------------------------------------------ replica block checksums
+    def get_replica_hashes(self, mid: str, disk_id: str) -> tuple[int, bytes] | None:
+        q = select(s.replica_hashes).where(s.replica_hashes.c.migration_id == mid,
+                                           s.replica_hashes.c.disk_id == disk_id)
+        with self.engine.connect() as c:
+            r = c.execute(q).first()
+        return (int(r.block_size), bytes(r.data)) if r else None
+
+    def set_replica_hashes(self, mid: str, disk_id: str, block_size: int, data: bytes | None) -> None:
+        with self.engine.begin() as c:
+            c.execute(delete(s.replica_hashes).where(s.replica_hashes.c.migration_id == mid,
+                                                     s.replica_hashes.c.disk_id == disk_id))
+            if data is not None:
+                c.execute(insert(s.replica_hashes).values(migration_id=mid, disk_id=disk_id, block_size=block_size,
+                                                          data=data, updated_at=time.time()))
 
     def save_state(self, mid: str, state: dict[str, Any]) -> None:
         with self.engine.begin() as c:
@@ -650,6 +667,12 @@ class DbReplicaStore:
 
     def save(self, d: dict[str, Any]) -> None:
         self.repo.save_state(self.mid, _jsonable(d))
+
+    def load_hashes(self, disk_id: str) -> tuple[int, bytes] | None:
+        return self.repo.get_replica_hashes(self.mid, disk_id)
+
+    def save_hashes(self, disk_id: str, block_size: int, data: bytes | None) -> None:
+        self.repo.set_replica_hashes(self.mid, disk_id, block_size, data)
 
 
 class DbStateStore:

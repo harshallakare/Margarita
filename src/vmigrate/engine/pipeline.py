@@ -31,7 +31,7 @@ from ..core.interfaces import DiskHints, SnapshotRef, SourceProvider, TargetDisk
 from ..ir import DiskSpec, GuestOS, OsFamily, VmSpec
 from ..osmorph import MorphRequest, resolve
 from . import safety
-from .copier import copy_disk
+from .copier import RateMeter, copy_disk
 from .report import write_report
 from .state import DiskState, MigrationState, Phase, StateStore, phase_at_least
 from .verify import check_size, compare_samples, full_verify, sample_offsets
@@ -305,6 +305,7 @@ class MigrationRunner:
             last_pct = [-1]
             t_start = time.monotonic()
             last_save = [0.0]
+            meter = RateMeter()
 
             def progress(off: int, size: int) -> None:
                 if self.cancel_hook is not None:
@@ -320,7 +321,7 @@ class MigrationRunner:
                     last_save[0] = now
                     with self._lock:
                         ds.progress_bytes = off
-                        ds.rate_mb_s = ((off - start) / (1 << 20)) / max(now - t_start, 1e-6)
+                        ds.rate_mb_s = meter.update(off)       # current speed (10 s window), not the average
                         ds.progress_at = time.time()
                         self.store.save(self.state)
 
@@ -337,6 +338,7 @@ class MigrationRunner:
                 # never-written regions entirely
                 alloc = reader.allocated_ranges() if writer.prezeroed else None
                 stats = copy_disk(reader, writer, chunk_size=self.engine.chunk_size, start_offset=start, ranges=alloc,
+                                  prefetch=self.engine.prefetch_chunks,
                                   checkpoint_every=self.engine.checkpoint_every, on_progress=progress,
                                   on_checkpoint=checkpoint)
                 staged = writer.staged_path

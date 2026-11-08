@@ -35,7 +35,7 @@ from ..providers import build_source, build_target
 from ..security.secretstore import FernetSecretStore, SecretStore
 from .settings import Settings
 
-ENGINE_OVERRIDES = {"max_parallel_disks", "chunk_size", "checkpoint_every", "verify_samples", "verify_sample_bytes",
+ENGINE_OVERRIDES = {"max_parallel_disks", "chunk_size", "checkpoint_every", "prefetch_chunks", "verify_samples", "verify_sample_bytes",
                     "app_consistent", "cleanup_source_snapshot", "on_failure", "boot_check", "boot_timeout",
                     "verify_full"}
 
