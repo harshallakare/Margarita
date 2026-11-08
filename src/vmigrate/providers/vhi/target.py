@@ -1,5 +1,12 @@
 """Purpose: Virtuozzo Hybrid Infrastructure (VHI) TargetProvider — the reference vertical's target.
-Must run ON a VHI node (vStorage mounted, root) because it writes volume backings directly.
+
+Two ways to write the migrated disks (write_mode):
+  * vstorage  — the worker runs ON a VHI node (vStorage mounted, root) and writes each volume's
+                qcow2 backing directly (fastest; the path documented below)
+  * helper_vm — the worker runs anywhere: a temporary helper VM is booted in VHI, the new volumes are
+                attached to it and written over SSH through a tiny NBD agent (helper.py, nbd.py), the
+                way Coriolis does it. Only API credentials + SSH reachability to the helper are needed.
+  * auto (default) — vstorage when <vstorage_mount>/<cinder_datastore> exists here, else helper_vm
 
 Usage (config):
     targets:
@@ -14,6 +21,11 @@ Usage (config):
         verify_tls: false
         volume_type: vmds                     # optional: Cinder volume type (default: Cinder's default type)
         multiattach_volume_type: vmds-shared  # optional: type with multiattach="<is> True" (cluster shared disks)
+        write_mode: auto                      # auto | vstorage | helper_vm
+        helper_image: ubuntu-22.04            # helper_vm: cloud image with python3 + cloud-init
+        helper_network: private               # helper_vm: network for the helper (reachable from worker)
+        helper_floating_network: null         # helper_vm: optional; allocate a floating IP from it
+        helper_ssh_cidr: 0.0.0.0/0            # helper_vm: SSH source range for the temporary security group
         vstorage_mount: /mnt/vstorage
         cinder_datastore: vols/datastores/cinder   # default
         staging_dir: /var/lib/vmigrate/staging
@@ -40,6 +52,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -59,6 +72,8 @@ from ...core.interfaces import (
 )
 from ...core.retry import poll_until
 from ..common.openstack_auth import project_problem
+from .helper import HelperVm
+from .nbd import NbdClient, NbdDiskReader, NbdDiskWriter, UnixBridge, agent_command
 from ...ir import DiskBus, Firmware, VmSpec
 from .qemu import (
     QemuImageReader,
@@ -127,6 +142,50 @@ class VhiTarget(TargetProvider):
         self.poll = float(config.get("poll_interval", 5))
         self.op_timeout = float(config.get("op_timeout", 1800))
         self.set_owner = config.get("chown_backing", True)
+        self.write_mode_cfg = config.get("write_mode", "auto") or "auto"
+        if self.write_mode_cfg not in ("auto", "vstorage", "helper_vm"):
+            raise ConfigError(f"targets.{name}.write_mode must be auto, vstorage or helper_vm")
+        self._helper: HelperVm | None = None
+        self._bridges: dict[str, UnixBridge] = {}
+        self._sockdir: str | None = None
+
+    # ------------------------------------------------------------------ write mode
+    @property
+    def write_mode(self) -> str:
+        if self.write_mode_cfg != "auto":
+            return self.write_mode_cfg
+        return "vstorage" if (self.vstorage / self.datastore).is_dir() else "helper_vm"
+
+    @property
+    def helper(self) -> HelperVm:
+        if self._helper is None:
+            self._helper = HelperVm(self.api, self.config, self.ctx, self.staging, poll=self.poll,
+                                    op_timeout=self.op_timeout)
+        return self._helper
+
+    def _agent(self, disk: TargetDiskRef, *, writable: bool) -> NbdClient:
+        dev = self.helper.attach(disk.id)
+        return NbdClient.over_process(self.helper.transport.popen(agent_command(dev, writable=writable)))
+
+    def _release_helper_disks(self) -> None:
+        """Volumes must be detached from the helper before Nova boots the real VM or Cinder clones them."""
+        for b in self._bridges.values():
+            b.close()
+        self._bridges.clear()
+        if self._sockdir:
+            shutil.rmtree(self._sockdir, ignore_errors=True)
+            self._sockdir = None
+        if self._helper is not None:
+            self._helper.detach_all()
+
+    def close(self) -> None:
+        if self._helper is None:
+            return
+        try:
+            self._release_helper_disks()
+        finally:
+            self._helper.destroy()
+            self._helper = None
 
     @property
     def api(self) -> Any:
@@ -170,6 +229,10 @@ class VhiTarget(TargetProvider):
         p = project_problem(pid, self.config)
         if self.volume_type and not self.api.find_volume_type(self.volume_type):
             p.append(f"volume type {self.volume_type!r} not found")
+        # helper settings are checked when helper mode is chosen explicitly or configured at all
+        # (in auto mode the API server is usually not the worker, so its vStorage view says nothing)
+        if self.write_mode_cfg == "helper_vm" or self.config.get("helper_image") or self.config.get("helper_network"):
+            p += [x for x in self.helper.problems() if "on this worker" not in x]
         return p
 
     def preflight(self, spec: VmSpec | None = None) -> list[str]:
@@ -182,11 +245,17 @@ class VhiTarget(TargetProvider):
             return p
         if self.volume_type and not self.api.find_volume_type(self.volume_type):
             p.append(f"volume type {self.volume_type!r} not found")
-        ds = self.vstorage / self.datastore
-        if not ds.is_dir():
-            p.append(f"vStorage cinder datastore not found at {ds} (run on a VHI node with vStorage mounted)")
-        if shutil.which(self.qemu.binary) is None:
-            p.append(f"{self.qemu.binary} not found on PATH")
+        helper = self.write_mode == "helper_vm"
+        if helper:
+            self.ctx.logger.info("vhi write mode: helper_vm (volumes written through a temporary helper VM)")
+            p += self.helper.problems()
+        else:
+            ds = self.vstorage / self.datastore
+            if not ds.is_dir():
+                p.append(f"vStorage cinder datastore not found at {ds}: run this worker on a VHI node with vStorage "
+                         "mounted, or set write_mode: helper_vm (with helper_image and helper_network)")
+            if shutil.which(self.qemu.binary) is None:
+                p.append(f"{self.qemu.binary} not found on PATH")
         if spec is None:
             return p
         o = self._opts(spec)
@@ -201,6 +270,8 @@ class VhiTarget(TargetProvider):
                 p.append(f"flavor {o.get('flavor') or o.get('default_flavor')!r} not found")
         elif not pick_flavor(self.api.flavors(), spec.cpu.total, spec.memory_bytes >> 20):
             p.append(f"no flavor with >= {spec.cpu.total} vCPU and >= {spec.memory_bytes >> 20} MiB RAM")
+        if helper:
+            return p                     # no local staging: data goes straight to the attached volumes
         # Pitfall 10: staging must hold the largest N disks in flight at once.
         par = int(spec.extra.get("max_parallel_disks", 1))
         need = sum(sorted((round_up_gib(d.size_bytes) * GIB for d in spec.disks), reverse=True)[:par])
@@ -250,6 +321,12 @@ class VhiTarget(TargetProvider):
         return backing_path(self.vstorage, disk.id, self.datastore)
 
     def open_disk_writer(self, disk: TargetDiskRef, *, resume: bool = False, incremental: bool = False) -> DiskWriter:
+        if self.write_mode == "helper_vm":
+            self.ctx.require_execute("write volume through helper VM", disk=disk.name, incremental=incremental)
+            # a fresh Cinder volume reads as zeros (thin), so zero chunks can be skipped; replica syncs
+            # rewrite existing content and must write zeros explicitly
+            zeroed = not incremental and bool(self.config.get("helper_assume_zeroed", True))
+            return NbdDiskWriter(self._agent(disk, writable=True), disk.size_bytes, prezeroed=zeroed)
         self.ctx.require_execute("stage raw", disk=disk.name, path=str(self._staged(disk)), incremental=incremental)
         p = self._staged(disk)
         if incremental:
@@ -282,6 +359,7 @@ class VhiTarget(TargetProvider):
     def clone_disk(self, disk: TargetDiskRef, name: str, restore_point: str | None = None) -> TargetDiskRef:
         if restore_point:
             raise ProviderError("VHI: restore points are not supported; deploy from the latest sync")
+        self._release_helper_disks()
         src = self.api.get_volume(disk.id)
         if (src.get("metadata") or {}).get(MANAGED) != "true":
             raise SafetyGateError(f"refusing to clone volume {disk.id}: not vmigrate-managed")
@@ -305,6 +383,11 @@ class VhiTarget(TargetProvider):
         self._staged(disk).unlink(missing_ok=True)
 
     def commit_disk(self, disk: TargetDiskRef, writer_staged: Path | None) -> None:
+        if self.write_mode == "helper_vm":
+            # data is already on the volume (the writer flushed it); nothing to convert
+            if writer_staged is not None:
+                raise ProviderError(f"{disk.name}: unexpected staged image in helper_vm mode")
+            return
         if writer_staged is None or not writer_staged.exists():
             raise ProviderError(f"{disk.name}: staged image missing ({writer_staged})")
         vol = self.api.get_volume(disk.id)
@@ -334,6 +417,8 @@ class VhiTarget(TargetProvider):
     def open_disk_reader(self, disk: TargetDiskRef) -> DiskReader | None:
         if not self.config.get("verify_after_commit", True):
             return None
+        if self.write_mode == "helper_vm":
+            return NbdDiskReader(self._agent(disk, writable=False), disk.size_bytes)
         return QemuImageReader(self._backing(disk), disk.size_bytes, self.qemu)
 
     def discard_staging(self, disk: TargetDiskRef) -> None:
@@ -341,6 +426,16 @@ class VhiTarget(TargetProvider):
             self._staged(disk).unlink(missing_ok=True)
 
     def morph_image(self, disk: TargetDiskRef) -> tuple[Path, str] | None:
+        if self.write_mode == "helper_vm":
+            # OSMorph (guestfish / virt-v2v on this worker) opens the remote volume over NBD
+            if disk.id not in self._bridges:
+                dev = self.helper.attach(disk.id)
+                t = self.helper.transport
+                if self._sockdir is None:     # short private dir: AF_UNIX paths are limited to ~104 chars
+                    self._sockdir = tempfile.mkdtemp(prefix="vmnbd-", dir="/tmp" if os.path.isdir("/tmp") else None)
+                self._bridges[disk.id] = UnixBridge(Path(self._sockdir) / f"{len(self._bridges)}.sock",
+                                                    lambda: t.popen(agent_command(dev, writable=True)))
+            return (self._bridges[disk.id].uri, "raw")  # type: ignore[return-value]
         b = self._backing(disk)
         return (b, "qcow2") if b.exists() else None
 
@@ -371,6 +466,7 @@ class VhiTarget(TargetProvider):
         return nets
 
     def create_vm(self, spec: VmSpec, boot_disk: TargetDiskRef, data_disks: list[TargetDiskRef]) -> VmRef:
+        self._release_helper_disks()
         o = self._opts(spec)
         fl = o.get("flavor") or o.get("default_flavor")
         flavor = self.api.find_flavor(fl) if fl else pick_flavor(self.api.flavors(), spec.cpu.total, spec.memory_bytes >> 20)
@@ -431,6 +527,7 @@ class VhiTarget(TargetProvider):
     # ------------------------------------------------------------------ cleanup
     def cleanup_on_failure(self, created: Mapping[str, Any]) -> None:
         self.ctx.require_execute("vhi cleanup created resources")
+        self.close()                     # helper VM first: its attachments block volume deletion
         vm = created.get("target_vm")
         if vm:
             s = self.api.get_server(vm["id"])

@@ -52,9 +52,19 @@ def domain_xml(req: MorphRequest) -> str:
         bus = _BUS.get(d.bus, "scsi")
         pfx = "vd" if bus == "virtio" else ("hd" if bus == "ide" else "sd")
         dev = pfx + (letters[i] if i < 26 else letters[i // 26 - 1] + letters[i % 26])
+        src = str(img)
+        if src.startswith("nbd://?socket="):     # VHI helper_vm mode: the volume is served over NBD
+            disks.append(f"""    <disk type='network' device='disk'>
+      <driver name='qemu' type={quoteattr(fmt)}/>
+      <source protocol='nbd'>
+        <host transport='unix' socket={quoteattr(src.split("socket=", 1)[1])}/>
+      </source>
+      <target dev='{dev}' bus='{bus}'/>
+    </disk>""")
+            continue
         disks.append(f"""    <disk type='file' device='disk'>
       <driver name='qemu' type={quoteattr(fmt)}/>
-      <source file={quoteattr(str(img))}/>
+      <source file={quoteattr(src)}/>
       <target dev='{dev}' bus='{bus}'/>
     </disk>""")
     loader = "\n    <loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE.fd</loader>" \

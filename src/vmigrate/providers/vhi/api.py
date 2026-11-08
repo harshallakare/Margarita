@@ -104,3 +104,34 @@ class OpenStackApi:
 
     def delete_port(self, port_id: str) -> None:
         self.conn.network.delete_port(port_id, ignore_missing=True)
+
+    # ---- helper VM (write_mode helper_vm) ------------------------------------------------
+    def find_image(self, name_or_id: str) -> dict[str, Any] | None:
+        i = self.conn.image.find_image(name_or_id, ignore_missing=True)
+        return _d(i) if i else None
+
+    def detach_volume(self, server_id: str, vol_id: str) -> None:
+        self.conn.compute.delete_volume_attachment(server_id, vol_id, ignore_missing=True)
+
+    def server_ports(self, server_id: str) -> list[dict[str, Any]]:
+        return [_d(p) for p in self.conn.network.ports(device_id=server_id)]
+
+    def create_floating_ip(self, network_id: str, port_id: str) -> dict[str, Any]:
+        return _d(self.conn.network.create_ip(floating_network_id=network_id, port_id=port_id))
+
+    def delete_floating_ip(self, fip_id: str) -> None:
+        self.conn.network.delete_ip(fip_id, ignore_missing=True)
+
+    def create_ssh_security_group(self, name: str, cidr: str) -> dict[str, Any]:
+        sg = _d(self.conn.network.create_security_group(name=name, description="vmigrate helper VM: SSH in"))
+        self.conn.network.create_security_group_rule(security_group_id=sg["id"], direction="ingress",
+                                                     ethertype="IPv4", protocol="tcp", port_range_min=22,
+                                                     port_range_max=22, remote_ip_prefix=cidr)
+        return sg
+
+    def find_security_group(self, name: str) -> dict[str, Any] | None:
+        g = self.conn.network.find_security_group(name, ignore_missing=True)
+        return _d(g) if g else None
+
+    def delete_security_group(self, sg_id: str) -> None:
+        self.conn.network.delete_security_group(sg_id, ignore_missing=True)
