@@ -43,9 +43,9 @@ class Session:
     def __init__(self, routes):
         self.routes, self.calls = routes, []
 
-    def request(self, method, url, json=None, headers=None, timeout=None):
+    def request(self, method, url, json=None, headers=None, timeout=None, auth=None):
         path = url.split("9440", 1)[1]
-        self.calls.append((method, path, json, headers))
+        self.calls.append((method, path, json, headers, auth))
         r = self.routes.get((method, path))
         return r(json) if callable(r) else (r or Resp(404, {"error": "no route"}))
 
@@ -427,6 +427,18 @@ def test_crt_discover_paging_jwt_refresh_and_zeroed_regions():
     assert c0[0][2]["referenceRecoveryPointExtId"] == "rp-1" and c0[0][2]["referenceDiskRecoveryPointExtId"] == "drp-1"
     assert c0[0][3]["Cookie"] == "NTNX_IGW_SESSION=jwt1" and c0[-1][3]["Cookie"] == "NTNX_IGW_SESSION=jwt2"
     assert state["jwt"] == 2                                     # rediscovered once after the 401
+    assert isinstance(c0[0][4], v4.JwtOnly) and c0[0][4].jwt == "jwt1"
+
+
+def test_crt_call_sends_only_the_session_token():
+    # seen live (AOS 7.3): Basic auth + token cookie -> 403 with an empty body
+    import requests
+    s = requests.Session()
+    s.auth = ("admin", "pc-secret")
+    s.cookies.set("NTNX_IGW_SESSION", "pc-cookie")
+    req = s.prepare_request(requests.Request("POST", "https://10.0.0.5:9440/x", json={}, auth=v4.JwtOnly("tok"),
+                                             headers={"Cookie": "NTNX_IGW_SESSION=tok"}))
+    assert "Authorization" not in req.headers and req.headers["Cookie"] == "NTNX_IGW_SESSION=tok"
 
 
 def test_crt_compute_falls_back_to_a_version_the_cluster_serves():
