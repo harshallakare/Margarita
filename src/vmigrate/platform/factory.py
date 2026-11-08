@@ -104,6 +104,14 @@ class Services:
         return RemoteSource(ep["name"], {"type": ep["type"]}, ctx, endpoint_id=ep["id"],
                             key=derive_key(self.settings.secret_key), locate=locate, http=http)
 
+    def alert_manager(self) -> Any:
+        """The (one) alert manager of this process: conductor ticks + API test sends share it."""
+        if getattr(self, "_alerts", None) is None:
+            from ..alerts.manager import AlertManager
+            object.__setattr__(self, "_alerts", AlertManager(self.repo, self.secrets, public_url=self.settings.public_url,
+                                                             repeat_hours=self.settings.alert_repeat_hours))
+        return self._alerts  # type: ignore[attr-defined]
+
     def build_target(self, ep: dict[str, Any], ctx: RunContext) -> TargetProvider:
         return build_target(ep["name"], self.provider_config(ep), ctx)
 

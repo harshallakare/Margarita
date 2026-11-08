@@ -188,6 +188,7 @@ const P: Record<string, string> = {
   logs: "M5 4h14v16H5zM8 8h8M8 12h8M8 16h5",
   audit: "M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6zM9 12l2 2 4-4",
   check: "M5 12l5 5L20 7",
+  bell: "M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0",
 };
 export function Icon({ n, size = 16 }: { n: keyof typeof P | string; size?: number }) {
   return (

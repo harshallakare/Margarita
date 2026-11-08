@@ -17,6 +17,9 @@ Environment:
     VMIGRATE_ALLOWED_PROVIDERS  optional comma list restricting endpoint types (e.g. "nutanix,vhi")
     VMIGRATE_CORS_ORIGINS       optional comma list for the web UI dev server (e.g. http://localhost:5173)
     VMIGRATE_WEB_DIR            built web UI to serve at /ui (default ./web/dist when it exists)
+    VMIGRATE_PUBLIC_URL         optional external URL of the UI/API (https://margarita.example.com); used for
+                                links in alert emails
+    VMIGRATE_ALERT_REPEAT_HOURS default 24: re-send unacknowledged critical alerts this often (0 = never)
 """
 
 from __future__ import annotations
@@ -39,6 +42,8 @@ class Settings:
     cors_origins: list[str] = field(default_factory=list)
     web_dir: Path | None = None
     allow_http_enroll: bool = False     # VMIGRATE_ALLOW_HTTP_ENROLL=1: lab only (secrets cross the wire in clear)
+    public_url: str | None = None
+    alert_repeat_hours: float = 24.0
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
@@ -60,4 +65,6 @@ class Settings:
             allowed_providers=lst("VMIGRATE_ALLOWED_PROVIDERS"),
             cors_origins=lst("VMIGRATE_CORS_ORIGINS"),
             web_dir=Path(e.get("VMIGRATE_WEB_DIR", "web/dist")),
+            public_url=e.get("VMIGRATE_PUBLIC_URL") or None,
+            alert_repeat_hours=float(e.get("VMIGRATE_ALERT_REPEAT_HOURS", 24)),
         )

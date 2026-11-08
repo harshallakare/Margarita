@@ -453,6 +453,66 @@ class Repo:
         with self.engine.connect() as c:
             return [_row(r) for r in c.execute(q.order_by(s.events.c.id).limit(limit))]  # type: ignore[misc]
 
+    # ------------------------------------------------------------------ alerts
+    def firing_alerts(self) -> list[dict[str, Any]]:
+        with self.engine.connect() as c:
+            return [_row(r) for r in c.execute(select(s.alerts).where(s.alerts.c.status == "firing"))]  # type: ignore[misc]
+
+    def create_alert(self, **values: Any) -> str:
+        aid, now = _id(), time.time()
+        with self.engine.begin() as c:
+            c.execute(insert(s.alerts).values(id=aid, status="firing", first_at=values.pop("first_at", now),
+                                              last_at=now, **values))
+        return aid
+
+    def update_alert(self, aid: str, **values: Any) -> None:
+        with self.engine.begin() as c:
+            c.execute(update(s.alerts).where(s.alerts.c.id == aid).values(**values))
+
+    def get_alert(self, aid: str) -> dict[str, Any] | None:
+        with self.engine.connect() as c:
+            return _row(c.execute(select(s.alerts).where(s.alerts.c.id == aid)).first())
+
+    def list_alerts(self, *, status: str | None = None, migration_id: str | None = None,
+                    limit: int = 200) -> list[dict[str, Any]]:
+        q = select(s.alerts)
+        if status:
+            q = q.where(s.alerts.c.status == status)
+        if migration_id:
+            q = q.where(s.alerts.c.migration_id == migration_id)
+        with self.engine.connect() as c:
+            return [_row(r) for r in c.execute(q.order_by(s.alerts.c.last_at.desc()).limit(limit))]  # type: ignore[misc]
+
+    # ------------------------------------------------------------------ notification channels
+    def create_channel(self, **values: Any) -> str:
+        cid, now = _id(), time.time()
+        with self.engine.begin() as c:
+            c.execute(insert(s.notification_channels).values(id=cid, created_at=now, updated_at=now, **values))
+        return cid
+
+    def get_channel(self, cid: str) -> dict[str, Any] | None:
+        with self.engine.connect() as c:
+            return _row(c.execute(select(s.notification_channels).where(s.notification_channels.c.id == cid)).first())
+
+    def get_channel_by_name(self, name: str) -> dict[str, Any] | None:
+        with self.engine.connect() as c:
+            return _row(c.execute(select(s.notification_channels)
+                                  .where(s.notification_channels.c.name == name)).first())
+
+    def list_channels(self) -> list[dict[str, Any]]:
+        with self.engine.connect() as c:
+            return [_row(r) for r in c.execute(select(s.notification_channels)  # type: ignore[misc]
+                                               .order_by(s.notification_channels.c.name))]
+
+    def update_channel(self, cid: str, **values: Any) -> None:
+        with self.engine.begin() as c:
+            c.execute(update(s.notification_channels).where(s.notification_channels.c.id == cid)
+                      .values(updated_at=time.time(), **values))
+
+    def delete_channel(self, cid: str) -> None:
+        with self.engine.begin() as c:
+            c.execute(delete(s.notification_channels).where(s.notification_channels.c.id == cid))
+
     # ------------------------------------------------------------------ schedules
     def create_schedule(self, mid: str, cron: str, enabled: bool, next_run_at: float | None) -> str:
         sid = _id()

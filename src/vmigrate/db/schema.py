@@ -6,7 +6,8 @@ Usage:
     metadata.create_all(engine)                                               # vmigrate-platform init-db
 
 Tables: users, api_tokens, secrets, endpoints, migrations (also replicas: mode column),
-executions (also the work queue: status + lease), tasks, task_logs, events, workers, schedules.
+executions (also the work queue: status + lease), tasks, task_logs, events, workers, schedules,
+alerts + notification_channels (alerting: conductor evaluates rules, email goes out on fire/resolve).
 upgrade_schema() adds columns introduced after a database was first created (no Alembic yet).
 Secrets hold ONLY ciphertext; endpoint rows reference them by id.
 """
@@ -254,6 +255,45 @@ replica_hashes = Table(                  # SHA-256 per 4 MiB block of each repli
     Column("disk_id", String(256), primary_key=True),
     Column("block_size", Integer, nullable=False),
     Column("data", LargeBinary, nullable=False),
+    Column("updated_at", Float, nullable=False),
+)
+
+alerts = Table(                          # one row per firing episode; resolved rows are history
+    "alerts", metadata,
+    Column("id", String(32), primary_key=True),
+    Column("key", String(256), nullable=False),          # rule identity, e.g. "rpo:<replica id>"
+    Column("kind", String(64), nullable=False),
+    Column("severity", String(16), nullable=False),      # critical | warning
+    Column("status", String(16), nullable=False),        # firing | resolved
+    Column("project", String(128), nullable=True),
+    Column("migration_id", String(32), nullable=True),
+    Column("execution_id", String(32), nullable=True),
+    Column("object_name", String(256), nullable=True),
+    Column("title", Text, nullable=False),
+    Column("detail", Text, nullable=True),
+    Column("first_at", Float, nullable=False),
+    Column("last_at", Float, nullable=False),
+    Column("resolved_at", Float, nullable=True),
+    Column("notified_at", Float, nullable=True),
+    Column("ack_by", String(128), nullable=True),
+    Column("ack_at", Float, nullable=True),
+)
+Index("ix_alerts_status", alerts.c.status, alerts.c.key)
+
+notification_channels = Table(
+    "notification_channels", metadata,
+    Column("id", String(32), primary_key=True),
+    Column("name", String(128), nullable=False, unique=True),
+    Column("type", String(32), nullable=False),          # email
+    Column("config", JSON, nullable=False),              # host, port, security, username, from_addr, to, ...
+    Column("secret_id", String(32), nullable=True),      # SMTP password (secret store, ciphertext only)
+    Column("enabled", Boolean, nullable=False, default=True),
+    Column("min_severity", String(16), nullable=False, default="warning"),
+    Column("notify_resolved", Boolean, nullable=False, default=True),
+    Column("notify_success", Boolean, nullable=False, default=False),
+    Column("last_sent_at", Float, nullable=True),
+    Column("last_error", Text, nullable=True),
+    Column("created_at", Float, nullable=False),
     Column("updated_at", Float, nullable=False),
 )
 

@@ -50,7 +50,7 @@ export interface Migration {
 export interface MigrationOptions {
   target_name?: string; app_consistent?: boolean; guest_os?: Record<string, unknown>;
   target_options?: Record<string, unknown>; osmorph?: Record<string, unknown>; engine?: Record<string, unknown>;
-  retention?: number; keep_helper_minutes?: number;
+  retention?: number; keep_helper_minutes?: number; rpo_minutes?: number;
 }
 
 export interface Schedule {
@@ -215,3 +215,20 @@ export const fmt = {
     return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
   },
 };
+
+export interface Alert {
+  id: string; key: string; kind: string; severity: "critical" | "warning"; status: "firing" | "resolved";
+  project: string | null; migration_id: string | null; execution_id: string | null; object_name: string | null;
+  title: string; detail: string | null; first_at: number; last_at: number; resolved_at: number | null;
+  notified_at: number | null; ack_by: string | null; ack_at: number | null;
+}
+export interface AlertSummary { firing: number; critical: number; unacknowledged: number }
+export interface EmailConfig {
+  host: string; port: number; security: "starttls" | "ssl" | "none"; username?: string | null; from_addr: string;
+  to: string[]; verify_tls: boolean; subject_prefix: string;
+}
+export interface Channel {
+  id: string; name: string; type: "email"; config: EmailConfig; enabled: boolean; min_severity: "warning" | "critical";
+  notify_resolved: boolean; notify_success: boolean; last_sent_at: number | null; last_error: string | null;
+  has_password: boolean; created_at: number; updated_at: number;
+}
