@@ -551,6 +551,17 @@ class NutanixSource(SourceProvider):
         sess.logout()
         sess.logout_matching(d["name"])            # also sessions left by a crashed worker process
         errors = []
+        # an object Nutanix created whose ID we never learned (step failed mid-way): find it by name
+        for key, kind in (("volume_group", "volume-group"), ("recovery_point", "recovery-point")):
+            if not d.get(key) and d.get("name"):
+                try:
+                    found = self.v4.find_by_name(kind, d["name"])
+                except Exception as e:  # noqa: BLE001 - keep cleaning; report at the end
+                    errors.append(f"look up {kind} {d['name']}: {e}")
+                    found = None
+                if found:
+                    self.ctx.logger.warning("cleaning up %s %s (%s) left without a recorded ID", kind, d["name"], found)
+                    d[key] = found
         if d.get("volume_group"):
             if d.get("attached"):
                 try:

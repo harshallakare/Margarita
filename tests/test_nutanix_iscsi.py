@@ -77,6 +77,33 @@ def test_v4_tasks_headers_and_delete_guard():
         api.clusters()                                          # pre-v4 Prism Central: clear message
 
 
+def test_v4_created_id_when_task_lists_only_the_vm():
+    # seen on a real Prism Central: CreateRecoveryPoint task succeeded, entitiesAffected = [the VM] only
+    only_vm = {"data": {"status": "SUCCEEDED", "entitiesAffected": [
+        {"extId": "fd3b2bf4", "rel": "vmm:ahv:config:vm", "name": "ovin-jump"}]}}
+    flt = f"{v4.RECOVERY_POINTS}?$filter=name%20eq%20'vmigrate-r'"
+    s = Session({("POST", v4.RECOVERY_POINTS): Resp(202, {"data": {"extId": "t1"}}),
+                 ("GET", f"{v4.TASKS}/t1"): Resp(200, only_vm),
+                 ("GET", flt): Resp(200, {"data": [{"extId": "rp-77", "name": "vmigrate-r"},
+                                                   {"extId": "rp-x", "name": "vmigrate-r-other"}]})})
+    api = v4.PrismV4(s, "https://pc:9440", sleep=lambda x: None)
+    assert api.create_recovery_point("fd3b2bf4", "vmigrate-r", app_consistent=True) == "rp-77"
+    # completionDetails carries the ID on some versions; rel spellings vary
+    assert v4.PrismV4._affected({"completionDetails": [{"name": "recoveryPointExtId", "value": "rp-5"}]},
+                                "recovery-point") == "rp-5"
+    assert v4.PrismV4._affected({"entitiesAffected": [{"rel": "dataprotection:config:recoveryPoint",
+                                                       "extId": "rp-6"}]}, "recovery-point") == "rp-6"
+    # $filter unsupported -> first page scanned; nothing matching -> loud error with the task
+    s2 = Session({("POST", v4.RECOVERY_POINTS): Resp(202, {"data": {"extId": "t1"}}),
+                  ("GET", f"{v4.TASKS}/t1"): Resp(200, only_vm),
+                  ("GET", f"{v4.RECOVERY_POINTS}?$limit=100"): Resp(200, {"data": []})})
+    with pytest.raises(ProviderError, match="created but its ID could not be determined.*ovin-jump"):
+        v4.PrismV4(s2, "https://pc:9440", sleep=lambda x: None).create_recovery_point("vm", "vmigrate-r",
+                                                                                      app_consistent=True)
+    with pytest.raises(SafetyGateError):
+        api.find_by_name("recovery-point", "prod-backup")      # only ever looks up vmigrate- objects
+
+
 def test_v4_missing_field_fails_loudly_with_payload():
     s = Session({("GET", f"{v4.RECOVERY_POINTS}/rp"): Resp(200, {"data": {"unexpected": 1}})})
     with pytest.raises(ProviderError, match="lacks 'data.vmRecoveryPoints'.*unexpected"):
@@ -135,10 +162,15 @@ def test_iscsi_session_logs_out_only_its_targets():
 # ---------------------------------------------------------------------- full migration through NutanixSource
 
 class FakeV4:
-    def __init__(self, n=13, dsip="10.0.0.50", reachable=True, drop_disk=False):
+    def __init__(self, n=13, dsip="10.0.0.50", reachable=True, drop_disk=False, rp_id_lost=False):
         self.n, self.dsip, self.reachable, self.drop_disk = n, dsip, reachable, drop_disk
+        self.rp_id_lost = rp_id_lost          # Prism created the RP but the ID could not be determined
         self.log: list[str] = []
         self.vg_map: dict[int, str] = {}
+        self.named: dict[tuple[str, str], str] = {}
+
+    def find_by_name(self, kind, name):
+        return self.named.get((kind, name))
 
     def clusters(self):
         if not self.reachable:
@@ -150,6 +182,9 @@ class FakeV4:
 
     def create_recovery_point(self, vm, name, app_consistent):
         self.log.append(f"rp:{name}:{'app' if app_consistent else 'crash'}")
+        if self.rp_id_lost:
+            self.named[("recovery-point", name)] = "rp-orphan"
+            raise ProviderError("recovery-point was created but its ID could not be determined")
         return "rp-1"
 
     def recovery_point_disks(self, rp):
@@ -179,7 +214,7 @@ class FakeV4:
         self.log.append("delete-vg")
 
     def delete_recovery_point(self, rp):
-        self.log.append("delete-rp")
+        self.log.append(f"delete-rp:{rp}" if rp != "rp-1" else "delete-rp")
 
 
 def iscsi_factory(fv4, devdir):
@@ -242,6 +277,15 @@ def test_recovery_point_missing_a_disk_is_refused_and_cleaned_up(tmp_path):
         MigrationRunner(MigrationConfig(name="m", source="ahv", target="tgt", vm="RIS-Sainath"), e, src, tgt, ctx,
                         StateStore(e.state_dir)).run()
     assert "delete-rp" in fv4.log and not tgt.disks             # partial objects removed; nothing created
+
+
+def test_recovery_point_with_unknown_id_is_still_cleaned_up(tmp_path):
+    fv4 = FakeV4(rp_id_lost=True)
+    ctx, src, tgt, e = make(tmp_path, fv4)
+    with pytest.raises(ProviderError, match="could not be determined"):
+        MigrationRunner(MigrationConfig(name="m", source="ahv", target="tgt", vm="RIS-Sainath"), e, src, tgt, ctx,
+                        StateStore(e.state_dir)).run()
+    assert "delete-rp:rp-orphan" in fv4.log                    # found by its vmigrate- name and deleted
 
 
 def test_transport_auto_selection(tmp_path):
