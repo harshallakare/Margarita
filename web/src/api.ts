@@ -9,6 +9,8 @@ export interface Me { user_id: string; username: string; role: Role; project: st
 export interface Field {
   name: string; label: string; kind: "text" | "url" | "password" | "bool" | "int" | "json" | "textarea" | "select";
   options?: string[];
+  /** filled from the target's live lists (POST /endpoints/discover): images | networks | external_networks | flavors | storage */
+  resource?: string;
   secret?: boolean; required?: boolean; help?: string; default?: unknown;
 }
 export interface ProviderRow { type: string; status: string; notes: string; fields: Field[] }

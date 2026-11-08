@@ -282,6 +282,10 @@ class TargetProvider(_Provider):
         """[{id, name, vcpus, ram_mb}] VM sizes, if the target uses predefined sizes."""
         return []
 
+    def list_images(self) -> list[dict[str, Any]]:
+        """[{id, name}] bootable images (e.g. for a helper VM). Empty = not applicable."""
+        return []
+
     # ---- replica support (optional) -------------------------------------------------------
     def supports_replica(self) -> bool:
         """True when open_disk_writer(incremental=True) and clone_disk are implemented."""
