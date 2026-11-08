@@ -259,6 +259,17 @@ def test_transport_auto_selection(tmp_path):
     assert any("transport iscsi" in p for p in src.check_connection())
 
 
+def test_endpoint_level_preflight_does_not_demand_nfs_when_v4_is_available(tmp_path):
+    # The dry-run's first step checks endpoints without a VM: auto + PC v4 => iSCSI, no PD needed.
+    _, src, _, _ = make(tmp_path, FakeV4())
+    assert src.preflight(None) == []
+    _, src, _, _ = make(tmp_path / "b", FakeV4(reachable=False))
+    p = src.preflight(None)
+    assert len(p) == 1 and "protection_domain is not set" in p[0] and "fell back to NFS" in p[0]
+    _, src, _, _ = make(tmp_path / "c", FakeV4(reachable=False), transport="iscsi")
+    assert src.preflight(None)[0].startswith("transport iscsi:")
+
+
 # ---------------------------------------------------------------------- CRT (changed regions)
 CUR = {"recovery_point": "rp-2", "vm_recovery_point": "vmrp-2", "disk_recovery_point": "drp-2"}
 REF = {"recovery_point": "rp-1", "vm_recovery_point": "vmrp-1", "disk_recovery_point": "drp-1"}
