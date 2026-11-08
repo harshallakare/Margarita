@@ -123,6 +123,21 @@ def _extra(meta: Any, name: str) -> str | None:
     return None
 
 
+class JwtOnly:
+    """requests auth hook for the cluster CRT call: the cluster session token is the ONLY credential.
+    Seen live (AOS 7.3): with the session's Basic auth (PC user) also attached, the cluster answered
+    403 with an empty body and ignored the NTNX_IGW_SESSION cookie. Strips Authorization and any
+    session cookies, and sends just the token (as Nutanix's SDK does once it holds a cookie)."""
+
+    def __init__(self, jwt: str):
+        self.jwt = jwt
+
+    def __call__(self, r: Any) -> Any:
+        r.headers.pop("Authorization", None)
+        r.headers["Cookie"] = f"NTNX_IGW_SESSION={self.jwt}"
+        return r
+
+
 def _route_missing(r: Any) -> bool:
     """A 404 from the web server (no such route) rather than a JSON API error about an object."""
     text = str(getattr(r, "text", "") or "")
@@ -335,7 +350,7 @@ class PrismV4:
                        "NTNX-Request-Id": str(uuid.uuid4()), "Cookie": f"NTNX_IGW_SESSION={jwt}"}
             try:
                 r = self.s.request("POST", f"https://{ip}:9440{path}", json=compute_body(off, ref), headers=headers,
-                                   timeout=self.timeout)
+                                   auth=JwtOnly(jwt), timeout=self.timeout)
             except Exception as e:  # noqa: BLE001
                 raise TransientProviderError(f"CRT {ip}: {e}") from e
             if r.status_code == 401 and not retried:          # JWT expired (15 min): get a fresh one once
@@ -353,6 +368,9 @@ class PrismV4:
                 log.info("CRT compute-changed-regions answered under API %s on %s", versions[vi], ip)
             if r.status_code >= 500 or r.status_code == 429:
                 raise TransientProviderError(f"CRT {ip}: HTTP {r.status_code} {r.text[:300]}")
+            if r.status_code == 403:
+                raise ProviderError(f"CRT {ip}: HTTP 403 (cluster refused the session token from Prism Central "
+                                    f"discover-cluster) {r.text[:400]}")
             if r.status_code >= 400:
                 raise ProviderError(f"CRT {ip}: HTTP {r.status_code} {r.text[:600]}")
             retried = False
