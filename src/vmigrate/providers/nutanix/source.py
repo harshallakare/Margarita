@@ -335,24 +335,55 @@ class NutanixSource(SourceProvider):
             layout = v4.recovery_point_layout(data["recovery_point"])
             data["vm_recovery_point"] = layout["vm_recovery_point"]
             rp_disks = layout["disks"]
-            pairs = []
+            unmapped = list(layout.get("unmapped") or [])
+            if len(rp_disks) + len(unmapped) != len(spec.disks):
+                raise SafetyGateError(f"recovery point covers {len(rp_disks) + len(unmapped)} disks, "
+                                      f"the VM has {len(spec.disks)}")
+            pairs, missing = [], []
             for d in spec.ordered_disks():
                 keys = {d.id, d.source_handle.get("v3_uuid"), d.source_handle.get("device_uuid"),
                         d.source_handle.get("vmdisk_uuid")} - {None, ""}
-                hit = [rp_disks[k] for k in keys if k in rp_disks]
-                if len(set(hit)) != 1:
-                    raise SafetyGateError(f"recovery point has no unique copy of disk {d.address} ({sorted(keys)}); "
-                                          f"it lists {sorted(rp_disks)}")
-                pairs.append((d, hit[0]))
+                hit = {rp_disks[k] for k in keys if k in rp_disks}
+                if len(hit) > 1:
+                    raise SafetyGateError(f"recovery point has several copies of disk {d.address}: {sorted(hit)}")
+                if hit:
+                    pairs.append((d, hit.pop()))
+                else:
+                    missing.append(d)
+            by_order = bool(missing)
+            if missing:
+                # Prism did not say which disk recovery point is which disk (diskExtId absent). Take
+                # Prism's order, but only when it can be checked: every volume-group disk's size must
+                # match its source disk below, and equal-sized disks would make a swap undetectable.
+                if len(missing) != len(unmapped):
+                    raise SafetyGateError(f"recovery point has no copy for disks {[d.address for d in missing]} "
+                                          f"(it lists {sorted(rp_disks)} plus {len(unmapped)} unlabelled)")
+                sizes = [d.size_bytes for d in missing]
+                if len(set(sizes)) != len(sizes) and not self.config.get("rp_disk_order_trust", False):
+                    same = sorted({d.address for d in missing if sizes.count(d.size_bytes) > 1})
+                    raise SafetyGateError(
+                        "Prism did not report which disk recovery point belongs to which disk (no diskExtId), and "
+                        f"disks {same} have the same size, so the order cannot be verified. Set rp_disk_order_trust: "
+                        "true on the Nutanix endpoint (advanced config) to accept Prism's disk order.")
+                self.ctx.logger.warning("recovery point lists no diskExtId; mapping %d disk(s) in Prism's order, "
+                                        "checked by size after the volume group is built", len(missing))
+                pairs += list(zip(missing, unmapped))
+                pairs.sort(key=lambda p: p[0].order)
             data["disk_rps"] = {d.id: drp for d, drp in pairs}
-            if len(rp_disks) != len(spec.disks):
-                raise SafetyGateError(f"recovery point covers {len(rp_disks)} disks, the VM has {len(spec.disks)}")
+            data["disk_map_by_order"] = by_order
             data["volume_group"] = v4.create_volume_group(name, cluster)
             for d, drp in pairs:
                 v4.add_disk_from_recovery_point(data["volume_group"], data["recovery_point"], drp, d.order)
             vg_disks = v4.vg_disks(data["volume_group"])
             if len(vg_disks) != len(spec.disks):
                 raise SafetyGateError(f"volume group has {len(vg_disks)} disks, the VM has {len(spec.disks)}")
+            if by_order:
+                got = {g["index"]: g["size"] for g in vg_disks}
+                for d in spec.disks:
+                    if got.get(d.order) not in (d.size_bytes, 0):
+                        raise SafetyGateError(
+                            f"disk {d.address}: volume-group disk {d.order} is {got.get(d.order)} bytes, the source "
+                            f"disk is {d.size_bytes}; Prism's disk order is not the VM's, refusing to copy")
             data["vg_disks"] = vg_disks
             data["disk_index"] = {d.id: d.order for d in spec.disks}
             v4.attach_iscsi_client(data["volume_group"], iqn)
