@@ -379,15 +379,20 @@ class ReplicaRunner:
             except ChangeTrackingUnavailable as e:   # e.g. VMware CBT reset: correct but slower
                 self.log.warning("disk %s: change tracking unavailable (%s); falling back to compare", d.address, e)
                 mode, fallback = "compare", str(e)
-        # Block checksums from the previous completed sync. Cleared in the store until THIS sync
-        # completes, so an interrupted sync can never leave checksums that disagree with the replica.
+        # Block checksums (per 1 MiB block, with per-block validity). The stored copy must never claim a
+        # block this sync may still change: a cbt sync forgets only the blocks of its changed ranges up
+        # front; compare and full syncs may write anywhere, so they clear the stored copy until done.
         stored = self.store.load_hashes(did)
-        base = stored[1] if stored and stored[0] == HASH_BLOCK else None
+        base = stored[1] if stored and stored[0] == HASH_BLOCK and mode != "full" else None
         hashes = BlockHashes(d.size_bytes, base)
-        if stored is not None:
+        if mode == "cbt" and ranges is not None:
+            hashes.invalidate(ranges)
+            if stored is not None:
+                self.store.save_hashes(did, HASH_BLOCK, hashes.to_bytes() if hashes.any_known() else None)
+        elif stored is not None:
             self.store.save_hashes(did, HASH_BLOCK, None)
         compare_by = None
-        hashes_off = False
+        align = True
         meter = RateMeter()
 
         def progress(off: int, size: int) -> None:
@@ -403,30 +408,29 @@ class ReplicaRunner:
             staged = writer.staged_path
             compare = None
             if mode == "compare":
-                if hashes.has_base:
+                if hashes.complete():
                     compare_by = "compare (checksums)"     # source vs stored checksums; replica not read
                 else:
-                    compare_by = "compare (reading replica)"
+                    compare_by = ("compare (reading replica)" if not hashes.has_base else
+                                  f"compare (checksums; reading replica for {100 - hashes.coverage() * 100:.0f}%)")
                     compare = RawFileReader(staged) if staged else self.target.open_disk_reader(ref)
                     if compare is None:
                         raise SafetyGateError(f"{self.target.type_name}: cannot read the replica back for compare mode")
             if mode == "cbt" and ranges is not None:
                 # keeping checksums means re-reading whole 1 MiB blocks around each change; skip that when it
-                # would read much more than changed (scattered small writes). Checksums then become unknown,
-                # and the next fallback reads the replica once to rebuild them.
+                # would read much more than changed (scattered small writes). Only the touched blocks then
+                # stay unknown; the next fallback reads just those back from the replica.
                 changed = sum(r.length for r in ranges)
                 grown = sum(r.length for r in align_ranges(ranges, HASH_BLOCK, d.size_bytes))
                 slack = min(64 << 20, d.size_bytes // 50)       # small fixed allowance, at most 2% of the disk
-                if not hashes.has_base or grown > changed * 1.5 + slack:
-                    hashes = BlockHashes(d.size_bytes)      # unknown: never saved, never trusted
-                    hashes_off = True
+                align = grown <= changed * 1.5 + slack
             if mode == "full" and writer.prezeroed:
                 hashes.fill_zero()                       # untouched blocks of a fresh volume are zeros
                 ranges = reader.allocated_ranges()   # skip never-written regions when the source knows them
             try:
                 stats = copy_disk(reader, writer, chunk_size=self.engine.chunk_size, ranges=ranges,
                                   checkpoint_every=self.engine.checkpoint_every, on_progress=progress, compare=compare,
-                                  hashes=None if hashes_off else hashes, prefetch=self.engine.prefetch_chunks)
+                                  hashes=hashes if align else None, prefetch=self.engine.prefetch_chunks)
             finally:
                 if compare is not None:
                     compare.close()
@@ -448,13 +452,14 @@ class ReplicaRunner:
             if not full.get("skipped") and not full["ok"]:
                 raise VerificationError(f"disk {d.id}: full checksum mismatch after sync")
         self.target.discard_staging(ref)
-        if hashes.complete():                    # only now do they describe the replica as written
+        if hashes.any_known():                   # only now do they describe the replica as written
             self.store.save_hashes(did, HASH_BLOCK, hashes.to_bytes())
-        else:
-            self.log.info("disk %s: block checksums incomplete after a %s sync; the next fallback reads the "
-                          "replica to rebuild them", d.address, mode)
+        if not hashes.complete():
+            self.log.info("disk %s: block checksums cover %.1f%% of the disk after a %s sync; a later fallback "
+                          "reads only the rest back from the replica", d.address, hashes.coverage() * 100, mode)
         rec = {"done": True, "mode": mode, "bytes_read": stats.bytes_read, "bytes_written": stats.bytes_written,
                "compare_by": compare_by, "checksums": hashes.complete(),
+               "checksum_coverage": round(hashes.coverage(), 4),
                "bytes_unchanged": stats.bytes_unchanged, "bytes_zero_skipped": stats.bytes_zero_skipped,
                "changed_bytes": sum(r.length for r in ranges) if ranges is not None else None,
                "cbt_fallback": fallback,

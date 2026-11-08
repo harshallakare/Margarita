@@ -14,7 +14,8 @@ Compare mode (replica sync without source change tracking):
     and compared with the checksum recorded when that block was last written; only differing blocks
     are written. The replica is never read back (the Coriolis approach: checksums kept from the
     previous run instead of re-reading the target).
-  * `compare=<reader of the replica>` — no usable checksums: read the replica back and compare.
+  * `compare=<reader of the replica>` — read the replica back and compare; with partial checksums,
+    only the blocks whose checksum is unknown are read back.
 `hashes` is also maintained on full / changed-range copies so the next fallback can use it.
 
 Resume contract: on_checkpoint(offset) is called only AFTER writer.flush(), so a persisted
@@ -73,23 +74,39 @@ def _zero_digest(n: int, _cache: dict[int, bytes] = {}) -> bytes:
 
 
 class BlockHashes:
-    """SHA-256 per HASH_BLOCK of one disk, as written to the replica. `base` = checksums from the
-    previous completed sync (None/empty = unknown). `known` tracks which blocks this run hashed."""
+    """SHA-256 per HASH_BLOCK of one disk, as written to the replica, with per-block validity.
+    `base` = checksums saved by an earlier sync: n*32 bytes (all blocks known) or n*32 + n bytes
+    (digests + one known-flag byte per block). A change-tracking sync invalidates only the blocks it
+    may touch, so one interrupted or scattered sync no longer throws every checksum away (seen live:
+    after one stopped sync, every later cbt sync ran without checksums)."""
 
     def __init__(self, size: int, base: bytes | None = None, block: int = HASH_BLOCK):
         self.size, self.block = size, block
         self.n = -(-size // block) if size else 0
-        ok = base is not None and len(base) == self.n * DIGEST
-        self.data = bytearray(base) if ok else bytearray(self.n * DIGEST)
-        self.has_base = ok
-        self.known = bytearray([1 if ok else 0]) * self.n
+        self.data = bytearray(self.n * DIGEST)
+        self.known = bytearray(self.n)
+        if base is not None and len(base) == self.n * DIGEST:
+            self.data[:] = base
+            self.known = bytearray(b"\x01") * self.n
+        elif base is not None and len(base) == self.n * (DIGEST + 1):
+            self.data[:] = base[:self.n * DIGEST]
+            self.known = bytearray(1 if b else 0 for b in base[self.n * DIGEST:])
+        self.has_base = any(self.known)        # some checksums came from an earlier sync
 
     def get(self, i: int) -> bytes | None:
-        return bytes(self.data[i * DIGEST:(i + 1) * DIGEST]) if self.has_base or self.known[i] else None
+        return bytes(self.data[i * DIGEST:(i + 1) * DIGEST]) if self.known[i] else None
 
     def set(self, i: int, digest: bytes) -> None:
         self.data[i * DIGEST:(i + 1) * DIGEST] = digest
         self.known[i] = 1
+
+    def invalidate(self, ranges: Iterable[ByteRange]) -> None:
+        """Forget every block a write to `ranges` may touch."""
+        for r in ranges:
+            if r.length <= 0:
+                continue
+            a, b = r.offset // self.block, min(self.n, -(-r.end // self.block))
+            self.known[a:b] = bytes(max(0, b - a))
 
     def fill_zero(self) -> None:
         """A fresh, zeroed target: every block not written below reads as zeros."""
@@ -99,8 +116,14 @@ class BlockHashes:
     def complete(self) -> bool:
         return all(self.known)
 
+    def any_known(self) -> bool:
+        return any(self.known)
+
+    def coverage(self) -> float:
+        return (sum(self.known) / self.n) if self.n else 1.0
+
     def to_bytes(self) -> bytes:
-        return bytes(self.data)
+        return bytes(self.data) if self.complete() else bytes(self.data) + bytes(self.known)
 
 
 def align_ranges(ranges: Iterable[ByteRange], block: int, size: int) -> list[ByteRange]:
@@ -214,7 +237,7 @@ def copy_disk(
         work = [r for r in clip(ranges, size) if r.end > start_offset]
         work = [ByteRange(max(r.offset, start_offset), r.end - max(r.offset, start_offset)) for r in work]
     pieces = split(work, chunk_size)
-    by_hash = hashes is not None and hashes.has_base and compare is None and ranges is None
+    by_hash = hashes is not None and hashes.has_base and ranges is None
 
     stats = CopyStats(bytes_total=size, resumed_from=start_offset)
     t0 = time.monotonic()
@@ -234,8 +257,21 @@ def copy_disk(
                 nb = buf[o:o + hashes.block]  # type: ignore[union-attr]
                 i = (p.offset + o) // hashes.block  # type: ignore[union-attr]
                 dg = hashlib.sha256(nb).digest()
-                if hashes.get(i) == dg:  # type: ignore[union-attr]
+                known = hashes.get(i)  # type: ignore[union-attr]
+                if known is None and compare is not None:     # checksum unknown: read this block back
+                    old = compare.read(p.offset + o, len(nb))
+                    for so in range(0, len(nb), compare_block):   # write only the sub-blocks that differ
+                        sb = nb[so:so + compare_block]
+                        if old[so:so + compare_block] == sb:
+                            stats.bytes_unchanged += len(sb)
+                        else:
+                            writer.write(p.offset + o + so, sb)
+                            stats.bytes_written += len(sb)
+                    hashes.set(i, dg)  # type: ignore[union-attr]
+                    continue
+                if known == dg:
                     stats.bytes_unchanged += len(nb)
+                    hashes.set(i, dg)  # type: ignore[union-attr]
                 else:
                     writer.write(p.offset + o, nb)
                     stats.bytes_written += len(nb)
