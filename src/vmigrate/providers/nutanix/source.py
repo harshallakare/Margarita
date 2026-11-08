@@ -528,9 +528,10 @@ class NutanixSource(SourceProvider):
         if not (self.supports_cbt() and cp.data.get("crt")):
             self.cleanup(snapshot)                          # recovery point deleted: nothing to reference
             return CheckpointRef(id=snapshot.id, data={})
-        # tear down the read path but keep the recovery point as the next sync's CRT reference
-        keep = dict(snapshot.data)
-        keep.pop("recovery_point", None)
+        # tear down the read path but keep the recovery point as the next sync's CRT reference.
+        # Say so explicitly: hiding its ID made the leftover sweep (find-by-name) delete it (seen live:
+        # the second sync found no base and fell back to compare).
+        keep = {**snapshot.data, "keep_recovery_point": True}
         self._cleanup_iscsi(SnapshotRef(id=snapshot.id, vm=snapshot.vm, app_consistent=snapshot.app_consistent,
                                         data=keep))
         try:
@@ -593,13 +594,17 @@ class NutanixSource(SourceProvider):
     def _cleanup_iscsi(self, snapshot: SnapshotRef) -> None:
         d = snapshot.data
         self.ctx.require_execute("nutanix iscsi cleanup", volume_group=d.get("volume_group"),
-                                 recovery_point=d.get("recovery_point"))
+                                 recovery_point="kept as CRT base" if d.get("keep_recovery_point")
+                                 else d.get("recovery_point"))
         sess = self._sessions.pop(snapshot.id, None) or self._iscsi_factory(d.get("portal") or "127.0.0.1")
         sess.logout()
         sess.logout_matching(d["name"])            # also sessions left by a crashed worker process
         errors = []
         # an object Nutanix created whose ID we never learned (step failed mid-way): find it by name
+        keep_rp = bool(d.get("keep_recovery_point"))
         for key, kind in (("volume_group", "volume-group"), ("recovery_point", "recovery-point")):
+            if key == "recovery_point" and keep_rp:
+                continue
             if not d.get(key) and d.get("name"):
                 try:
                     found = self.v4.find_by_name(kind, d["name"])
@@ -619,7 +624,7 @@ class NutanixSource(SourceProvider):
                 self.v4.delete_volume_group(d["volume_group"])
             except Exception as e:  # noqa: BLE001
                 errors.append(f"delete volume group {d['volume_group']}: {e}")
-        if d.get("recovery_point"):
+        if d.get("recovery_point") and not keep_rp:
             try:
                 self.v4.delete_recovery_point(d["recovery_point"])
             except Exception as e:  # noqa: BLE001

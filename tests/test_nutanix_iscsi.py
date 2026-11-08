@@ -192,6 +192,7 @@ class FakeV4:
         if self.rp_id_lost:
             self.named[("recovery-point", name)] = "rp-orphan"
             raise ProviderError("recovery-point was created but its ID could not be determined")
+        self.named[("recovery-point", name)] = "rp-1"      # like real Prism: findable by its name
         return "rp-1"
 
     def recovery_point_disks(self, rp):
@@ -450,6 +451,7 @@ class CrtV4(FakeV4):
     def create_recovery_point(self, vm, name, app_consistent):
         self.rp_seq += 1
         self.log.append(f"rp:{name}")
+        self.named[("recovery-point", name)] = f"rp-{self.rp_seq}"   # like real Prism: findable by name
         return f"rp-{self.rp_seq}"
 
     def set_expiration(self, rp, hours):

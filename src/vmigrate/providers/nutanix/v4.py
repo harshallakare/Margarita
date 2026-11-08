@@ -131,7 +131,8 @@ class PrismV4:
         self.timeout, self.task_timeout, self.poll, self.sleep = timeout, task_timeout, poll, sleep
 
     # ------------------------------------------------------------------ plumbing
-    def _call(self, method: str, path: str, *, body: Any = None, etag: str | None = None) -> tuple[Any, Any]:
+    def _call(self, method: str, path: str, *, body: Any = None, etag: str | None = None,
+              quiet: bool = False) -> tuple[Any, Any]:
         headers = {"Accept": "application/json"}
         if method != "GET":
             headers["NTNX-Request-Id"] = str(uuid.uuid4())
@@ -144,8 +145,9 @@ class PrismV4:
             log.warning("Prism v4 %s %s failed after %.1fs: %s", method, path, time.monotonic() - t0, e)
             raise TransientProviderError(f"Prism v4 {method} {path}: {e}") from e
         log.debug("Prism v4 %s %s -> %s in %.2fs", method, path, r.status_code, time.monotonic() - t0)
-        if r.status_code >= 400:
-            log.warning("Prism v4 %s %s -> HTTP %s: %s", method, path, r.status_code, r.text[:500])
+        if r.status_code >= 400:   # quiet: an expected miss while probing (alternate API version, gone object)
+            (log.debug if quiet else log.warning)("Prism v4 %s %s -> HTTP %s: %s", method, path, r.status_code,
+                                                  r.text[:500])
         if r.status_code in (429,) or r.status_code >= 500:
             raise TransientProviderError(f"Prism v4 {method} {path}: HTTP {r.status_code} {r.text[:400]}")
         if r.status_code == 404 and method == "GET" and path == CLUSTERS:   # the v4 probe call
@@ -155,8 +157,8 @@ class PrismV4:
             raise ProviderError(f"Prism v4 {method} {path}: HTTP {r.status_code} {r.text[:600]}")
         return (r.json() if r.content else {}), r.headers
 
-    def _get(self, path: str) -> tuple[Any, str | None]:
-        data, headers = self._call("GET", path)
+    def _get(self, path: str, *, quiet: bool = False) -> tuple[Any, str | None]:
+        data, headers = self._call("GET", path, quiet=quiet)
         return data, (headers or {}).get("ETag") or (headers or {}).get("Etag")
 
     def _task(self, resp: Any, what: str) -> dict[str, Any]:
@@ -214,7 +216,7 @@ class PrismV4:
     def _list_named(self, collection: str, name: str) -> list[dict[str, Any]]:
         try:
             flt = quote(f"name eq '{name}'", safe="'=")
-            data, _ = self._get(f"{collection}?$filter={flt}")
+            data, _ = self._get(f"{collection}?$filter={flt}", quiet=True)
             return data.get("data") or []
         except ProviderError:                    # $filter not supported here: scan the first page
             data, _ = self._get(f"{collection}?$limit=100")
@@ -262,7 +264,7 @@ class PrismV4:
             alt += [f"{RECOVERY_POINTS.replace('/v4.0/', f'/{v}/')}/{rp_ext}" for v in ("v4.2", "v4.1")]
             for path in alt:
                 try:
-                    d2, _ = self._get(path)
+                    d2, _ = self._get(path, quiet=True)
                 except ProviderError as e:
                     log.debug("  %s: %s", path, e)
                     continue
@@ -346,7 +348,7 @@ class PrismV4:
         """GET for a cleanup step; None when the object no longer exists (an earlier attempt already
         removed it; seen live: DP-10400 "does not exist in IDF"), so cleanup is safe to repeat."""
         try:
-            return self._get(path)
+            return self._get(path, quiet=True)
         except ProviderError as e:
             if "HTTP 404" in str(e):
                 log.info("%s already gone; nothing to clean up", what)
