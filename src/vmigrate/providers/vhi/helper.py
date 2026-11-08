@@ -14,6 +14,12 @@ Lifecycle (one helper per run, created on first use, destroyed by close()/cleanu
   5. attach(volume) -> /dev/disk/by-id path inside the helper; detach(volume); destroy()
 Every object it creates is tagged vmigrate:managed / vmigrate:helper and named vmigrate-helper-<run>.
 
+Kept between replica syncs (replica option keep_helper_minutes): export() hands the running helper,
+with its volumes still attached, to the replica state; the next sync adopt()s it (only on a worker
+that still holds its SSH keys, after checking the server, SSH and every attachment); otherwise, or
+when it sat idle too long, release_record() removes it. Booting + attaching took ~2 of 3.5 min of a
+live cbt sync of a 250 GiB disk; the copy itself took seconds.
+
 Usage:
     h = HelperVm(api, cfg, ctx, workdir); t = h.ensure(); dev = h.attach(volume_id); h.destroy()
 """
@@ -22,6 +28,7 @@ from __future__ import annotations
 
 import base64
 import shlex
+import socket
 import shutil
 import subprocess
 import threading
@@ -130,6 +137,7 @@ class HelperVm:
         self.transport: Any = None
         self.sg_id: str | None = None
         self.fip_id: str | None = None
+        self.host: str | None = None
         self.attached: dict[str, str] = {}          # volume id -> device path in the helper
         # disks are copied in parallel: one helper per run, and attach/detach one at a time
         self._lock = threading.RLock()
@@ -220,7 +228,7 @@ class HelperVm:
         if not t.run("command -v python3 || true").strip():
             raise ProviderError(f"helper image {self.cfg['helper_image']!r} has no python3; use a standard cloud "
                                 "image (Ubuntu, Rocky/Alma, Debian)")
-        self.transport = t
+        self.transport, self.host = t, host
         self.ctx.logger.info("helper VM %s ready at %s", self.name, host)
         return t
 
@@ -277,6 +285,112 @@ class HelperVm:
         sg = self.api.find_security_group(f"{self.name}-ssh")
         if sg:
             self.api.delete_security_group(sg["id"])
+
+    # ------------------------------------------------------------------ kept between syncs
+    def export(self) -> dict[str, Any] | None:
+        """Record of the running helper for a later run; this object forgets it (destroy() is a no-op)."""
+        with self._lock:
+            if self.server is None or self.transport is None:
+                return None
+            rec = {"name": self.name, "server_id": self.server["id"], "host": self.host,
+                   "port": int(self.cfg.get("helper_ssh_port", 22)), "dir": str(self.dir),
+                   "worker_host": socket.gethostname(), "fip_id": self.fip_id, "sg_id": self.sg_id,
+                   "attached": dict(self.attached)}
+            self.server, self.transport, self.fip_id, self.sg_id = None, None, None, None
+            self.attached = {}
+            return rec
+
+    def adopt(self, rec: dict[str, Any]) -> bool:
+        """Reuse a kept helper. Every check failing means False (nothing changed here)."""
+        with self._lock:
+            d = Path(str(rec.get("dir") or ""))
+            key, known = d / "id_ed25519", d / "known_hosts"
+            if not (key.is_file() and known.is_file()):
+                self.ctx.logger.info("kept helper VM %s: its SSH keys are not on this worker; replacing it",
+                                     rec.get("name"))
+                return False
+            try:
+                srv = self.api.get_server(rec["server_id"])
+            except Exception as e:  # noqa: BLE001 - gone or unreachable: replace it
+                self.ctx.logger.info("kept helper VM %s: not found (%s); replacing it", rec.get("name"), e)
+                return False
+            if (srv.get("metadata") or {}).get(HELPER) != "true" or srv.get("status") != "ACTIVE":
+                self.ctx.logger.info("kept helper VM %s is %s; replacing it", rec.get("name"), srv.get("status"))
+                return False
+            t = self._tf(rec["host"], key, known, port=int(rec.get("port") or 22))
+            try:
+                t.run("true", timeout=30)
+            except (ProviderError, subprocess.TimeoutExpired) as e:
+                self.ctx.logger.info("kept helper VM %s: no SSH (%s); replacing it", rec.get("name"), e)
+                return False
+            attached: dict[str, str] = {}
+            for vid, dev in (rec.get("attached") or {}).items():
+                try:
+                    vol = self.api.get_volume(vid)
+                    on_it = any(a.get("server_id") == srv["id"] for a in vol.get("attachments") or [])
+                    if vol.get("status") == "in-use" and on_it and t.run(
+                            f"test -b {shlex.quote(dev)} && echo ok || true", timeout=30).strip() == "ok":
+                        attached[vid] = dev
+                except Exception as e:  # noqa: BLE001 - that volume is re-attached normally
+                    self.ctx.logger.info("kept helper VM: volume %s not reusable (%s)", vid, e)
+            self.name, self.dir = str(rec["name"]), d
+            self.server, self.transport, self.host = srv, t, str(rec["host"])
+            self.fip_id, self.sg_id = rec.get("fip_id"), rec.get("sg_id")
+            self.attached = attached
+            self.ctx.logger.info("reusing kept helper VM %s at %s (%d volume(s) still attached)",
+                                 self.name, rec["host"], len(attached))
+            return True
+
+    @staticmethod
+    def release_record(api: Any, rec: dict[str, Any], log: Any, *, wait: bool = True, poll: float = 5,
+                       op_timeout: float = 1800) -> None:
+        """Remove a kept helper by its record: detach its volumes (left intact), delete the server and
+        anything created with it. Only a server tagged as a vmigrate helper is ever deleted."""
+        errors: list[str] = []
+        sid = rec.get("server_id")
+        srv = None
+        if sid:
+            try:
+                srv = api.get_server(sid)
+            except Exception:  # noqa: BLE001 - already gone
+                srv = None
+        if srv is not None and (srv.get("metadata") or {}).get(HELPER) != "true":
+            raise SafetyGateError(f"server {sid} is not a vmigrate helper; refusing to delete it")
+        if srv is not None:
+            for vid in rec.get("attached") or {}:
+                try:
+                    api.detach_volume(sid, vid)
+                except Exception as e:  # noqa: BLE001 - deleting the server detaches it too
+                    log.info("kept helper %s: detach %s: %s", rec.get("name"), vid, e)
+            if wait:
+                for vid in rec.get("attached") or {}:
+                    try:
+                        poll_until(lambda v=vid: api.get_volume(v), lambda v: v.get("status") == "available",
+                                   failed=lambda v: str(v.get("status", "")).startswith("error"),
+                                   timeout=op_timeout, interval=poll, what=f"volume {vid} detached from helper")
+                    except Exception as e:  # noqa: BLE001
+                        errors.append(f"detach {vid}: {e}")
+            try:
+                api.delete_server(sid)
+                if wait:
+                    poll_until(lambda: api.servers_by_name(rec.get("name")), lambda x: not x,
+                               timeout=op_timeout, interval=poll, what="kept helper VM delete")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"delete server {rec.get('name')}: {e}")
+        for what, oid, fn in (("floating IP", rec.get("fip_id"), getattr(api, "delete_floating_ip", None)),
+                              ("security group", rec.get("sg_id"), getattr(api, "delete_security_group", None))):
+            if oid and fn:
+                try:
+                    fn(oid)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"delete {what} {oid}: {e}")
+        d = rec.get("dir")
+        if d and rec.get("worker_host") == socket.gethostname():
+            shutil.rmtree(d, ignore_errors=True)
+        if errors:
+            raise ProviderError(f"kept helper VM cleanup incomplete; remove by hand anything named "
+                                f"{rec.get('name')}*: " + "; ".join(errors))
+        log.info("kept helper VM %s removed", rec.get("name"))
 
     # ------------------------------------------------------------------ volumes
     def attach(self, volume_id: str) -> str:
@@ -361,9 +475,9 @@ class HelperVm:
         if self.sg_id:
             step("delete temporary security group", lambda: self.api.delete_security_group(self.sg_id))
             self.sg_id = None
-        self.transport = None
+        self.transport = self.host = None
         shutil.rmtree(self.dir, ignore_errors=True)
         if errors:
             raise ProviderError(f"helper VM cleanup incomplete; remove by hand anything named {self.name}*: "
                                 + "; ".join(errors))
-            self.ctx.logger.info("helper VM %s removed", self.name)
+        self.ctx.logger.info("helper VM %s removed", self.name)

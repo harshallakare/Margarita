@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import shutil
 from collections.abc import Mapping
 from pathlib import Path
@@ -228,6 +229,74 @@ class FakeTarget(TargetProvider):
     def _registry(self) -> Path:
         return self.staging / "registry.json"
 
+    # ---- simulated helper VM (config helper: true), kept between replica syncs like VHI's ----
+    # <staging>/helpers.json: {"live": {id: {"attached": [disk names]}}, "created": n, "released": [ids]}
+    _helper_id: str | None = None
+    _helper_lock = threading.RLock()            # disks run in parallel
+
+    def _helpers(self, update: Any = None) -> dict[str, Any]:
+        with self._helper_lock:
+            return self._helpers_locked(update)
+
+    def _helpers_locked(self, update: Any = None) -> dict[str, Any]:
+        f = self.staging / "helpers.json"
+        st = json.loads(f.read_text()) if f.exists() else {"live": {}, "created": 0, "released": []}
+        if update is not None:
+            update(st)
+            self.staging.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps(st))
+        return st
+
+    def _use_helper(self, disk: TargetDiskRef) -> None:
+        if not self.config.get("helper"):
+            return
+        with self._helper_lock:
+            self._use_helper_locked(disk)
+
+    def _use_helper_locked(self, disk: TargetDiskRef) -> None:
+        if self._helper_id is None:
+            def mk(st: dict[str, Any]) -> None:
+                st["created"] += 1
+                self._helper_id = f"helper-{st['created']}"
+                st["live"][self._helper_id] = {"attached": []}
+            self._helpers(mk)
+            self.calls.append(f"helper create {self._helper_id}")
+
+        def att(st: dict[str, Any]) -> None:
+            a = st["live"][self._helper_id]["attached"]
+            if disk.name not in a:
+                a.append(disk.name)
+        self._helpers(att)
+
+    def _refuse_if_attached(self, disk: TargetDiskRef, what: str) -> None:
+        for hid, h in self._helpers()["live"].items():
+            if disk.name in h["attached"] and hid != self._helper_id:
+                raise ProviderError(f"fake: {what} {disk.name}: volume in-use (attached to kept helper {hid})")
+
+    def keep_helper(self) -> dict[str, Any] | None:
+        if self._helper_id is None:
+            return None
+        hid, self._helper_id = self._helper_id, None
+        return {"name": hid, "server_id": hid, "attached": {d: d for d in self._helpers()["live"][hid]["attached"]}}
+
+    def adopt_helper(self, record: dict[str, Any]) -> bool:
+        if self.config.get("helper_lost") or record.get("server_id") not in self._helpers()["live"]:
+            return False
+        self._helper_id = record["server_id"]
+        self.calls.append(f"helper adopt {self._helper_id}")
+        return True
+
+    def release_helper(self, record: dict[str, Any], *, wait: bool = True) -> None:
+        def rel(st: dict[str, Any]) -> None:
+            if st["live"].pop(record.get("server_id"), None) is not None:
+                st["released"].append(record["server_id"])
+        self._helpers(rel)
+
+    def close(self) -> None:
+        if self._helper_id is not None:
+            self.release_helper({"server_id": self._helper_id})
+            self._helper_id = None
+
     def _save(self) -> None:
         if not self.persist:
             return
@@ -278,6 +347,7 @@ class FakeTarget(TargetProvider):
 
     def open_disk_writer(self, disk: TargetDiskRef, *, resume: bool = False, incremental: bool = False) -> DiskWriter:
         self.ctx.require_execute("fake open writer", disk=disk.name)
+        self._use_helper(disk)
         p = self._staged(disk)
         if incremental:
             # start from the committed replica content; unwritten regions are NOT zero
@@ -314,6 +384,7 @@ class FakeTarget(TargetProvider):
 
     def clone_disk(self, disk: TargetDiskRef, name: str, restore_point: str | None = None) -> TargetDiskRef:
         self.ctx.require_execute("fake clone disk", disk=disk.name, name=name, restore_point=restore_point)
+        self._refuse_if_attached(disk, "clone")
         src = self._rp(disk, restore_point) if restore_point else self._final(disk)
         if not src.exists():
             raise ProviderError(f"fake: nothing to clone at {src}")
@@ -327,6 +398,7 @@ class FakeTarget(TargetProvider):
 
     def delete_disk(self, disk: TargetDiskRef) -> None:
         self.ctx.require_execute("fake delete disk", disk=disk.name)
+        self._refuse_if_attached(disk, "delete")
         self._final(disk).unlink(missing_ok=True)
         self._staged(disk).unlink(missing_ok=True)
         for rp in (self.staging / "restore-points").glob(f"{disk.name}@*.img"):

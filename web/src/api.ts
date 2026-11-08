@@ -50,7 +50,7 @@ export interface Migration {
 export interface MigrationOptions {
   target_name?: string; app_consistent?: boolean; guest_os?: Record<string, unknown>;
   target_options?: Record<string, unknown>; osmorph?: Record<string, unknown>; engine?: Record<string, unknown>;
-  retention?: number;
+  retention?: number; keep_helper_minutes?: number;
 }
 
 export interface Schedule {
@@ -72,6 +72,8 @@ export interface Replica {
                  network_map?: Record<string, string> | null;
                  target_vm?: { id: string; name: string } | null }[];
   errors: { t: number; kind: string; error: string }[];
+  /** target helper VM kept between syncs (replica option keep_helper_minutes) */
+  helper?: { name: string; host: string | null; kept_at: number | null; expires_at: number | null; volumes: number } | null;
   schedules: Schedule[]; created_at: number; updated_at: number; last_execution: Execution | null;
 }
 

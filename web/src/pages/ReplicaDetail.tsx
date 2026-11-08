@@ -12,6 +12,34 @@ const ACTIVE = ["pending", "queued", "running"];
 const PRESETS: [string, string][] = [["*/15 * * * *", "every 15 minutes"], ["0 * * * *", "hourly"],
   ["0 */4 * * *", "every 4 hours"], ["0 2 * * *", "daily at 02:00 UTC"], ["0 2 * * 1-5", "weekdays at 02:00 UTC"]];
 
+function HelperCard({ r, busy, canEdit, onSaved }: { r: Replica; busy: boolean; canEdit: boolean; onSaved: () => void }) {
+  const cur = r.options.keep_helper_minutes ?? 0;
+  const [mins, setMins] = useState(cur);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => setMins(cur), [cur]);
+  const h = r.helper;
+  const save = () => api.patch(`/replicas/${r.id}`, { options: { ...r.options, keep_helper_minutes: mins } })
+    .then(onSaved).catch((e) => setErr(errText(e)));
+  return (
+    <div className="card">
+      <h2 style={{ marginTop: 0 }}>Helper VM between syncs</h2>
+      <p className="small" style={{ marginTop: 0 }}>
+        {h ? <>Kept: <span className="mono">{h.name}</span>{h.host ? <> at <span className="mono">{h.host}</span></> : null} · {h.volumes} volume{h.volumes === 1 ? "" : "s"} attached
+          · {h.expires_at ? <>removed at {fmt.time(h.expires_at)} if no sync runs</> : "in use"}</>
+          : <span className="muted">None kept. {cur > 0 ? "The next sync keeps its helper." : "Each sync boots and removes its own helper."}</span>}</p>
+      {canEdit && <div className="row">
+        <input type="number" min={0} max={10080} value={mins} style={{ width: 110 }} disabled={busy}
+               onChange={(e) => setMins(Number(e.target.value))} />
+        <span className="small muted">idle minutes (0 = off)</span>
+        <button className="btn sm" disabled={busy || mins === cur || mins < 0 || mins > 10080}
+                title={busy ? "Wait for the running execution to finish" : ""} onClick={save}>Save</button>
+      </div>}
+      <ErrorBox error={err} title="Could not save" />
+      <p className="small muted" style={{ marginBottom: 0 }}>VHI helper-VM mode. Saves about 2 minutes of boot and volume attach per sync.
+        Set it above your sync interval. Deploy, cutover and delete remove the helper first.</p>
+    </div>);
+}
+
 function CronEditor({ onSave, onClose, initial }: { initial?: string; onClose: () => void; onSave: (c: string) => Promise<void> }) {
   const [cron, setCron] = useState(initial ?? "0 */4 * * *");
   const [prev, setPrev] = useState<{ valid: boolean; error?: string; next: number[] } | null>(null);
@@ -269,6 +297,7 @@ export default function ReplicaDetail() {
             </table></div>)}
         </div>
         <div className="stack" style={{ marginTop: 0 }}>
+          <HelperCard r={r} busy={!!active} canEdit={can("operator")} onSaved={() => { rep.reload(); setToast("Saved"); }} />
           <div className="card">
             <div className="spread" style={{ marginBottom: 8 }}><h2 style={{ margin: 0 }}>Schedules</h2>
               {can("operator") && <button className="btn sm" onClick={() => setModal("sched")}>Add</button>}</div>

@@ -45,6 +45,7 @@ export default function Wizard() {
   const [params, setParams] = useSearchParams();
   const replica = params.get("mode") === "replica";
   const [retention, setRetention] = useState(3);
+  const [keepHelper, setKeepHelper] = useState(0);
   const [cron, setCron] = useState("");
   const [cronOk, setCronOk] = useState<{ valid: boolean; error?: string; next: number[] } | null>(null);
   useEffect(() => {
@@ -123,7 +124,7 @@ export default function Wizard() {
   }, [tgt]);
 
   const canNext = [!!src, gateOk, !!tgt, true,
-    parallel >= 1 && parallel <= 64 && (!replica || ((retention >= 1 && retention <= 100) && (!cron.trim() || !!cronOk?.valid))),
+    parallel >= 1 && parallel <= 64 && (!replica || ((retention >= 1 && retention <= 100) && keepHelper >= 0 && keepHelper <= 10080 && (!cron.trim() || !!cronOk?.valid))),
     !!prefix][step];
 
   const names = sel.map((vm) => (sel.length === 1 ? prefix : `${prefix}-${slug(vm)}`));
@@ -148,7 +149,7 @@ export default function Wizard() {
           ...(pool ? { pool } : {}),
           ...(cluster.trim() ? { cluster: cluster.trim() } : {}),
           engine: { max_parallel_disks: parallel, on_failure: onFailure, boot_check: bootCheck, verify_full: verifyFull },
-          ...(replica ? { retention } : {}),
+          ...(replica ? { retention, ...(keepHelper > 0 ? { keep_helper_minutes: keepHelper } : {}) } : {}),
         };
         const body = { name: names[i], source_endpoint_id: src!.id, target_endpoint_id: tgt!.id, vm, options };
         if (replica) {
@@ -316,6 +317,9 @@ export default function Wizard() {
             {replica && <label className="field"><span>Restore points to keep</span>
               <input type="number" min={1} max={100} value={retention} onChange={(e) => setRetention(Number(e.target.value))} />
               <small>On targets that support them. Older ones are deleted after each sync.</small></label>}
+            {replica && <label className="field"><span>Keep helper VM between syncs (minutes)</span>
+              <input type="number" min={0} max={10080} value={keepHelper} onChange={(e) => setKeepHelper(Number(e.target.value))} />
+              <small>VHI helper-VM mode: keep the helper (with the replica volumes attached) this long after a sync, so the next sync skips about 2 minutes of boot and attach. Set it above your sync interval. 0 = remove after every sync.</small></label>}
             {replica && <label className="field"><span>Sync schedule (cron, UTC, optional)</span>
               <input type="text" className="mono" value={cron} placeholder="0 */4 * * *  (empty = manual)" onChange={(e) => setCron(e.target.value)} />
               <small>{!cron.trim() ? "Leave empty to sync manually." : cronOk?.valid ? `Next: ${cronOk.next.slice(0, 2).map((t) => fmt.time(t)).join(", ")}` : cronOk?.error ?? "checking…"}</small></label>}

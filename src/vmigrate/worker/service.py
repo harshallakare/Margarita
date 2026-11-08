@@ -181,6 +181,13 @@ class Worker:
                             "replica_cutover": lambda: runner.cutover_handlers(dict(ex.get("params") or {}))}[kind]()
             else:
                 raise RuntimeError(f"unknown execution kind {kind!r}")
+            if kind != "migration":
+                try:
+                    runner.begin(kind)        # reuse (sync) or remove (deploy/cutover/delete) a kept helper VM
+                except Exception:
+                    runner.source.close()
+                    runner.target.close()
+                    raise
             try:
                 dag = DagRunner(SqlTaskStore(repo, xid), handlers,
                                 max_parallel=runner.engine.max_parallel_disks, cancel_check=cancel_check,
@@ -196,8 +203,11 @@ class Worker:
                     else:
                         runner.record_failure(kind, error)
             finally:
-                runner.source.close()
-                runner.target.close()
+                if kind == "migration":
+                    runner.source.close()
+                    runner.target.close()
+                else:
+                    runner.finish(kind, status == ExecStatus.COMPLETED)
         except Exception as e:  # noqa: BLE001 - provider build / config errors
             status, error = ExecStatus.FAILED, f"{type(e).__name__}: {e}"
             log.exception("execution %s failed before/outside the task graph", xid)

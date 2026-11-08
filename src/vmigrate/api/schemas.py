@@ -123,6 +123,10 @@ class MigrationOptions(BaseModel):
     osmorph: dict[str, Any] = Field(default_factory=dict)
     engine: dict[str, Any] = Field(default_factory=dict)
     retention: int | None = Field(None, ge=1, le=100, description="replicas: restore points to keep (default 3)")
+    keep_helper_minutes: int | None = Field(None, ge=0, le=7 * 24 * 60,
+                                            description="replicas: keep the target helper VM (with the replica volumes "
+                                                        "attached) this many idle minutes after a sync, so the next "
+                                                        "sync skips its boot and attach; 0 = remove after each sync")
     pool: str | None = Field(None, description="run only on workers of this worker pool (tag pool:<name>)")
     cluster: str | None = Field(None, pattern=NAME, description="cluster group: VMs sharing disks; each shared disk is "
                                 "copied once and attached to every member")
@@ -210,6 +214,7 @@ class ReplicaOut(BaseModel):
     restore_points: list[dict[str, Any]]
     deployments: list[dict[str, Any]]
     cutovers: list[dict[str, Any]] = []
+    helper: dict[str, Any] | None = None
     errors: list[dict[str, Any]]
     schedules: list[ScheduleOut]
     created_at: float

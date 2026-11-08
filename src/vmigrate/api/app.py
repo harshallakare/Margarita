@@ -921,6 +921,8 @@ def create_app(services: Services | None = None) -> FastAPI:
             last_sync=(st.get("syncs") or [None])[-1], syncs=list(reversed(st.get("syncs", [])))[:50],
             restore_points=list(reversed(st.get("restore_points", []))), deployments=list(reversed(deps)),
             cutovers=list(reversed(st.get("cutovers", []))),
+            helper=({k: st["helper"].get(k) for k in ("name", "host", "kept_at", "expires_at")}
+                    | {"volumes": len(st["helper"].get("attached") or {})}) if st.get("helper") else None,
             errors=list(reversed(st.get("errors", [])))[:10],
             schedules=[sched_out(x) for x in repo.list_schedules(r["id"])],
             created_at=r["created_at"], updated_at=r["updated_at"], last_execution=ex_out(execs[0]) if execs else None)
