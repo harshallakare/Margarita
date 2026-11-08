@@ -94,6 +94,11 @@ def create_app(services: Services | None = None) -> FastAPI:
                 r = repo.get_migration(x["migration_id"]) if x else None
             elif otype == "pool":
                 r = repo.get_pool(oid)
+            elif otype == "notification_channel":
+                r = repo.get_channel(oid)
+            elif otype == "alert":
+                a = repo.get_alert(oid)
+                return a["title"] if a else None
             elif otype == "schedule":
                 sc = repo.get_schedule(oid)
                 r = repo.get_migration(sc["migration_id"]) if sc else None
@@ -266,6 +271,109 @@ def create_app(services: Services | None = None) -> FastAPI:
         if pl is None:
             raise HTTPException(404, "pool not found")
         return pl
+
+    # ------------------------------------------------------------------ alerts + notifications
+    def alert_visible(a: dict[str, Any], p: Principal) -> bool:
+        return a.get("project") is None or p.sees_project(a["project"])
+
+    @app.get("/alerts", tags=["alerts"])
+    def list_alerts(status: str | None = None, migration_id: str | None = None, limit: int = 200,
+                    p: Principal = Depends(viewer)) -> list[dict[str, Any]]:
+        if status not in (None, "firing", "resolved"):
+            raise HTTPException(422, "status must be firing or resolved")
+        rows = repo.list_alerts(status=status, migration_id=migration_id, limit=max(1, min(limit, 1000)))
+        return [a for a in rows if alert_visible(a, p)]
+
+    @app.get("/alerts/summary", tags=["alerts"])
+    def alerts_summary(p: Principal = Depends(viewer)) -> dict[str, int]:
+        rows = [a for a in repo.firing_alerts() if alert_visible(a, p)]
+        return {"firing": len(rows), "critical": sum(a["severity"] == "critical" for a in rows),
+                "unacknowledged": sum(not a.get("ack_at") for a in rows)}
+
+    @app.post("/alerts/{aid}/ack", tags=["alerts"])
+    def ack_alert(aid: str, p: Principal = Depends(operator)) -> dict[str, Any]:
+        a = repo.get_alert(aid)
+        if a is None or not alert_visible(a, p):
+            raise HTTPException(404, "alert not found")
+        if a["status"] != "firing":
+            raise HTTPException(409, "alert is already resolved")
+        repo.update_alert(aid, ack_by=p.username, ack_at=time.time())
+        return repo.get_alert(aid)  # type: ignore[return-value]
+
+    def channel_out(c: dict[str, Any]) -> dict[str, Any]:
+        return {k: c.get(k) for k in ("id", "name", "type", "config", "enabled", "min_severity", "notify_resolved",
+                                      "notify_success", "last_sent_at", "last_error", "created_at", "updated_at")} \
+            | {"has_password": bool(c.get("secret_id"))}
+
+    def channel_or_404(cid: str) -> dict[str, Any]:
+        c = repo.get_channel(cid)
+        if c is None:
+            raise HTTPException(404, "notification channel not found")
+        return c
+
+    def check_channel(cfg: dict[str, Any], password: str | None) -> None:
+        """Save-time check: connect, TLS, log in (no mail sent). 422 with the server's answer on failure."""
+        try:
+            svc.alert_manager().channel_factory(cfg, password).check()
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(422, f"SMTP check failed ({type(e).__name__}): {e}. Fix the settings, or save "
+                                     "with skip_check to store them anyway.") from e
+
+    @app.get("/notification-channels", tags=["alerts"])
+    def list_channels(_: Principal = Depends(admin)) -> list[dict[str, Any]]:
+        return [channel_out(c) for c in repo.list_channels()]
+
+    @app.post("/notification-channels", status_code=201, tags=["alerts"])
+    def create_channel(body: m.ChannelCreate, p: Principal = Depends(admin)) -> dict[str, Any]:
+        if repo.get_channel_by_name(body.name):
+            raise HTTPException(409, "a notification channel with this name exists")
+        cfg = body.config.model_dump()
+        if not body.skip_check:
+            check_channel(cfg, body.password)
+        sid = svc.secrets.put({"password": body.password}) if body.password else None
+        cid = repo.create_channel(name=body.name, type=body.type, config=cfg, secret_id=sid, enabled=body.enabled,
+                                  min_severity=body.min_severity, notify_resolved=body.notify_resolved,
+                                  notify_success=body.notify_success)
+        return channel_out(channel_or_404(cid))
+
+    @app.patch("/notification-channels/{cid}", tags=["alerts"])
+    def update_channel(cid: str, body: m.ChannelUpdate, _: Principal = Depends(admin)) -> dict[str, Any]:
+        c = channel_or_404(cid)
+        vals = body.model_dump(exclude_unset=True, exclude={"password", "clear_password", "skip_check", "config"})
+        cfg = body.config.model_dump() if body.config is not None else dict(c["config"])
+        if body.config is not None:
+            vals["config"] = cfg
+        old_pw = (svc.secrets.get(c["secret_id"]) or {}).get("password") if c.get("secret_id") else None
+        pw = None if body.clear_password else (body.password if body.password is not None else old_pw)
+        if (body.config is not None or body.password is not None or body.clear_password) and not body.skip_check:
+            check_channel(cfg, pw)
+        if body.clear_password and c.get("secret_id"):
+            svc.secrets.delete(c["secret_id"])
+            vals["secret_id"] = None
+        elif body.password is not None:
+            if c.get("secret_id"):
+                svc.secrets.replace(c["secret_id"], {"password": body.password})
+            else:
+                vals["secret_id"] = svc.secrets.put({"password": body.password})
+        repo.update_channel(cid, **vals)
+        return channel_out(channel_or_404(cid))
+
+    @app.delete("/notification-channels/{cid}", status_code=204, tags=["alerts"])
+    def delete_channel(cid: str, _: Principal = Depends(admin)) -> None:
+        c = channel_or_404(cid)
+        if c.get("secret_id"):
+            svc.secrets.delete(c["secret_id"])
+        repo.delete_channel(cid)
+
+    @app.post("/notification-channels/{cid}/test", tags=["alerts"])
+    def test_channel(cid: str, _: Principal = Depends(admin)) -> dict[str, Any]:
+        c = channel_or_404(cid)
+        try:
+            svc.alert_manager().test_channel(c)
+        except Exception as e:  # noqa: BLE001
+            repo.update_channel(cid, last_error=f"{type(e).__name__}: {e}"[:1000])
+            raise HTTPException(422, f"test message failed ({type(e).__name__}): {e}") from e
+        return {"ok": True, "sent_to": c["config"].get("to")}
 
     @app.get("/pools", tags=["pools"])
     def list_pools(_: Principal = Depends(viewer)) -> list[dict[str, Any]]:

@@ -1,8 +1,9 @@
-// Purpose: Settings — users (admin: list + create), worker pool status, secret store status,
-// and the live provider support matrix.
+// Purpose: Settings — notification channels (admin: email alerts, with save-time SMTP check and a
+// test send), users (admin: list + create), worker pool status, secret store status, and the live
+// provider support matrix.
 
 import { useState } from "react";
-import { api, fmt, type Providers } from "../api";
+import { api, fmt, type Channel, type EmailConfig, type Providers } from "../api";
 import { ErrorBox, Modal, Status, Toast, errText, useAuth, useLoad } from "../ui";
 
 interface User { id: string; username: string; role: string; project: string; disabled: boolean; created_at: number }
@@ -83,6 +84,119 @@ function NewUser({ onClose, onDone }: { onClose: () => void; onDone: (m: string)
   );
 }
 
+const EMPTY: EmailConfig = { host: "", port: 587, security: "starttls", username: "", from_addr: "", to: [],
+  verify_tls: true, subject_prefix: "[Margarita]" };
+
+function ChannelEditor({ ch, onClose, onDone }: { ch: Channel | null; onClose: () => void; onDone: (m: string) => void }) {
+  const [name, setName] = useState(ch?.name ?? "ops-email");
+  const [cfg, setCfg] = useState<EmailConfig>({ ...EMPTY, ...(ch?.config ?? {}) });
+  const [to, setTo] = useState((ch?.config.to ?? []).join(", "));
+  const [pw, setPw] = useState("");
+  const [minSev, setMinSev] = useState(ch?.min_severity ?? "warning");
+  const [resolved, setResolved] = useState(ch?.notify_resolved ?? true);
+  const [success, setSuccess] = useState(ch?.notify_success ?? false);
+  const [enabled, setEnabled] = useState(ch?.enabled ?? true);
+  const [skip, setSkip] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const set = (k: keyof EmailConfig, v: unknown) => setCfg((c) => ({ ...c, [k]: v }));
+  const recipients = to.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean);
+  const ok = name && cfg.host && cfg.port > 0 && cfg.from_addr.includes("@") && recipients.length > 0 && recipients.every((r) => r.includes("@"));
+  const save = async () => {
+    setBusy(true); setErr(null);
+    const config = { ...cfg, to: recipients, username: cfg.username?.trim() || null };
+    const common = { config, min_severity: minSev, notify_resolved: resolved, notify_success: success, enabled, skip_check: skip };
+    try {
+      if (ch) await api.patch(`/notification-channels/${ch.id}`, { ...common, ...(pw ? { password: pw } : {}) });
+      else await api.post("/notification-channels", { name, type: "email", ...common, ...(pw ? { password: pw } : {}) });
+      onDone(ch ? `Saved ${name}` : `Added ${name}`);
+    } catch (e) { setErr(errText(e)); } finally { setBusy(false); }
+  };
+  return (
+    <Modal title={ch ? `Edit ${ch.name}` : "Add email notifications"} onClose={onClose} footer={<>
+      <button className="btn" onClick={onClose}>Cancel</button>
+      <button className="btn primary" disabled={!ok || busy} onClick={save}>{busy ? "Checking SMTP…" : ch ? "Save" : "Add channel"}</button></>}>
+      <div className="form">
+        {!ch && <label className="field"><span>Name</span><input type="text" value={name} onChange={(e) => setName(e.target.value)} /></label>}
+        <div className="form cols">
+          <label className="field"><span>SMTP server</span>
+            <input type="text" value={cfg.host} placeholder="smtp.example.com" onChange={(e) => set("host", e.target.value)} /></label>
+          <label className="field"><span>Port</span>
+            <input type="number" min={1} max={65535} value={cfg.port} onChange={(e) => set("port", Number(e.target.value))} /></label>
+          <label className="field"><span>Security</span>
+            <select value={cfg.security} onChange={(e) => { set("security", e.target.value); set("port", e.target.value === "ssl" ? 465 : e.target.value === "none" ? 25 : 587); }}>
+              <option value="starttls">STARTTLS (587)</option><option value="ssl">SSL/TLS (465)</option><option value="none">None (25, internal relay)</option></select></label>
+          <label className="field"><span>Username (optional)</span>
+            <input type="text" value={cfg.username ?? ""} autoComplete="off" onChange={(e) => set("username", e.target.value)} /></label>
+          <label className="field"><span>Password{ch?.has_password ? " (leave empty to keep)" : ""}</span>
+            <input type="password" value={pw} autoComplete="new-password" onChange={(e) => setPw(e.target.value)} />
+            <small>Stored encrypted in the secret store; never shown again.</small></label>
+          <label className="field"><span>From</span>
+            <input type="text" value={cfg.from_addr} placeholder="margarita@example.com" onChange={(e) => set("from_addr", e.target.value)} /></label>
+        </div>
+        <label className="field"><span>Send to</span>
+          <input type="text" value={to} placeholder="ops@example.com, dr-team@example.com" onChange={(e) => setTo(e.target.value)} />
+          <small>Comma-separated addresses.</small></label>
+        <div className="form cols">
+          <label className="field"><span>Send alerts of</span>
+            <select value={minSev} onChange={(e) => setMinSev(e.target.value as "warning" | "critical")}>
+              <option value="warning">warning and critical</option><option value="critical">critical only</option></select></label>
+          <label className="field"><span>Subject prefix</span>
+            <input type="text" value={cfg.subject_prefix} onChange={(e) => set("subject_prefix", e.target.value)} /></label>
+        </div>
+        <label className="check"><input type="checkbox" checked={resolved} onChange={(e) => setResolved(e.target.checked)} /> Also email when an alert clears</label>
+        <label className="check"><input type="checkbox" checked={success} onChange={(e) => setSuccess(e.target.checked)} /> Email when a migration, deploy or cutover completes</label>
+        <label className="check"><input type="checkbox" checked={cfg.verify_tls} onChange={(e) => set("verify_tls", e.target.checked)} /> Verify the server's TLS certificate</label>
+        <label className="check"><input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /> Enabled</label>
+        <label className="check"><input type="checkbox" checked={skip} onChange={(e) => setSkip(e.target.checked)} /> Save without checking the SMTP login first</label>
+        <ErrorBox error={err} title="Not saved" />
+      </div>
+    </Modal>);
+}
+
+function Notifications({ onToast }: { onToast: (m: string) => void }) {
+  const chans = useLoad(() => api.get<Channel[]>("/notification-channels"), [], 15000);
+  const [edit, setEdit] = useState<Channel | "new" | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [testing, setTesting] = useState<string | null>(null);
+  const test = (c: Channel) => {
+    setTesting(c.id); setErr(null);
+    api.post<{ sent_to: string[] }>(`/notification-channels/${c.id}/test`)
+      .then((r) => onToast(`Test email sent to ${r.sent_to.join(", ")}`))
+      .catch((e) => setErr(errText(e))).finally(() => { setTesting(null); chans.reload(); });
+  };
+  const del = (c: Channel) => {
+    if (!confirm(`Delete notification channel ${c.name}?`)) return;
+    api.del(`/notification-channels/${c.id}`).then(() => { chans.reload(); onToast(`Deleted ${c.name}`); }).catch((e) => setErr(errText(e)));
+  };
+  return (
+    <div className="card">
+      <div className="spread" style={{ marginBottom: 12 }}><h2 style={{ margin: 0 }}>Alert notifications</h2>
+        <button className="btn small" onClick={() => setEdit("new")}>Add email</button></div>
+      <ErrorBox error={err ?? chans.error} title="Notification channel" />
+      {(chans.data ?? []).length === 0 ? <p className="muted">No channels: alerts only show on the Alerts page. Add an email channel to be told
+        when a sync fails or a replica misses its recovery point objective.</p> : (
+        <div className="table-wrap"><table>
+          <thead><tr><th>Channel</th><th>Sends</th><th>Last sent</th><th /></tr></thead>
+          <tbody>{chans.data!.map((c) => (
+            <tr key={c.id}><td><b>{c.name}</b>{!c.enabled && <span className="tag" style={{ marginLeft: 6 }}>off</span>}
+              <div className="muted small">{c.config.host}:{c.config.port} → {c.config.to.join(", ")}</div>
+              {c.last_error && <div className="small" style={{ color: "var(--bad)" }}>{c.last_error}</div>}</td>
+              <td className="small">{c.min_severity === "critical" ? "critical" : "warning + critical"}
+                {c.notify_resolved ? " · cleared" : ""}{c.notify_success ? " · completions" : ""}</td>
+              <td className="small muted">{fmt.ago(c.last_sent_at)}</td>
+              <td className="row" style={{ justifyContent: "end" }}>
+                <button className="btn small" disabled={testing === c.id} onClick={() => test(c)}>{testing === c.id ? "Sending…" : "Send test"}</button>
+                <button className="btn small" onClick={() => setEdit(c)}>Edit</button>
+                <button className="btn small danger" onClick={() => del(c)}>Delete</button></td></tr>))}</tbody>
+        </table></div>)}
+      <p className="muted small" style={{ marginBottom: 0 }}>Set <code>VMIGRATE_PUBLIC_URL</code> on the server to get links back to this UI in emails.
+        Unacknowledged critical alerts are re-sent daily (<code>VMIGRATE_ALERT_REPEAT_HOURS</code>).</p>
+      {edit && <ChannelEditor ch={edit === "new" ? null : edit} onClose={() => setEdit(null)}
+                              onDone={(m) => { setEdit(null); chans.reload(); onToast(m); }} />}
+    </div>);
+}
+
 export default function Settings() {
   const { can } = useAuth();
   const admin = can("admin");
@@ -98,8 +212,9 @@ export default function Settings() {
 
   return (
     <>
-      <div className="page-head"><div><h1>Settings</h1><div className="sub">Users, workers, secrets and platform support.</div></div></div>
+      <div className="page-head"><div><h1>Settings</h1><div className="sub">Alert notifications, users, workers, secrets and platform support.</div></div></div>
       <div className="grid cols-2" style={{ alignItems: "start" }}>
+        {admin && <Notifications onToast={setToast} />}
         <div className="card">
           <div className="spread" style={{ marginBottom: 12 }}><h2 style={{ margin: 0 }}>Workers</h2>
             <span className="muted small">{(workers.data ?? []).filter((w) => w.alive).length} alive</span></div>

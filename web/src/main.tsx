@@ -4,8 +4,9 @@
 import { StrictMode, useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, NavLink, Route, Routes } from "react-router-dom";
-import { api, setUnauthorizedHandler, token, type Me } from "./api";
-import { AuthCtx, ErrorBox, Icon, roleAtLeast } from "./ui";
+import { api, setUnauthorizedHandler, token, type AlertSummary, type Me } from "./api";
+import { AuthCtx, ErrorBox, Icon, roleAtLeast, useLoad } from "./ui";
+import Alerts from "./pages/Alerts";
 import Audit from "./pages/Audit";
 import Endpoints from "./pages/Endpoints";
 import Execution from "./pages/Execution";
@@ -50,6 +51,16 @@ function Login({ onLogin }: { onLogin: (m: Me) => void }) {
   );
 }
 
+function AlertsLink() {
+  const sum = useLoad(() => api.get<AlertSummary>("/alerts/summary"), [], 30000);
+  const n = sum.data?.firing ?? 0;
+  return (
+    <NavLink to="/alerts"><Icon n="bell" />Alerts
+      {n > 0 && <span className={`nav-badge${sum.data!.critical ? " bad" : ""}`}
+                      title={`${sum.data!.critical} critical, ${sum.data!.unacknowledged} unacknowledged`}>{n}</span>}
+    </NavLink>);
+}
+
 function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [ready, setReady] = useState(false);
@@ -74,6 +85,7 @@ function App() {
             <NavLink to="/migrations"><Icon n="migrate" />Migrations</NavLink>
             <NavLink to="/endpoints"><Icon n="endpoint" />Endpoints</NavLink>
             <NavLink to="/replicas"><Icon n="replica" />Replicas</NavLink>
+            <AlertsLink />
             <NavLink to="/logs"><Icon n="logs" />Logs</NavLink>
             {can("admin") && <NavLink to="/audit"><Icon n="audit" />Audit trail</NavLink>}
             <NavLink to="/settings"><Icon n="settings" />Settings</NavLink>
@@ -97,6 +109,7 @@ function App() {
             <Route path="/settings" element={<Settings />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/audit" element={<Audit />} />
+            <Route path="/alerts" element={<Alerts />} />
             <Route path="*" element={<div className="empty"><h2>Not found</h2></div>} />
           </Routes>
         </main>

@@ -4,13 +4,53 @@
 
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, fmt, KIND_LABEL, type Endpoint, type Execution, type Replica, type Schedule } from "../api";
+import { api, fmt, KIND_LABEL, type Alert, type Endpoint, type Execution, type Replica, type Schedule } from "../api";
 import { ConfirmTyped, ErrorBox, Loading, Modal, Status, Toast, TransferBar, errText, useAuth, useLoad } from "../ui";
 import { ConsistencyPill } from "./Replicas";
 
 const ACTIVE = ["pending", "queued", "running"];
 const PRESETS: [string, string][] = [["*/15 * * * *", "every 15 minutes"], ["0 * * * *", "hourly"],
   ["0 */4 * * *", "every 4 hours"], ["0 2 * * *", "daily at 02:00 UTC"], ["0 2 * * 1-5", "weekdays at 02:00 UTC"]];
+
+function age(sec: number): string {
+  const m = Math.round(sec / 60);
+  return m < 120 ? `${m} min` : m < 2880 ? `${(m / 60).toFixed(1)} h` : `${(m / 1440).toFixed(1)} days`;
+}
+
+function RpoCard({ r, busy, canEdit, onSaved }: { r: Replica; busy: boolean; canEdit: boolean; onSaved: () => void }) {
+  const cur = r.options.rpo_minutes ?? 0;
+  const [mins, setMins] = useState(cur);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => setMins(cur), [cur]);
+  const alerts = useLoad(() => api.get<Alert[]>(`/alerts?status=firing&migration_id=${r.id}`), [r.id], 15000);
+  const last = r.last_sync?.finished ?? null;
+  const ageS = last ? Date.now() / 1000 - last : null;
+  const missed = cur > 0 && (ageS === null ? Date.now() / 1000 - r.created_at > cur * 60 : ageS > cur * 60);
+  const save = () => api.patch(`/replicas/${r.id}`, { options: { ...r.options, rpo_minutes: mins } })
+    .then(onSaved).catch((e) => setErr(errText(e)));
+  return (
+    <div className="card">
+      <div className="spread" style={{ marginBottom: 8 }}><h2 style={{ margin: 0 }}>Recovery point objective</h2>
+        {cur > 0 && <Status s={missed ? "failed" : "ok"} label={missed ? "missed" : "met"} />}</div>
+      <p className="small" style={{ marginTop: 0 }}>
+        Newest recovery point: {ageS !== null ? <b>{age(ageS)} old</b> : <span className="muted">none yet</span>}
+        {cur > 0 ? <> · objective {age(cur * 60)}</> : <span className="muted"> · no objective set, so no alert</span>}</p>
+      {(alerts.data ?? []).map((a) => (
+        <div key={a.id} className="alert bad small" style={{ marginBottom: 8 }}><b>{a.title}</b>
+          {a.detail && <div className="muted">{a.detail.split("\n")[0]}</div>}
+          <Link to="/alerts">all alerts</Link></div>))}
+      {canEdit && <div className="row">
+        <input type="number" min={0} max={43200} value={mins} style={{ width: 110 }} disabled={busy}
+               onChange={(e) => setMins(Number(e.target.value))} />
+        <span className="small muted">minutes (0 = off)</span>
+        <button className="btn sm" disabled={busy || mins === cur || mins < 0 || mins > 43200}
+                title={busy ? "Wait for the running execution to finish" : ""} onClick={save}>Save</button>
+      </div>}
+      <ErrorBox error={err} title="Could not save" />
+      <p className="small muted" style={{ marginBottom: 0 }}>Alerts (and emails, if a channel is set up) when the newest completed sync is older
+        than this. Set it above your sync interval plus one sync's duration.</p>
+    </div>);
+}
 
 function HelperCard({ r, busy, canEdit, onSaved }: { r: Replica; busy: boolean; canEdit: boolean; onSaved: () => void }) {
   const cur = r.options.keep_helper_minutes ?? 0;
@@ -297,6 +337,7 @@ export default function ReplicaDetail() {
             </table></div>)}
         </div>
         <div className="stack" style={{ marginTop: 0 }}>
+          <RpoCard r={r} busy={!!active} canEdit={can("operator")} onSaved={() => { rep.reload(); setToast("Saved"); }} />
           <HelperCard r={r} busy={!!active} canEdit={can("operator")} onSaved={() => { rep.reload(); setToast("Saved"); }} />
           <div className="card">
             <div className="spread" style={{ marginBottom: 8 }}><h2 style={{ margin: 0 }}>Schedules</h2>

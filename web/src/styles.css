@@ -281,3 +281,12 @@ pre.md { white-space: pre-wrap; font-family: var(--mono); font-size: 12.5px; bac
 .lvl-WARNING { background: #fff4e5; color: #b54708; }
 .lvl-DEBUG { color: var(--muted, #6b7280); }
 .logtable td { vertical-align: top; }
+
+/* alerts */
+.nav-badge { margin-left: auto; min-width: 18px; padding: 0 6px; border-radius: 99px; font-size: 11px; font-weight: 650;
+  line-height: 18px; text-align: center; background: var(--warn-soft); color: var(--warn); }
+.nav-badge.bad { background: var(--bad); color: #fff; }
+.sev { font-size: 11px; font-weight: 650; letter-spacing: .02em; text-transform: uppercase; padding: 1px 7px; border-radius: 5px; }
+.sev.critical { background: var(--bad-soft); color: var(--bad); }
+.sev.warning { background: var(--warn-soft); color: var(--warn); }
+.alert-detail { white-space: pre-wrap; word-break: break-word; margin: 6px 0 0; font-size: 12.5px; color: var(--text-2); }

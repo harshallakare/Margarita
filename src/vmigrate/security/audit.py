@@ -27,7 +27,8 @@ MAX_DETAILS = 8192
 AUDITED_GETS = {"/executions/{xid}/diagnostics", "/audit/export"}
 COLLECTIONS = {"users": "user", "endpoints": "endpoint", "migrations": "migration", "replicas": "replica",
                "executions": "execution", "schedules": "schedule", "pools": "pool", "minions": "minion",
-               "workers": "worker", "secrets": "secret", "audit": "audit"}
+               "workers": "worker", "secrets": "secret", "audit": "audit", "alerts": "alert",
+               "notification-channels": "notification_channel"}
 SPECIAL = {("POST", "/auth/token"): ("auth.login", "user"), ("POST", "/auth/logout"): ("auth.logout", "user"),
            ("POST", "/enroll"): ("worker.enroll", "worker")}
 VERB = {"POST": "create", "PUT": "update", "PATCH": "update", "DELETE": "delete", "GET": "read"}

@@ -123,6 +123,9 @@ class MigrationOptions(BaseModel):
     osmorph: dict[str, Any] = Field(default_factory=dict)
     engine: dict[str, Any] = Field(default_factory=dict)
     retention: int | None = Field(None, ge=1, le=100, description="replicas: restore points to keep (default 3)")
+    rpo_minutes: int | None = Field(None, ge=0, le=30 * 24 * 60,
+                                    description="replicas: alert when the newest completed sync is older than this "
+                                                "(recovery point objective); 0/unset = no RPO alert")
     keep_helper_minutes: int | None = Field(None, ge=0, le=7 * 24 * 60,
                                             description="replicas: keep the target helper VM (with the replica volumes "
                                                         "attached) this many idle minutes after a sync, so the next "
@@ -279,3 +282,37 @@ class TaskOut(BaseModel):
 
 
 ReplicaOut.model_rebuild()
+
+
+class EmailChannelConfig(BaseModel):
+    host: str = Field(..., min_length=1, max_length=255)
+    port: int = Field(587, ge=1, le=65535)
+    security: str = Field("starttls", pattern="^(starttls|ssl|none)$")
+    username: str | None = Field(None, max_length=255)
+    from_addr: str = Field(..., max_length=255)
+    to: list[str] = Field(..., min_length=1, max_length=50)
+    verify_tls: bool = True
+    subject_prefix: str = Field("[Margarita]", max_length=64)
+
+
+class ChannelCreate(BaseModel):
+    name: str = Field(..., pattern=NAME)
+    type: str = Field("email", pattern="^email$")
+    config: EmailChannelConfig
+    password: str | None = Field(None, max_length=1024, description="SMTP password; stored encrypted, never returned")
+    enabled: bool = True
+    min_severity: str = Field("warning", pattern="^(warning|critical)$")
+    notify_resolved: bool = True
+    notify_success: bool = False
+    skip_check: bool = Field(False, description="save without first connecting + logging in to the SMTP server")
+
+
+class ChannelUpdate(BaseModel):
+    config: EmailChannelConfig | None = None
+    password: str | None = Field(None, max_length=1024, description="new SMTP password; omit to keep the current one")
+    clear_password: bool = False
+    enabled: bool | None = None
+    min_severity: str | None = Field(None, pattern="^(warning|critical)$")
+    notify_resolved: bool | None = None
+    notify_success: bool | None = None
+    skip_check: bool = False

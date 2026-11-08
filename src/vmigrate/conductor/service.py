@@ -171,6 +171,12 @@ class Conductor:
         self.purge_audit()
         # 7) replica helper VMs kept between syncs: remove the ones idle past their time
         stats["helpers_released"] = self.reap_helpers()
+        # 8) alerts: evaluate rules, fire / resolve, email (every 30 s; delivery runs in the background)
+        try:
+            a = self.svc.alert_manager().run()
+            stats["alerts_fired"], stats["alerts_resolved"] = a.get("fired", 0), a.get("resolved", 0)
+        except Exception:  # noqa: BLE001 - alerting must never stop orchestration
+            log.exception("alert evaluation failed")
         return stats
 
     def reap_helpers(self, now: float | None = None) -> int:
