@@ -123,10 +123,23 @@ def _extra(meta: Any, name: str) -> str | None:
     return None
 
 
+def _route_missing(r: Any) -> bool:
+    """A 404 from the web server (no such route) rather than a JSON API error about an object."""
+    text = str(getattr(r, "text", "") or "")
+    if "requested URL was not found" in text:
+        return True
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001 - not JSON: a server page, not the API
+        return True
+    return not (isinstance(body, dict) and (body.get("data") or {}).get("error"))
+
+
 class PrismV4:
     def __init__(self, session: Any, pc_url: str, *, timeout: float = 60, task_timeout: float = 3600,
                  poll: float = 2, sleep: Any = time.sleep, crt_version: str = "v4.0"):
         self.crt_version = crt_version
+        self._compute_ver: str | None = None    # API version the cluster answered compute-changed-regions on
         self.s, self.base = session, pc_url.rstrip("/")
         self.timeout, self.task_timeout, self.poll, self.sleep = timeout, task_timeout, poll, sleep
 
@@ -303,9 +316,18 @@ class PrismV4:
         """All regions of `cur` that differ from `ref` (None: everything allocated), as
         (offset, length, REGULAR|ZEROED). Pages with nextOffset; re-discovers when the JWT expires."""
         ip, jwt = self._discover(cur, ref)
-        path = (DP_CONTENT.format(ver=self.crt_version) + f"/{cur['recovery_point']}/vm-recovery-points/"
-                f"{cur['vm_recovery_point']}/disk-recovery-points/{cur['disk_recovery_point']}"
-                "/$actions/compute-changed-regions")
+        # Seen live: the cluster answered compute-changed-regions under v4.0 with a bare web-server 404
+        # ("The requested URL was not found on the server"); the Nutanix SDK uses v4.4. Try versions until
+        # one has the route, then stick to it. A JSON 404 from the API itself is a real error.
+        versions = ([self._compute_ver] if self._compute_ver else
+                    [self.crt_version] + [v for v in ("v4.4", "v4.3", "v4.2", "v4.1", "v4.0") if v != self.crt_version])
+
+        def path_for(ver: str) -> str:
+            return (DP_CONTENT.format(ver=ver) + f"/{cur['recovery_point']}/vm-recovery-points/"
+                    f"{cur['vm_recovery_point']}/disk-recovery-points/{cur['disk_recovery_point']}"
+                    "/$actions/compute-changed-regions")
+        vi = 0
+        path = path_for(versions[vi])
         out: list[tuple[int, int, str]] = []
         off, retried = 0, False
         for _ in range(max_pages):
@@ -320,6 +342,15 @@ class PrismV4:
                 ip, jwt = self._discover(cur, ref)
                 retried = True
                 continue
+            if r.status_code == 404 and self._compute_ver is None and _route_missing(r) and vi + 1 < len(versions):
+                log.info("CRT compute-changed-regions not served under %s on %s; trying %s",
+                         versions[vi], ip, versions[vi + 1])
+                vi += 1
+                path = path_for(versions[vi])
+                continue
+            if r.status_code < 400 and self._compute_ver is None:
+                self._compute_ver = versions[vi]
+                log.info("CRT compute-changed-regions answered under API %s on %s", versions[vi], ip)
             if r.status_code >= 500 or r.status_code == 429:
                 raise TransientProviderError(f"CRT {ip}: HTTP {r.status_code} {r.text[:300]}")
             if r.status_code >= 400:

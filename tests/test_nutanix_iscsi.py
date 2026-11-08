@@ -429,6 +429,30 @@ def test_crt_discover_paging_jwt_refresh_and_zeroed_regions():
     assert state["jwt"] == 2                                     # rediscovered once after the 401
 
 
+def test_crt_compute_falls_back_to_a_version_the_cluster_serves():
+    # seen live: v4.0 compute-changed-regions -> bare web-server 404 "The requested URL was not found on
+    # the server"; the SDK's v4.4 path is what the cluster serves
+    v44 = COMPUTE.replace("/v4.0/", "/v4.4/")
+    route_404 = Resp(404, {"message": "The requested URL was not found on the server. If you entered the URL "
+                                      "manually please check your spelling and try again."})
+    ok = Resp(200, {"data": [{"offset": 0, "length": 8192}], "metadata": {"extraInfo": [{"name": "nextOffset",
+                                                                                        "value": "0"}]}})
+    disc = Resp(200, {"data": {"clusterIp": {"ipv4": {"value": "10.0.0.5"}}, "jwtToken": "j"}})
+    s = Session({("POST", DISCOVER): disc, ("POST", COMPUTE): route_404, ("POST", v44): ok})
+    api = v4.PrismV4(s, "https://pc:9440", sleep=lambda x: None)
+    assert api.changed_regions(CUR, REF, 4 << 20) == [(0, 8192, "REGULAR")]
+    assert [c[1] for c in s.calls if "compute" in c[1]] == [COMPUTE, v44]
+    s.calls.clear()
+    api.changed_regions(CUR, REF, 4 << 20)                              # remembered: straight to v4.4
+    assert [c[1] for c in s.calls if "compute" in c[1]] == [v44]
+    # a real API 404 (JSON error about the object) is not retried under other versions
+    gone = Resp(404, {"data": {"error": [{"code": "DP-10400", "message": "Recovery point does not exist"}]}})
+    s2 = Session({("POST", DISCOVER): disc, ("POST", COMPUTE): gone})
+    with pytest.raises(ProviderError, match="DP-10400"):
+        v4.PrismV4(s2, "https://pc:9440", sleep=lambda x: None).changed_regions(CUR, REF, 4 << 20)
+    assert len([c for c in s2.calls if "compute" in c[1]]) == 1
+
+
 def test_set_expiration_guard_and_body():
     s = Session({("GET", f"{v4.RECOVERY_POINTS}/rp-1"): Resp(200, {"data": {"name": "vmigrate-x"}}, {"ETag": "e7"}),
                  ("POST", f"{v4.RECOVERY_POINTS}/rp-1/$actions/set-expiration-time"): Resp(200, {}),
