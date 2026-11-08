@@ -250,12 +250,23 @@ class NutanixSource(SourceProvider):
 
     def preflight(self, spec: VmSpec | None = None) -> list[str]:
         problems: list[str] = []
+        why_nfs = "transport is nfs"
+        if spec is None and self.transport != "nfs":
+            # endpoint-level check (no VM yet): with Prism Central v4 reachable, iSCSI is used and no
+            # NFS settings are needed. The per-cluster decision (Data Services IP) is made per VM.
+            ok, why = self._v4_status()
+            if ok:
+                return problems
+            if self.transport == "iscsi":
+                return [f"transport iscsi: {why}"]
+            why_nfs = f"auto transport fell back to NFS because iSCSI is unavailable: {why}"
         if spec is not None:
             try:
                 mode, why = self.transport_for((spec.extra.get("nutanix") or {}).get("cluster"))
             except ProviderError as e:
                 return [str(e)]
             self.ctx.logger.info("nutanix transport for %s: %s (%s)", spec.name, mode, why)
+            why_nfs = f"transport for {spec.name}: nfs ({why})"
             if mode == "iscsi":
                 try:
                     self._iscsi_factory("127.0.0.1").initiator_name()
@@ -263,7 +274,9 @@ class NutanixSource(SourceProvider):
                     problems.append(str(e))
                 return problems
         if not self.pd:
-            problems.append(f"sources.{self.name}.protection_domain is not set (needed by the NFS transport)")
+            problems.append(f"sources.{self.name}.protection_domain is not set, needed by the NFS transport "
+                            f"[{why_nfs}]. To avoid NFS, set Prism Central on the endpoint (PC 7.3+ with the "
+                            "v4 API and a cluster Data Services IP).")
         if spec is not None:
             for ctr in spec.extra.get("nutanix", {}).get("containers", []):
                 try:

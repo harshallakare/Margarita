@@ -135,7 +135,9 @@ export default function MigrationDetail() {
             </div>
           </div>
           <div className="row" style={{ marginBottom: 12 }}>
-            <span className={`pill ${r.disk_count_match ? "ok" : "bad"}`}>disk count {r.disk_count_match ? "matches" : "MISMATCH"}</span>
+            {!r.crosscheck
+              ? <span className="pill">disk count not checked yet</span>
+              : <span className={`pill ${r.disk_count_match ? "ok" : "bad"}`}>disk count {r.disk_count_match ? "matches" : "MISMATCH"}</span>}
             {r.verification && "boot" in r.verification && <span className={`pill ${(r.verification.boot as { ok: boolean }).ok ? "ok" : "bad"}`}>
               boot {(r.verification.boot as { ok: boolean }).ok ? "ok" : "failed"}</span>}
             {r.morph && <span className={`pill ${r.morph.status === "manual_required" ? "warn" : "ok"}`}>OSMorph: {String(r.morph.status)}</span>}
