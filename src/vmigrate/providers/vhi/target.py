@@ -169,14 +169,34 @@ class VhiTarget(TargetProvider):
 
     def _release_helper_disks(self) -> None:
         """Volumes must be detached from the helper before Nova boots the real VM or Cinder clones them."""
+        self._close_bridges()
+        if self._helper is not None:
+            self._helper.detach_all()
+
+    def _close_bridges(self) -> None:
         for b in self._bridges.values():
             b.close()
         self._bridges.clear()
         if self._sockdir:
             shutil.rmtree(self._sockdir, ignore_errors=True)
             self._sockdir = None
-        if self._helper is not None:
-            self._helper.detach_all()
+
+    def keep_helper(self) -> dict[str, Any] | None:
+        if self._helper is None:
+            return None
+        self._close_bridges()                      # NBD agents end; volumes stay attached to the helper
+        rec = self._helper.export()
+        self._helper = None
+        return rec
+
+    def adopt_helper(self, record: dict[str, Any]) -> bool:
+        if self.write_mode != "helper_vm":
+            return False
+        return self.helper.adopt(record)
+
+    def release_helper(self, record: dict[str, Any], *, wait: bool = True) -> None:
+        HelperVm.release_record(self.api, record, self.ctx.logger, wait=wait, poll=self.poll,
+                                op_timeout=self.op_timeout)
 
     def close(self) -> None:
         if self._helper is None:

@@ -143,7 +143,8 @@ class Services:
         src_ep, tgt_ep = self._endpoints(mig)
         return ReplicaRunner(self.job_for(mig), self.engine_for(mig), self.build_source(src_ep, ctx, target_ep=tgt_ep),
                              self.build_target(tgt_ep, ctx), ctx, DbReplicaStore(self.repo, mig["id"]),
-                             retention=int((mig.get("options") or {}).get("retention", 3)))
+                             retention=int((mig.get("options") or {}).get("retention", 3)),
+                             keep_helper_minutes=float((mig.get("options") or {}).get("keep_helper_minutes") or 0))
 
 
 def engine_dict(e: EngineConfig) -> dict[str, Any]:

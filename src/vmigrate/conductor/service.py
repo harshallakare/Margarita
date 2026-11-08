@@ -169,7 +169,52 @@ class Conductor:
         stats["minions"] = self.scale_pools()
         # 6) audit retention (daily)
         self.purge_audit()
+        # 7) replica helper VMs kept between syncs: remove the ones idle past their time
+        stats["helpers_released"] = self.reap_helpers()
         return stats
+
+    def reap_helpers(self, now: float | None = None) -> int:
+        """A sync may keep its target helper VM (replica option keep_helper_minutes). When it sat idle
+        past expires_at and no execution of that replica is active, delete it through the target API.
+        Failures are recorded on the replica and retried (at most once a minute)."""
+        from ..core.context import RunContext
+        from ..engine.replica import ReplicaState
+        from ..db.repo import DbReplicaStore
+        now = now or time.time()
+        if now - getattr(self, "_last_reap", 0.0) < 30:      # cheap: replica states are read twice a minute
+            return 0
+        self._last_reap = now
+        n = 0
+        for mig in self.repo.list_migrations(None, mode="replica"):
+            h = (mig.get("state") or {}).get("helper")
+            if not h or h.get("expires_at") is None or h["expires_at"] > now:
+                continue
+            if now - float(h.get("last_reap_try") or 0) < 60 or self.repo.active_execution(mig["id"]):
+                continue
+            store = DbReplicaStore(self.repo, mig["id"])
+            st = ReplicaState.from_dict(store.load() or {})
+            try:
+                ep = self.repo.get_endpoint(mig["target_endpoint_id"])
+                if ep is None:
+                    raise RuntimeError("target endpoint no longer exists")
+                ctx = RunContext(dry_run=False, run_id=f"reap-{mig['id'][:8]}", logger=log)
+                tgt = self.svc.build_target(ep, ctx)
+                try:
+                    tgt.release_helper(h, wait=False)    # deleting the server detaches its volumes
+                finally:
+                    tgt.close()
+            except Exception as e:  # noqa: BLE001 - recorded, retried next minute
+                log.warning("replica %s: could not remove kept helper VM %s: %s", mig["name"], h.get("name"), e)
+                if st.helper:
+                    st.helper["last_reap_try"], st.helper["last_reap_error"] = now, f"{type(e).__name__}: {e}"
+                    store.save(st.to_dict())
+                continue
+            st.helper = None
+            store.save(st.to_dict())
+            self.audit("replica.helper_released", "replica", mig["id"], mig["name"],
+                       {"helper": h.get("name"), "idle_minutes": round((now - float(h.get("kept_at") or now)) / 60)})
+            n += 1
+        return n
 
     def _requirements(self, ex: dict[str, Any]) -> Requirement | None:
         mig = self.repo.get_migration(ex["migration_id"])

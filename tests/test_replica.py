@@ -266,3 +266,66 @@ def test_deploy_and_cutover_can_use_an_isolated_network_for_that_run(rep):
     x = rep.run("cutover", {"dry_run": False, "deploy_name": "ris-cut", "network_map": {"VLAN-130": "isolated-test"}})
     assert x["status"] == "completed", x
     assert rep.registry()["vms"]["ris-cut"]["network_map"] == {"VLAN-120": "prod-net", "VLAN-130": "isolated-test"}
+
+
+def test_helper_vm_kept_between_syncs_released_for_deploy_and_reaped_when_idle(rep):
+    import json
+    import time as _t
+    r = rep.get()
+    tgt = r["target_endpoint_id"]
+    cfg = {"staging_dir": str(rep.tmp / "tgt"), "persist": True, "helper": True}
+    assert rep.c.patch(f"/endpoints/{tgt}", headers=rep.admin, json={"config": cfg}).status_code == 200
+
+    def helpers():
+        return json.loads((rep.tmp / "tgt" / "helpers.json").read_text())
+
+    def keep(minutes):
+        x = rep.c.patch(f"/replicas/{rep.rid}", headers=rep.admin,
+                        json={"options": {"retention": 2, "keep_helper_minutes": minutes}})
+        assert x.status_code == 200, x.text
+
+    keep(30)
+    assert rep.run("execute")["status"] == "completed"
+    h = helpers()
+    assert h["created"] == 1 and list(h["live"]) == ["helper-1"]           # kept after the sync
+    shown = rep.get()["helper"]
+    assert shown["name"] == "helper-1" and shown["expires_at"] > _t.time() + 25 * 60 and shown["volumes"] == 3
+
+    rep.set_source(generation=1)
+    assert rep.run("execute")["status"] == "completed"
+    assert helpers()["created"] == 1 and list(helpers()["live"]) == ["helper-1"]   # reused: no new boot
+
+    assert rep.run("execute", {"dry_run": True})["status"] == "completed"        # dry run: untouched
+    assert list(helpers()["live"]) == ["helper-1"] and rep.get()["helper"]
+
+    # deploy needs the volumes: the kept helper is removed first (the fake refuses to clone in-use volumes)
+    x = rep.c.post(f"/replicas/{rep.rid}/deploy", headers=rep.admin, json={"dry_run": False})
+    assert x.status_code == 202, x.text
+    rep.drive()
+    assert rep.c.get(f"/executions/{x.json()['id']}", headers=rep.admin).json()["status"] == "completed"
+    assert helpers()["live"] == {} and helpers()["released"] == ["helper-1"] and rep.get()["helper"] is None
+
+    # kept again, then idle past its time: the conductor removes it
+    rep.set_source(generation=2)
+    assert rep.run("execute")["status"] == "completed"
+    assert list(helpers()["live"]) == ["helper-2"]
+    assert rep.conductor.reap_helpers(now=_t.time() + 10) == 0                    # not expired yet
+    rep.conductor._last_reap = 0
+    assert rep.conductor.reap_helpers(now=_t.time() + 31 * 60) == 1
+    assert helpers()["live"] == {} and rep.get()["helper"] is None
+
+    # a helper that cannot be reused (another worker, deleted by hand) is replaced, never blocks the sync
+    rep.set_source(generation=3)
+    assert rep.run("execute")["status"] == "completed"
+    assert rep.c.patch(f"/endpoints/{tgt}", headers=rep.admin,
+                       json={"config": {**cfg, "helper_lost": True}}).status_code == 200
+    rep.set_source(generation=4)
+    assert rep.run("execute")["status"] == "completed"
+    h = helpers()
+    assert "helper-3" in h["released"] and list(h["live"]) == ["helper-4"]
+
+    keep(0)                                                                       # off: removed after each sync
+    rep.set_source(generation=5)
+    assert rep.run("execute")["status"] == "completed"
+    assert helpers()["live"] == {} and rep.get()["helper"] is None
+    assert all(rep.replica_bytes(i) == _expected(i, 5) for i in range(3))

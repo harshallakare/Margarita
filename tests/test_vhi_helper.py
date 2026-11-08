@@ -79,12 +79,14 @@ class FakeHelperOpenStack(FakeOpenStack):
 
     def attach_volume(self, sid, vid):
         super().attach_volume(sid, vid)
+        self.volumes[vid]["attachments"] = [{"server_id": sid}]
         self.log.append(f"attach:{vid}")
 
     def detach_volume(self, sid, vid):
         s = self.servers[sid]
         s["atts"] = [a for a in s["atts"] if a["volume_id"] != vid]
         self.volumes[vid]["status"] = "available"
+        self.volumes[vid]["attachments"] = []
         self.log.append(f"detach:{vid}")
 
     def delete_server(self, sid):
@@ -125,6 +127,8 @@ def make_transport(api: FakeHelperOpenStack, hosts: list):
                 return "".join(f"virtio-{v[:20]}\nvirtio-{v[:20]}-part1\n" for v in self._attached())
             if cmd.startswith("command -v python3"):
                 return "/usr/bin/python3\n"
+            if cmd.startswith("test -b "):
+                return "ok\n" if any(shlex.split(cmd)[2].endswith(v[:20]) for v in self._attached()) else ""
             return ""
 
         def popen(self, cmd):
@@ -142,9 +146,9 @@ def fake_keygen(path: Path) -> str:
     return f"ssh-ed25519 AAAA{path.name} vmigrate-helper"
 
 
-def _tgt(tmp_path, *, dry=False, **cfg):
-    ctx = RunContext(dry_run=dry, logger=logging.getLogger("t"), run_id="run-abcdef123456")
-    api = FakeHelperOpenStack(tmp_path / "vstorage-absent", tmp_path / "devs")
+def _tgt(tmp_path, *, dry=False, api=None, run_id="run-abcdef123456", **cfg):
+    ctx = RunContext(dry_run=dry, logger=logging.getLogger("t"), run_id=run_id)
+    api = api or FakeHelperOpenStack(tmp_path / "vstorage-absent", tmp_path / "devs")
     conf = {"type": "vhi", "project_id": "proj-1", "vstorage_mount": str(tmp_path / "no-vstorage"),
             "staging_dir": str(tmp_path / "staging"), "poll_interval": 0, "op_timeout": 5, "helper_image": "ubuntu-22.04",
             "helper_network": "helper-net", "network_map": {"net0": "uuid-net0"}, **cfg}
@@ -354,3 +358,46 @@ def test_replica_compare_sync_through_helper_is_byte_exact(tmp_path):
     assert api.dev(ref.id).read_bytes()[:size] == gen1.read(0, size)
     assert stats.bytes_unchanged + stats.bytes_written + stats.bytes_zero_skipped >= size - (1 << 20)
     t.close()
+
+
+def test_helper_kept_between_runs_is_reused_with_its_volumes_attached(tmp_path):
+    t, api, hosts = _tgt(tmp_path)
+    ref = t.create_disk("d", 1 << 20, DiskHints(bus=DiskBus.SCSI))
+    with t.open_disk_writer(ref) as w:
+        w.write(0, b"a" * 4096)
+    rec = t.keep_helper()
+    t.close()                                                  # nothing is destroyed: it was handed over
+    assert rec and list(rec["attached"]) == [ref.id] and rec["host"] == "10.9.0.5"
+    assert api.volumes[ref.id]["status"] == "in-use" and Path(rec["dir"]).is_dir()
+    t2, _, _ = _tgt(tmp_path, api=api, run_id="run-second00000")   # the next sync, same worker
+    assert t2.adopt_helper(rec)
+    with t2.open_disk_writer(ref, incremental=True) as w:
+        w.write(4096, b"b" * 4096)
+    assert api.log.count("create-helper") == 1 and api.log.count(f"attach:{ref.id}") == 1   # no boot, no attach
+    assert api.dev(ref.id).read_bytes()[:8192] == b"a" * 4096 + b"b" * 4096
+    rec2 = t2.keep_helper()
+    t2.release_helper(rec2)                                     # e.g. before a deploy, or idle too long
+    assert not any(s["name"].startswith("vmigrate-helper") for s in api.servers.values())
+    assert api.volumes[ref.id]["status"] == "available" and not Path(rec["dir"]).exists()
+    t2.release_helper(rec2)                                     # repeatable
+
+
+def test_kept_helper_not_adopted_without_keys_or_when_gone(tmp_path):
+    import shutil as _sh
+    from vmigrate.core.errors import SafetyGateError
+    t, api, _ = _tgt(tmp_path)
+    ref = t.create_disk("d", 1 << 20, DiskHints(bus=DiskBus.SCSI))
+    with t.open_disk_writer(ref) as w:
+        w.write(0, b"x")
+    rec = t.keep_helper()
+    keys = Path(rec["dir"])
+    _sh.copytree(keys, tmp_path / "keys-bak")
+    _sh.rmtree(keys)                                            # another worker: keys not here
+    t2, _, _ = _tgt(tmp_path, api=api, run_id="run-other000000")
+    assert not t2.adopt_helper(rec)
+    _sh.copytree(tmp_path / "keys-bak", keys)
+    api.servers[rec["server_id"]]["status"] = "SHUTOFF"
+    assert not _tgt(tmp_path, api=api, run_id="run-third000000")[0].adopt_helper(rec)
+    api.servers[rec["server_id"]]["metadata"] = {}              # not ours: never deleted
+    with pytest.raises(SafetyGateError, match="not a vmigrate helper"):
+        t2.release_helper(rec)

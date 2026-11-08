@@ -134,6 +134,7 @@ class ReplicaState:
     deployments: list[dict[str, Any]] = field(default_factory=list)
     cutovers: list[dict[str, Any]] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
+    helper: dict[str, Any] | None = None            # target helper VM kept between syncs (+ expires_at)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "replica", **asdict(self)}
@@ -209,9 +210,10 @@ class _DeployStateStore:
 
 class ReplicaRunner:
     def __init__(self, job: MigrationConfig, engine: EngineConfig, source: SourceProvider, target: TargetProvider,
-                 ctx: RunContext, store: ReplicaStore, *, retention: int = 3):
+                 ctx: RunContext, store: ReplicaStore, *, retention: int = 3, keep_helper_minutes: float = 0):
         self.job, self.engine, self.source, self.target, self.ctx, self.store = job, engine, source, target, ctx, store
         self.retention = max(1, int(retention))
+        self.keep_helper_minutes = max(0.0, float(keep_helper_minutes or 0))
         self.log = ctx.logger.getChild(job.name) if isinstance(ctx.logger, logging.Logger) else ctx.logger
         self._lock = threading.RLock()
         raw = store.load()
@@ -223,6 +225,54 @@ class ReplicaRunner:
     def _save(self) -> None:
         with self._lock:
             self.store.save(self.state.to_dict())
+
+    # ------------------------------------------------------------------ kept helper VM (target side)
+    def begin(self, kind: str) -> None:
+        """Start of an execution. A sync reuses the helper VM kept by the previous sync; anything else
+        (deploy, cutover, delete disks) removes it first, so the replica volumes are free to clone,
+        attach or delete. Dry runs change nothing."""
+        rec = self.state.helper
+        if not rec or self.ctx.dry_run:
+            return
+        if kind == "replica_sync" and self.keep_helper_minutes > 0:
+            with self._lock:
+                rec["expires_at"] = None             # in use: the conductor never reaps it meanwhile
+            self._save()
+            try:
+                if self.target.adopt_helper(rec):
+                    return
+            except Exception as e:  # noqa: BLE001 - never block a sync on reuse; a fresh helper works
+                self.log.warning("kept helper VM %s not reusable: %s", rec.get("name"), e)
+        self.ctx.require_execute("remove kept helper VM", name=rec.get("name"))
+        self.target.release_helper(rec)          # raises when it could not be removed (record kept)
+        with self._lock:
+            self.state.helper = None
+        self._save()
+
+    def finish(self, kind: str, completed: bool) -> None:
+        """End of an execution: keep the helper for the next sync when asked to, else remove it."""
+        try:
+            self.source.close()
+        finally:
+            kept = None
+            try:
+                if (kind == "replica_sync" and completed and self.keep_helper_minutes > 0
+                        and not self.ctx.dry_run):
+                    kept = self.target.keep_helper()
+            finally:
+                self.target.close()
+            if self.ctx.dry_run:                 # a dry run neither used nor changed the kept helper
+                return
+            with self._lock:
+                had = self.state.helper is not None
+                if kept:
+                    kept["expires_at"] = time.time() + self.keep_helper_minutes * 60
+                    kept["kept_at"] = time.time()
+                    self.log.info("helper VM %s kept for the next sync (removed after %g idle minutes)",
+                                  kept.get("name"), self.keep_helper_minutes)
+                self.state.helper = kept
+            if kept or had:
+                self._save()
 
     def spec(self) -> VmSpec:
         if not self.state.spec:

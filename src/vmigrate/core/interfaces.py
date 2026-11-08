@@ -290,6 +290,20 @@ class TargetProvider(_Provider):
         """[{id, name}] security groups (e.g. for a helper VM). Empty = not applicable."""
         return []
 
+    # ---- helper VM kept between replica syncs (optional) -------------------------------------
+    def keep_helper(self) -> dict[str, Any] | None:
+        """End of a sync: hand the open helper (with its volumes still attached) over to a later run
+        instead of destroying it in close(). Returns a JSON record, or None when nothing is kept."""
+        return None
+
+    def adopt_helper(self, record: dict[str, Any]) -> bool:
+        """Start of a sync: reuse a helper kept by keep_helper(). False: not usable here (the caller
+        then calls release_helper and a fresh helper is created on demand)."""
+        return False
+
+    def release_helper(self, record: dict[str, Any], *, wait: bool = True) -> None:
+        """Remove a kept helper (its volumes are detached and left intact). Safe to repeat."""
+
     # ---- replica support (optional) -------------------------------------------------------
     def supports_replica(self) -> bool:
         """True when open_disk_writer(incremental=True) and clone_disk are implemented."""
