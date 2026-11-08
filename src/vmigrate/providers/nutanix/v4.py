@@ -342,8 +342,22 @@ class PrismV4:
                 out[_need(d, "diskExtId")] = _need(d, "diskRecoveryPointExtId")
         return out
 
+    def _get_or_gone(self, path: str, what: str) -> tuple[Any, str | None] | None:
+        """GET for a cleanup step; None when the object no longer exists (an earlier attempt already
+        removed it; seen live: DP-10400 "does not exist in IDF"), so cleanup is safe to repeat."""
+        try:
+            return self._get(path)
+        except ProviderError as e:
+            if "HTTP 404" in str(e):
+                log.info("%s already gone; nothing to clean up", what)
+                return None
+            raise
+
     def delete_recovery_point(self, rp_ext: str) -> None:
-        data, etag = self._get(f"{RECOVERY_POINTS}/{rp_ext}")
+        got = self._get_or_gone(f"{RECOVERY_POINTS}/{rp_ext}", f"recovery point {rp_ext}")
+        if got is None:
+            return
+        data, etag = got
         name = str((data.get("data") or {}).get("name", ""))
         if not name.startswith(PREFIX):
             raise SafetyGateError(f"refusing to delete recovery point {rp_ext} ({name!r}): not created by vmigrate")
@@ -378,7 +392,10 @@ class PrismV4:
         """Detach takes the iSCSI client's UUID, not its IQN (seen live: VOL-40101 "the iSCSI client
         UUID must be specified"). The UUID comes from the VG's iscsi-client-attachments, else from the
         iscsi-clients list by initiator name. Only ever acts on a vmigrate- volume group."""
-        vg = self.volume_group(vg_ext)
+        got = self._get_or_gone(f"{VOLUME_GROUPS}/{vg_ext}", f"volume group {vg_ext}")
+        if got is None:
+            return
+        vg = _need(got[0], "data")
         if not str(vg.get("name", "")).startswith(PREFIX):
             raise SafetyGateError(f"refusing to detach clients from volume group {vg_ext} ({vg.get('name')!r})")
         ids: list[str] = []
@@ -403,10 +420,13 @@ class PrismV4:
             self._task(resp, f"detach iSCSI client {cid}")
 
     def delete_volume_group(self, vg_ext: str) -> None:
-        vg = self.volume_group(vg_ext)
+        got = self._get_or_gone(f"{VOLUME_GROUPS}/{vg_ext}", f"volume group {vg_ext}")
+        if got is None:
+            return
+        data, etag = got
+        vg = _need(data, "data")
         if not str(vg.get("name", "")).startswith(PREFIX):
             raise SafetyGateError(f"refusing to delete volume group {vg_ext} ({vg.get('name')!r}): not vmigrate's")
-        _, etag = self._get(f"{VOLUME_GROUPS}/{vg_ext}")
         resp, _ = self._call("DELETE", f"{VOLUME_GROUPS}/{vg_ext}", etag=etag)
         if resp:
             self._task(resp, f"delete volume group {vg.get('name')}")
