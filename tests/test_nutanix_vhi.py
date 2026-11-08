@@ -66,6 +66,18 @@ def test_mapping_size_and_uuid_mismatch():
         to_vmspec(v3_vm("x", DISKS13), v2_vm("x", VM_UUID, bad))
 
 
+def test_mapping_v3_uuid_differs_from_vmdisk_uuid_like_real_prism():
+    # Real Prism (seen on ovin-jump): v3 disk uuid is the device id, v2 vmdisk_uuid is the storage vdisk.
+    s = to_vmspec(v3_vm("x", DISKS13), v2_vm("x", VM_UUID, DISKS13))
+    d = s.disks[0]
+    assert d.id == "vd-00" and d.source_handle["v3_uuid"] == "dev-vd-00" != d.source_handle["vmdisk_uuid"]
+    assert d.source_handle["device_uuid"] == "dev-vd-00"
+    v2 = v2_vm("x", VM_UUID, DISKS13)
+    for e in v2["vm_disk_info"]:
+        e["disk_address"].pop("device_uuid", None)        # older AOS without device_uuid: no false mismatch
+    assert len(to_vmspec(v3_vm("x", DISKS13), v2).disks) == 13
+
+
 def test_mapping_volume_group_disk_is_not_silently_dropped():
     v3 = v3_vm("x", DISKS13)
     v3["status"]["resources"]["disk_list"].append({"volume_group_reference": {"uuid": "vg"},

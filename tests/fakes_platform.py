@@ -23,7 +23,7 @@ def qcow2_header(size: int) -> bytes:
 
 
 def v3_vm(name: str, disks: list[tuple[str, int, int]], *, cdrom=True, boot_index=0, boot_type="LEGACY") -> dict:
-    dl = [{"uuid": u, "disk_size_bytes": size,
+    dl = [{"uuid": f"dev-{u}", "disk_size_bytes": size,      # real Prism: v3 uuid = device, != vmdisk_uuid
            "device_properties": {"device_type": "DISK", "disk_address": {"adapter_type": "SCSI", "device_index": idx}},
            "storage_config": {"storage_container_reference": {"uuid": "ctr-uuid"}}}
           for (u, idx, size) in disks]
@@ -46,7 +46,7 @@ def v3_vm(name: str, disks: list[tuple[str, int, int]], *, cdrom=True, boot_inde
 
 def v2_vm(name: str, uuid: str, disks: list[tuple[str, int, int]], *, power="on", cdrom=True) -> dict:
     info = [{"is_cdrom": False, "size": size, "storage_container_uuid": "ctr-uuid",
-             "disk_address": {"device_bus": "scsi", "device_index": idx, "vmdisk_uuid": u,
+             "disk_address": {"device_bus": "scsi", "device_index": idx, "vmdisk_uuid": u, "device_uuid": f"dev-{u}",
                               "ndfs_filepath": f"/{CTR}/.acropolis/vmdisk/{u}"}}
             for (u, idx, size) in disks]
     if cdrom:

@@ -324,7 +324,8 @@ class NutanixSource(SourceProvider):
             rp_disks = layout["disks"]
             pairs = []
             for d in spec.ordered_disks():
-                keys = {d.id, d.source_handle.get("v3_uuid"), d.source_handle.get("vmdisk_uuid")} - {None, ""}
+                keys = {d.id, d.source_handle.get("v3_uuid"), d.source_handle.get("device_uuid"),
+                        d.source_handle.get("vmdisk_uuid")} - {None, ""}
                 hit = [rp_disks[k] for k in keys if k in rp_disks]
                 if len(set(hit)) != 1:
                     raise SafetyGateError(f"recovery point has no unique copy of disk {d.address} ({sorted(keys)}); "

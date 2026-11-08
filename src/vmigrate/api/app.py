@@ -39,7 +39,7 @@ from starlette.concurrency import run_in_threadpool
 from ..config.loader import SECRET_KEYS
 from ..core.context import RunContext
 from ..core.cron import Cron, CronError
-from ..core.errors import ConfigError, MigrationError, ProviderNotImplemented
+from ..core.errors import ConfigError, MigrationError, ProviderError, ProviderNotImplemented
 from ..engine.dag import TERMINAL_EXEC, ExecStatus
 from ..engine.report import render_markdown
 from ..engine.safety import LEGACY_DISK_CAP, check_disk_counts
@@ -511,6 +511,20 @@ def create_app(services: Services | None = None) -> FastAPI:
             return out
         return await run_in_threadpool(go)
 
+    elog = logging.getLogger("vmigrate.api.endpoints")
+
+    async def provider_call(what: str, fn: Any) -> Any:
+        """Run a provider call in the threadpool; on failure log the full traceback on the server and
+        return the real reason to the UI (instead of a bare "Internal Server Error")."""
+        try:
+            return await run_in_threadpool(fn)
+        except HTTPException:
+            raise
+        except Exception as ex:  # noqa: BLE001 - every provider failure must reach the user with its reason
+            elog.exception("%s failed", what)
+            status = 422 if isinstance(ex, (ValueError, MigrationError)) and not isinstance(ex, ProviderError) else 502
+            raise HTTPException(status, f"{what} failed: {type(ex).__name__}: {ex}") from ex
+
     @app.get("/endpoints/{eid}/instances", tags=["endpoints"])
     async def list_instances(eid: str, p: Principal = Depends(viewer)) -> list[dict[str, Any]]:
         e = scoped(repo.get_endpoint(eid), p, "endpoint")
@@ -521,7 +535,7 @@ def create_app(services: Services | None = None) -> FastAPI:
                 return [{"id": v.id, "name": v.name} for v in src.list_vms()]
             finally:
                 src.close()
-        return await run_in_threadpool(go)
+        return await provider_call(f"listing VMs on {e['name']}", go)
 
     @app.get("/endpoints/{eid}/instances/{vm}", tags=["endpoints"])
     async def inspect_instance(eid: str, vm: str, p: Principal = Depends(viewer)) -> dict[str, Any]:
@@ -544,7 +558,7 @@ def create_app(services: Services | None = None) -> FastAPI:
                 return {"vm": spec.to_dict(), "disk_gate": gate}
             finally:
                 src.close()
-        return await run_in_threadpool(go)
+        return await provider_call(f"inspecting {vm} on {e['name']}", go)
 
     # ------------------------------------------------------------------ migrations
     def ex_out(x: dict[str, Any], counts: dict[str, dict[str, int]] | None = None,

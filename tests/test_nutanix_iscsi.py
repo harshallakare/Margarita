@@ -154,7 +154,7 @@ class FakeV4:
 
     def recovery_point_disks(self, rp):
         n = self.n - 1 if self.drop_disk else self.n
-        return {f"vd-{i:02d}": f"drp-{i:02d}" for i in range(n)}
+        return {f"dev-vd-{i:02d}": f"drp-{i:02d}" for i in range(n)}   # v4 diskExtId = device uuid
 
     def recovery_point_layout(self, rp):
         return {"vm_recovery_point": f"vmrp-{rp}", "disks": self.recovery_point_disks(rp)}
