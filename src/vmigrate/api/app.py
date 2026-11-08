@@ -999,6 +999,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         if not body.restore_point and not st.get("consistent"):
             raise HTTPException(409, "replica disks are mid-sync; finish a sync or choose a restore point")
         params = {"restore_point": body.restore_point, "deployment_id": uuid.uuid4().hex[:12],
+                  "network_map": body.network_map, "preserve_mac": body.preserve_mac,
                   "deploy_name": body.deploy_name or f"{(r['options'] or {}).get('target_name') or r['vm']}-dr"}
         return start_kind(r, "replica_deploy", body.dry_run, p, params)
 
@@ -1010,6 +1011,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         if not (r.get("state") or {}).get("syncs"):
             raise HTTPException(409, "cutover needs a completed initial sync; run the replica first")
         params = {"shutdown_source": body.shutdown_source, "force_power_off": body.force_power_off,
+                  "network_map": body.network_map, "preserve_mac": body.preserve_mac,
                   "shutdown_timeout": body.shutdown_timeout, "deployment_id": uuid.uuid4().hex[:12],
                   "cutover_id": uuid.uuid4().hex[:12],
                   "deploy_name": body.deploy_name or f"{(r['options'] or {}).get('target_name') or r['vm']}"}

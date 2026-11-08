@@ -354,7 +354,9 @@ class TargetProvider(_Provider):
     def set_boot(self, vm: VmRef, boot_disk: TargetDiskRef, firmware: Firmware, bus: DiskBus) -> None:
         """After attach: ensure boot order/firmware. No-op where prepare_boot_disk covered it."""
 
-    def check_boot(self, vm: VmRef, timeout: float = 900) -> BootCheck:
+    def check_boot(self, vm: VmRef, timeout: float = 900, *, guest_os: str | None = None,
+                   progress: Any = None) -> BootCheck:
+        """guest_os: "linux" | "windows" | None; progress(msg) reports waiting status."""
         return BootCheck(ok=True, detail="boot check not implemented for this target")
 
     @abstractmethod

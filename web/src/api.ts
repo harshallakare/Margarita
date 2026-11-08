@@ -69,6 +69,7 @@ export interface Replica {
   last_sync: SyncRecord | null; syncs: SyncRecord[];
   restore_points: { id: string; at: number; disks: Record<string, string> }[];
   deployments: { id: string; name: string; at: number; status: string; restore_point: string | null;
+                 network_map?: Record<string, string> | null;
                  target_vm?: { id: string; name: string } | null }[];
   errors: { t: number; kind: string; error: string }[];
   schedules: Schedule[]; created_at: number; updated_at: number; last_execution: Execution | null;

@@ -200,7 +200,8 @@ export default function Execution() {
               <dl className="kv small" style={{ marginTop: 12 }}>
                 <dt>Task</dt><dd className="mono">{selected.id}</dd>
                 <dt>Depends on</dt><dd className="mono">{selected.depends_on.join(", ") || "—"}</dd>
-                <dt>Attempts</dt><dd>{selected.attempts} of {selected.max_attempts}</dd>
+                <dt>Attempts</dt><dd>{selected.status === "running" ? `${selected.attempts + 1} of ${selected.max_attempts} (in progress)`
+                  : `${selected.attempts} of ${selected.max_attempts}`}</dd>
                 <dt>Started</dt><dd>{fmt.time(selected.started_at)}</dd>
                 <dt>Finished</dt><dd>{fmt.time(selected.finished_at)}</dd>
               </dl>
