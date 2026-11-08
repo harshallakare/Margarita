@@ -163,13 +163,18 @@ def test_iscsi_session_logs_out_only_its_targets():
 
 class FakeV4:
     def __init__(self, n=13, dsip="10.0.0.50", reachable=True, drop_disk=False, rp_id_lost=False,
-                 no_disk_ext=False, vg_size=None):
+                 no_disk_ext=False, vg_size=None, cdrom=False):
         self.n, self.dsip, self.reachable, self.drop_disk = n, dsip, reachable, drop_disk
         self.no_disk_ext, self.vg_size = no_disk_ext, vg_size   # Prism omits diskExtId / VG reports this size
+        self.cdrom = cdrom                     # the RP also holds an ISO-backed CD-ROM copy (seen live)
+        self.sizes = {"drp-cd": 1 << 20}
         self.rp_id_lost = rp_id_lost          # Prism created the RP but the ID could not be determined
         self.log: list[str] = []
         self.vg_map: dict[int, str] = {}
         self.named: dict[tuple[str, str], str] = {}
+
+    def size_of_drp(self, drp):
+        return self.sizes.get(drp, self.vg_size or SIZE)
 
     def find_by_name(self, kind, name):
         return self.named.get((kind, name))
@@ -191,7 +196,10 @@ class FakeV4:
 
     def recovery_point_disks(self, rp):
         n = self.n - 1 if self.drop_disk else self.n
-        return {f"dev-vd-{i:02d}": f"drp-{i:02d}" for i in range(n)}   # v4 diskExtId = device uuid
+        d = {f"dev-vd-{i:02d}": f"drp-{i:02d}" for i in range(n)}       # v4 diskExtId = device uuid
+        if self.cdrom:
+            d = {"dev-cdrom": "drp-cd", **d}            # listed FIRST, so order alone would pick it
+        return d
 
     def recovery_point_layout(self, rp):
         d = self.recovery_point_disks(rp)
@@ -207,7 +215,7 @@ class FakeV4:
         self.vg_map[index] = drp
 
     def vg_disks(self, vg):
-        return [{"ext": f"vgd-{i}", "index": i, "size": self.vg_size or SIZE} for i in sorted(self.vg_map)]
+        return [{"ext": f"vgd-{i}", "index": i, "size": self.size_of_drp(d)} for i, d in sorted(self.vg_map.items())]
 
     def attach_iscsi_client(self, vg, iqn):
         self.log.append(f"attach:{iqn}")
@@ -236,7 +244,8 @@ def iscsi_factory(fv4, devdir):
             out = []
             for idx, drp in sorted(fv4.vg_map.items()):
                 p = devdir / f"{vg_name}-lun-{idx}"
-                p.write_bytes(PatternDisk(drp.replace("drp-", "vd-"), SIZE).read(0, SIZE))
+                sz = fv4.size_of_drp(drp) if drp == "drp-cd" else SIZE
+                p.write_bytes(PatternDisk(drp.replace("drp-", "vd-"), sz).read(0, sz))
                 out.append((f"iqn.x:{vg_name}", idx, str(p)))
             return out
 
@@ -298,12 +307,26 @@ def test_rp_without_disk_ext_ids_single_disk_maps_directly(tmp_path):
     assert tgt._final(tgt.disks["RIS-Sainath-disk00"]).read_bytes() == PatternDisk("vd-00", SIZE).read(0, SIZE)
 
 
+def test_rp_with_iso_cdrom_copy_and_no_disk_ext_ids_matches_by_size(tmp_path):
+    # seen live: "recovery point covers 2 disks, the VM has 1" (the extra copy is an ISO CD-ROM)
+    fv4 = FakeV4(n=1, no_disk_ext=True, cdrom=True)
+    ctx, src, tgt, e = make(tmp_path, fv4, disks=1)
+    st = _run(src, tgt, ctx, e)
+    assert st.phase.value == "done"
+    assert sorted(fv4.vg_map.values()) == ["drp-00", "drp-cd"]            # both put in the VG ...
+    assert tgt._final(tgt.disks["RIS-Sainath-disk00"]).read_bytes() == PatternDisk("vd-00", SIZE).read(0, SIZE)
+    # ... and the identified copies (diskExtId present) never pull in the CD-ROM copy
+    fv4 = FakeV4(n=1, cdrom=True)
+    ctx, src, tgt, e = make(tmp_path / "b", fv4, disks=1)
+    assert _run(src, tgt, ctx, e).phase.value == "done" and fv4.vg_map == {0: "drp-00"}
+
+
 def test_rp_without_disk_ext_ids_equal_sizes_needs_explicit_trust(tmp_path):
     fv4 = FakeV4(no_disk_ext=True)                       # 13 disks, all the same size in this fake
     ctx, src, tgt, e = make(tmp_path, fv4)
-    with pytest.raises(SafetyGateError, match="same size.*rp_disk_order_trust"):
+    with pytest.raises(SafetyGateError, match="cannot be told apart.*rp_disk_order_trust"):
         _run(src, tgt, ctx, e)
-    assert "delete-rp" in fv4.log and not tgt.disks
+    assert "delete-vg" in fv4.log and "delete-rp" in fv4.log and not tgt.disks
     fv4 = FakeV4(no_disk_ext=True)
     ctx, src, tgt, e = make(tmp_path / "b", fv4, rp_disk_order_trust=True)
     assert _run(src, tgt, ctx, e).phase.value == "done" and fv4.vg_map == {i: f"drp-{i:02d}" for i in range(13)}
@@ -312,7 +335,7 @@ def test_rp_without_disk_ext_ids_equal_sizes_needs_explicit_trust(tmp_path):
 def test_rp_order_mapping_is_refused_when_sizes_disagree(tmp_path):
     fv4 = FakeV4(n=1, no_disk_ext=True, vg_size=SIZE * 2)
     ctx, src, tgt, e = make(tmp_path, fv4, disks=1)
-    with pytest.raises(SafetyGateError, match="Prism's disk order is not the VM's"):
+    with pytest.raises(SafetyGateError, match="no unlabelled recovery-point copy has that size"):
         _run(src, tgt, ctx, e)
     assert "delete-vg" in fv4.log and "delete-rp" in fv4.log
 

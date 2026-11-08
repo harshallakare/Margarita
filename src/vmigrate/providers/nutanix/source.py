@@ -336,7 +336,7 @@ class NutanixSource(SourceProvider):
             data["vm_recovery_point"] = layout["vm_recovery_point"]
             rp_disks = layout["disks"]
             unmapped = list(layout.get("unmapped") or [])
-            if len(rp_disks) + len(unmapped) != len(spec.disks):
+            if len(rp_disks) + len(unmapped) < len(spec.disks):
                 raise SafetyGateError(f"recovery point covers {len(rp_disks) + len(unmapped)} disks, "
                                       f"the VM has {len(spec.disks)}")
             pairs, missing = [], []
@@ -350,42 +350,55 @@ class NutanixSource(SourceProvider):
                     pairs.append((d, hit.pop()))
                 else:
                     missing.append(d)
-            by_order = bool(missing)
+            if missing and not unmapped:
+                raise SafetyGateError(f"recovery point has no copy for disks {[d.address for d in missing]} "
+                                      f"(it lists {sorted(rp_disks)})")
+            # Volume-group LUNs: the identified copies in disk order, then (only if some disk is still
+            # unidentified) every unlabelled copy. Prism may omit diskExtId and may include copies the
+            # migration does not use (seen live: an ISO-backed CD-ROM), so unlabelled copies are
+            # matched to source disks by the size Nutanix reports for each LUN.
+            pairs.sort(key=lambda p: p[0].order)
+            lun_drps = [drp for _, drp in pairs] + (unmapped if missing else [])
+            data["volume_group"] = v4.create_volume_group(name, cluster)
+            for i, drp in enumerate(lun_drps):
+                v4.add_disk_from_recovery_point(data["volume_group"], data["recovery_point"], drp, i)
+            vg_disks = v4.vg_disks(data["volume_group"])
+            if len(vg_disks) != len(lun_drps):
+                raise SafetyGateError(f"volume group has {len(vg_disks)} disks, {len(lun_drps)} were added")
+            size_at = {g["index"]: g["size"] for g in vg_disks}
+            lun_of = {drp: i for i, drp in enumerate(lun_drps)}
+            for d, drp in pairs:
+                if size_at.get(lun_of[drp]) not in (d.size_bytes, 0):
+                    raise SafetyGateError(f"disk {d.address}: its recovery-point copy is {size_at.get(lun_of[drp])} "
+                                          f"bytes, the source disk is {d.size_bytes}; refusing to copy")
             if missing:
-                # Prism did not say which disk recovery point is which disk (diskExtId absent). Take
-                # Prism's order, but only when it can be checked: every volume-group disk's size must
-                # match its source disk below, and equal-sized disks would make a swap undetectable.
-                if len(missing) != len(unmapped):
-                    raise SafetyGateError(f"recovery point has no copy for disks {[d.address for d in missing]} "
-                                          f"(it lists {sorted(rp_disks)} plus {len(unmapped)} unlabelled)")
-                sizes = [d.size_bytes for d in missing]
-                if len(set(sizes)) != len(sizes) and not self.config.get("rp_disk_order_trust", False):
-                    same = sorted({d.address for d in missing if sizes.count(d.size_bytes) > 1})
-                    raise SafetyGateError(
-                        "Prism did not report which disk recovery point belongs to which disk (no diskExtId), and "
-                        f"disks {same} have the same size, so the order cannot be verified. Set rp_disk_order_trust: "
-                        "true on the Nutanix endpoint (advanced config) to accept Prism's disk order.")
-                self.ctx.logger.warning("recovery point lists no diskExtId; mapping %d disk(s) in Prism's order, "
-                                        "checked by size after the volume group is built", len(missing))
-                pairs += list(zip(missing, unmapped))
+                free = list(unmapped)
+                trust = bool(self.config.get("rp_disk_order_trust", False))
+                for d in missing:
+                    cands = [drp for drp in free if size_at.get(lun_of[drp]) == d.size_bytes]
+                    if len(cands) > 1 and not trust:
+                        raise SafetyGateError(
+                            f"Prism did not report which disk copy belongs to disk {d.address} (no diskExtId) and "
+                            f"{len(cands)} copies have its size ({d.size_bytes} bytes), so it cannot be told apart. "
+                            "Set rp_disk_order_trust: true on the Nutanix endpoint (advanced config) to accept "
+                            "Prism's order.")
+                    if not cands:
+                        seen = sorted({size_at.get(lun_of[x]) for x in free})
+                        raise SafetyGateError(
+                            f"disk {d.address} ({d.size_bytes} bytes): no unlabelled recovery-point copy has that "
+                            f"size (copies: {seen} bytes); refusing to guess")
+                    pairs.append((d, cands[0]))
+                    free.remove(cands[0])
+                if free:
+                    self.ctx.logger.info("recovery point holds %d extra disk copy(ies) not migrated (e.g. a CD-ROM "
+                                         "with an ISO); sizes %s", len(free), [size_at.get(lun_of[x]) for x in free])
+                self.ctx.logger.warning("recovery point lists no diskExtId; %d disk(s) matched to their copies by "
+                                        "size", len(missing))
                 pairs.sort(key=lambda p: p[0].order)
             data["disk_rps"] = {d.id: drp for d, drp in pairs}
-            data["disk_map_by_order"] = by_order
-            data["volume_group"] = v4.create_volume_group(name, cluster)
-            for d, drp in pairs:
-                v4.add_disk_from_recovery_point(data["volume_group"], data["recovery_point"], drp, d.order)
-            vg_disks = v4.vg_disks(data["volume_group"])
-            if len(vg_disks) != len(spec.disks):
-                raise SafetyGateError(f"volume group has {len(vg_disks)} disks, the VM has {len(spec.disks)}")
-            if by_order:
-                got = {g["index"]: g["size"] for g in vg_disks}
-                for d in spec.disks:
-                    if got.get(d.order) not in (d.size_bytes, 0):
-                        raise SafetyGateError(
-                            f"disk {d.address}: volume-group disk {d.order} is {got.get(d.order)} bytes, the source "
-                            f"disk is {d.size_bytes}; Prism's disk order is not the VM's, refusing to copy")
+            data["disk_map_by_size"] = bool(missing)
             data["vg_disks"] = vg_disks
-            data["disk_index"] = {d.id: d.order for d in spec.disks}
+            data["disk_index"] = {d.id: lun_of[drp] for d, drp in pairs}
             v4.attach_iscsi_client(data["volume_group"], iqn)
             data["attached"] = True
         except Exception:
@@ -465,7 +478,10 @@ class NutanixSource(SourceProvider):
 
     def snapshot_disk_count(self, snapshot: SnapshotRef) -> int | None:
         if snapshot.data.get("transport") == "iscsi":
-            return len(self._devices(snapshot))       # LUNs actually visible on this worker
+            # LUNs actually visible on this worker that hold a VM disk's copy (a volume group may also
+            # carry an unused copy, e.g. an ISO CD-ROM in the recovery point; it is not migrated)
+            devs = self._devices(snapshot)
+            return len({i for i in (snapshot.data.get("disk_index") or {}).values() if i in devs})
         return len(snapshot.data.get("disk_paths", {}))
 
     def open_disk(self, snapshot: SnapshotRef, disk: DiskSpec) -> DiskReader:
