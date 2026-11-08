@@ -511,3 +511,38 @@ def test_crt_falls_back_cleanly(tmp_path):
     _, nocrt, _, _ = make(tmp_path / "b", CrtV4(), crt=False)
     s = _snap(nocrt, "run3")
     assert not nocrt.supports_cbt() and nocrt.retire_snapshot(s, None).data == {}   # crt off: RP deleted as before
+
+
+def test_v4_detach_iscsi_client_uses_the_client_uuid():
+    # seen live: detach with {"iscsiInitiatorName"} -> HTTP 400 VOL-40101 "the iSCSI client UUID must be
+    # specified", and the volume group could then not be deleted (client still attached)
+    vg = f"{v4.VOLUME_GROUPS}/vg-1"
+    sent = []
+
+    def detach(body):
+        sent.append(body)
+        if "extId" not in body:
+            return Resp(400, {"data": {"error": [{"code": "VOL-40101"}]}})
+        return Resp(202, {"data": {"extId": "t-d"}})
+    done = {"data": {"status": "SUCCEEDED"}}
+    s = Session({("GET", vg): Resp(200, {"data": {"name": "vmigrate-r"}}),
+                 ("GET", f"{vg}/iscsi-client-attachments"): Resp(200, {"data": [
+                     {"extId": "client-9", "clusterReference": "cl"}]}),
+                 ("POST", f"{vg}/$actions/detach-iscsi-client"): detach,
+                 ("GET", f"{v4.TASKS}/t-d"): Resp(200, done)})
+    api = v4.PrismV4(s, "https://pc:9440", sleep=lambda x: None)
+    api.detach_iscsi_client("vg-1", "iqn.1994-05.com.redhat:worker1")
+    assert sent == [{"extId": "client-9"}]
+    # attachment listing unavailable -> client found by its IQN
+    flt = f"{v4.ISCSI_CLIENTS}?$filter=iscsiInitiatorName%20eq%20'iqn.x%3Aw1'"
+    s2 = Session({("GET", vg): Resp(200, {"data": {"name": "vmigrate-r"}}),
+                  ("GET", flt): Resp(200, {"data": [{"extId": "client-3", "iscsiInitiatorName": "iqn.x:w1"}]}),
+                  ("POST", f"{vg}/$actions/detach-iscsi-client"): detach,
+                  ("GET", f"{v4.TASKS}/t-d"): Resp(200, done)})
+    sent.clear()
+    v4.PrismV4(s2, "https://pc:9440", sleep=lambda x: None).detach_iscsi_client("vg-1", "iqn.x:w1")
+    assert sent == [{"extId": "client-3"}]
+    # never touches someone else's volume group
+    s3 = Session({("GET", vg): Resp(200, {"data": {"name": "prod-vg"}})})
+    with pytest.raises(SafetyGateError):
+        v4.PrismV4(s3, "https://pc:9440").detach_iscsi_client("vg-1", "iqn.x:w1")
