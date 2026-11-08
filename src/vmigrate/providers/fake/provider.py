@@ -18,6 +18,7 @@ Replica simulation (source): `generation: N` advances the disks N "change genera
 generation rewrites ~1/8 of the 64 KiB blocks. A snapshot captures the generation it was taken at.
 `cbt: true` makes changed_regions() report exactly the blocks changed between two snapshots
 (like Nutanix CRT / VMware CBT); without it the engine falls back to full read + compare.
+`change_limit: <bytes>` confines changes to the start of each disk (tests of localized writes).
 """
 
 from __future__ import annotations
@@ -57,8 +58,10 @@ def _changed_in(seed: bytes, i: int, gen: int) -> bool:
 
 
 class PatternDisk(DiskReader):
-    def __init__(self, seed: str, size: int, *, fail_at: int | None = None, generation: int = 0):
+    def __init__(self, seed: str, size: int, *, fail_at: int | None = None, generation: int = 0,
+                 change_limit: int | None = None):
         self.seed = seed.encode()
+        self.change_limit = change_limit
         self._size = size
         self.fail_at = fail_at
         self.reads = 0
@@ -66,14 +69,19 @@ class PatternDisk(DiskReader):
 
     def changed_blocks(self, base: int, cur: int) -> list[int]:
         nblocks = -(-self._size // _BLOCK)
-        return [i for i in range(nblocks) if any(_changed_in(self.seed, i, g) for g in range(base + 1, cur + 1))]
+        return [i for i in range(nblocks) if any(self._changed(i, g) for g in range(base + 1, cur + 1))]
+
+    def _changed(self, i: int, gen: int) -> bool:
+        if self.change_limit is not None and i * _BLOCK >= self.change_limit:
+            return False
+        return _changed_in(self.seed, i, gen)
 
     @property
     def size(self) -> int:
         return self._size
 
     def _block(self, i: int) -> bytes:
-        last = next((g for g in range(self.generation, 0, -1) if _changed_in(self.seed, i, g)), 0)
+        last = next((g for g in range(self.generation, 0, -1) if self._changed(i, g)), 0)
         if last:
             h = hashlib.sha256(self.seed + i.to_bytes(8, "little") + b"g" + last.to_bytes(4, "little")).digest()
             return (h * (_BLOCK // len(h)))[:_BLOCK]
@@ -167,7 +175,7 @@ class FakeSource(SourceProvider):
         if not snapshot.id:
             raise LiveDiskReadRefused("fake: snapshot required")
         r = PatternDisk(disk.source_handle["seed"], disk.size_bytes, fail_at=self.fail_read_at,
-                        generation=int(snapshot.data.get("generation", 0)))
+                        generation=int(snapshot.data.get("generation", 0)), change_limit=self._change_limit())
         delay = float(self.config.get("read_delay") or 0)     # demos: make copies slow enough to watch
         if delay > 0:
             import time as _time
@@ -182,10 +190,14 @@ class FakeSource(SourceProvider):
     def supports_cbt(self) -> bool:
         return self.cbt
 
+    def _change_limit(self) -> int | None:
+        v = self.config.get("change_limit")
+        return int(v) if v else None
+
     def changed_regions(self, disk: DiskSpec, base: CheckpointRef, cur: CheckpointRef) -> list[ByteRange]:
         if not self.cbt:
             raise NotImplementedError("fake: cbt disabled")
-        pd = PatternDisk(disk.source_handle["seed"], disk.size_bytes)
+        pd = PatternDisk(disk.source_handle["seed"], disk.size_bytes, change_limit=self._change_limit())
         blocks = pd.changed_blocks(int(base.data.get("generation", 0)), int(cur.data.get("generation", 0)))
         return normalize(ByteRange(i * _BLOCK, min(_BLOCK, disk.size_bytes - i * _BLOCK)) for i in blocks)
 

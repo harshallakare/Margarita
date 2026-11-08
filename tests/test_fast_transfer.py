@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from vmigrate.core.fileio import RawFileWriter
+from vmigrate.core.fileio import RawFileReader, RawFileWriter
 from vmigrate.core.interfaces import DiskReader
 from vmigrate.core.ranges import ByteRange
 from vmigrate.engine.copier import HASH_BLOCK, BlockHashes, CopyCancelled, RateMeter, align_ranges, copy_disk
@@ -170,3 +170,81 @@ def test_interrupted_sync_never_leaves_trusted_checksums(rep):  # noqa: F811
     assert all(t["result"]["checksums"] for t in reps)
     from .test_replica import _expected
     assert all(rep.replica_bytes(i) == _expected(i, 1) for i in range(3))
+
+
+def test_partial_checksums_round_trip_and_invalidate():
+    h = BlockHashes(4 * MB + 5)                      # 5 blocks, the last one short
+    assert not h.has_base and h.coverage() == 0
+    h.fill_zero()
+    full = h.to_bytes()
+    assert len(full) == 5 * 32 and BlockHashes(4 * MB + 5, full).complete()      # old (complete) format still loads
+    h.invalidate([ByteRange(MB + 10, 1), ByteRange(4 * MB, 5)])                   # touches blocks 1 and 4
+    part = BlockHashes(4 * MB + 5, h.to_bytes())
+    assert part.has_base and not part.complete() and part.coverage() == 0.6
+    assert part.get(0) is not None and part.get(1) is None and part.get(4) is None
+
+
+def test_partial_checksums_read_back_only_the_unknown_blocks(tmp_path):
+    size = 8 * MB
+    data = bytearray(PatternDisk("q", size).read(0, size))
+    h = BlockHashes(size)
+    with RawFileWriter(tmp_path / "r.raw", size) as w:
+        h.fill_zero()
+        copy_disk(Mutable(data), w, chunk_size=4 * MB, hashes=h)
+    h.invalidate([ByteRange(2 * MB, 2 * MB)])        # blocks 2-3: written by a sync whose checksums were lost
+    data[2 * MB + 7] ^= 0xFF                         # one byte in an unknown block changes ...
+    data[6 * MB + 7] ^= 0xFF                         # ... and one in a known block
+
+    class Replica(RawFileReader):
+        read_bytes = 0
+
+        def read(self, offset, length):
+            Replica.read_bytes += length
+            return super().read(offset, length)
+    rep = Replica(tmp_path / "r.raw")
+    h2 = BlockHashes(size, h.to_bytes())
+    with RawFileWriter(tmp_path / "r.raw", size) as w:
+        w.prezeroed = False
+        st = copy_disk(Mutable(data), w, chunk_size=4 * MB, hashes=h2, compare=rep)
+    rep.close()
+    assert Replica.read_bytes == 2 * MB                               # only the unknown blocks were read back
+    assert st.bytes_written == (64 << 10) + MB      # unknown block: the 64 KiB piece; known block: the whole 1 MiB
+    assert (tmp_path / "r.raw").read_bytes() == bytes(data) and h2.complete()
+
+
+def test_cbt_sync_keeps_checksums_and_one_failed_sync_loses_only_its_blocks(rep):  # noqa: F811
+    lim = 2 * MB                                  # writes land in the first 2 of 9 MiB (localized, like real VMs)
+
+    def src(gen, **kw):
+        rep.set_source(generation=gen, change_limit=lim, **kw)
+
+    def expected(i, gen):
+        return PatternDisk(f"RIS-Sainath:{i}", 9 * MB, generation=gen, change_limit=lim).read(0, 9 * MB)
+
+    def disk_results(x):
+        return [t["result"] for t in rep.c.get(f"/executions/{x['id']}/tasks", headers=rep.admin).json()
+                if t["kind"] == "replicate_disk"]
+    src(0)
+    assert rep.run("execute")["status"] == "completed"                # full: complete checksums
+    src(1)                                                            # cbt touches <= 2 blocks per disk
+    x = rep.run("execute")
+    res = disk_results(x)
+    assert all(r["mode"] == "cbt" and r["checksum_coverage"] >= 7 / 9 for r in res), res   # was: all dropped
+    src(2, cbt=False, fail_read_at=1 << 20)                           # a compare sync dies: checksums cleared
+    assert rep.run("execute")["status"] == "failed"
+    src(2)
+    assert rep.run("execute")["status"] == "completed"                # cbt: nothing to build on yet
+    src(3, cbt=False)                                                 # compare reads the replica, rebuilds all
+    x = rep.run("execute")
+    assert x["status"] == "completed", x
+    assert all(r["compare_by"] == "compare (reading replica)" and r["checksums"] for r in disk_results(x))
+    src(4)                                                            # cbt: unaligned writes forget only their blocks
+    x = rep.run("execute")
+    res = disk_results(x)
+    assert all(r["mode"] == "cbt" and 7 / 9 <= r["checksum_coverage"] for r in res), res
+    src(5, cbt=False)                                                 # fallback reads back only those blocks
+    x = rep.run("execute")
+    assert x["status"] == "completed", x
+    res = disk_results(x)
+    assert all(r["checksums"] and r["compare_by"].startswith("compare (checksums") for r in res), res
+    assert all(rep.replica_bytes(i) == expected(i, 5) for i in range(3))
