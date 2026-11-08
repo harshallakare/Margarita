@@ -546,3 +546,19 @@ def test_v4_detach_iscsi_client_uses_the_client_uuid():
     s3 = Session({("GET", vg): Resp(200, {"data": {"name": "prod-vg"}})})
     with pytest.raises(SafetyGateError):
         v4.PrismV4(s3, "https://pc:9440").detach_iscsi_client("vg-1", "iqn.x:w1")
+
+
+def test_v4_cleanup_is_safe_to_repeat_when_objects_are_already_gone():
+    # seen live: a retried finalize hit DP-10400 "Recovery point ... does not exist" (removed by the
+    # previous attempt) and failed; already-gone objects must count as cleaned up
+    gone = Resp(404, {"data": {"error": [{"code": "DP-10400", "message": "does not exist in IDF"}]}})
+    s = Session({("GET", f"{v4.RECOVERY_POINTS}/rp-x"): gone, ("GET", f"{v4.VOLUME_GROUPS}/vg-x"): gone})
+    api = v4.PrismV4(s, "https://pc:9440")
+    api.delete_recovery_point("rp-x")
+    api.delete_volume_group("vg-x")
+    api.detach_iscsi_client("vg-x", "iqn.x:w1")
+    assert not [c for c in s.calls if c[0] != "GET"]               # nothing else attempted
+    # other errors still surface
+    s2 = Session({("GET", f"{v4.RECOVERY_POINTS}/rp-x"): Resp(403, {"error": "forbidden"})})
+    with pytest.raises(ProviderError, match="HTTP 403"):
+        v4.PrismV4(s2, "https://pc:9440").delete_recovery_point("rp-x")
