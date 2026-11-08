@@ -40,12 +40,13 @@ class V3Disk:
 
 @dataclass(frozen=True)
 class V2Disk:
-    vmdisk_uuid: str
+    vmdisk_uuid: str                 # the storage vdisk (backs ndfs_filepath) — NOT the v3 disk uuid
     bus: DiskBus
     index: int
     size_bytes: int
     ndfs_filepath: str
     container_uuid: str | None
+    device_uuid: str = ""            # the VM disk device — the same id as v3 disk_list[].uuid / v4 diskExtId
 
 
 def _resources(v3: dict[str, Any]) -> dict[str, Any]:
@@ -89,7 +90,7 @@ def disks_v2(v2: dict[str, Any]) -> list[V2Disk]:
         out.append(V2Disk(
             vmdisk_uuid=a.get("vmdisk_uuid", ""), bus=bus, index=int(a.get("device_index", -1)),
             size_bytes=int(d.get("size", 0)), ndfs_filepath=a.get("ndfs_filepath", ""),
-            container_uuid=d.get("storage_container_uuid"),
+            container_uuid=d.get("storage_container_uuid"), device_uuid=a.get("device_uuid", ""),
         ))
     return out
 
@@ -138,13 +139,17 @@ def to_vmspec(v3: dict[str, Any], v2: dict[str, Any]) -> VmSpec:
         d3, d2 = a_addr[key], b_addr[key]
         if d3.size_bytes != d2.size_bytes:
             raise NutanixMappingError(f"{name}: size mismatch at {key[0].value}.{key[1]}: v3 {d3.size_bytes} v2 {d2.size_bytes}")
-        if d3.uuid and d2.vmdisk_uuid and d3.uuid != d2.vmdisk_uuid:
-            raise NutanixMappingError(f"{name}: vmdisk uuid mismatch at {key}: v3 {d3.uuid} v2 {d2.vmdisk_uuid}")
+        # v3 disk uuid == v2 device_uuid (the disk device). v2 vmdisk_uuid is the storage vdisk and is
+        # legitimately different, so it is never compared with the v3 uuid.
+        if d3.uuid and d2.device_uuid and d3.uuid != d2.device_uuid:
+            raise NutanixMappingError(f"{name}: disk uuid mismatch at {key[0].value}.{key[1]}: "
+                                      f"v3 {d3.uuid} v2 device_uuid {d2.device_uuid}")
         disks.append(DiskSpec(
             id=d2.vmdisk_uuid or d3.uuid, bus=key[0], size_bytes=d3.size_bytes, order=order,
             is_boot=key == boot_addr, bus_index=key[1], controller=_CONTROLLER.get(key[0]),
             source_handle={"vmdisk_uuid": d2.vmdisk_uuid, "ndfs_filepath": d2.ndfs_filepath,
-                           "container_uuid": d2.container_uuid or d3.container_uuid, "v3_uuid": d3.uuid},
+                           "container_uuid": d2.container_uuid or d3.container_uuid, "v3_uuid": d3.uuid,
+                           "device_uuid": d2.device_uuid or d3.uuid},
         ))
 
     nics = []

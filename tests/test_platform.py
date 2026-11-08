@@ -123,6 +123,14 @@ def test_wizard_inspect_surfaces_true_disk_count_and_gate(plat):
     assert v["ok"] and set(v["roles"]) == {"source", "target"}
 
 
+def test_inspect_failure_returns_real_reason_not_bare_500(plat):
+    src, _ = plat.endpoints()
+    r = plat.c.get(f"/endpoints/{src}/instances/no-such-vm", headers=plat.viewer)
+    assert r.status_code == 502
+    d = r.json()["detail"]
+    assert "inspecting no-such-vm" in d and "ProviderError" in d and "no VM 'no-such-vm'" in d
+
+
 def test_dry_run_is_default_and_changes_nothing(plat):
     src, tgt = plat.endpoints()
     mid = plat.migration(src, tgt)
