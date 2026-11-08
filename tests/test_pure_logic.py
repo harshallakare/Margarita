@@ -188,6 +188,12 @@ def test_osmorph_registry_and_policy():
     # bus changes -> virtio injection required, not automated -> manual_required
     res = resolve(OsFamily.LINUX, "kvm").run(MorphRequest(s, "kvm", DiskBus.VIRTIO, []), ctx)
     assert res.status == "manual_required"
-    # unknown cells never silently pass
+    # Windows from a non-virtio controller with no tools here -> manual, never silently passed
+    for d in s.disks:
+        d.controller = "pvscsi"
     assert resolve(OsFamily.WINDOWS, "kvm").run(MorphRequest(s, "kvm", DiskBus.SCSI, []), ctx).status == "manual_required"
+    # Windows already on virtio-scsi, same bus (AHV -> VHI): drivers present, nothing required
+    for d in s.disks:
+        d.controller = "virtio-scsi"
+    assert resolve(OsFamily.WINDOWS, "kvm").run(MorphRequest(s, "kvm", DiskBus.SCSI, []), ctx).status == "planned"
     assert resolve(OsFamily.LINUX, "aws").name == "manual"
