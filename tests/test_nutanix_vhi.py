@@ -184,8 +184,18 @@ def test_boot_metadata():
 
 
 def test_auth_scoping():
-    with pytest.raises(Exception, match="project_id"):
-        auth_kwargs({"auth_url": "u", "username": "a", "project_name": "p"})
+    with pytest.raises(Exception, match="project_id, or project_name"):
+        auth_kwargs({"auth_url": "u", "username": "a"})
+    # Coriolis-style: project name + project domain
+    kw = auth_kwargs({"auth_url": "u", "username": "a", "password": "p", "project_name": "Medimaze",
+                      "project_domain_name": "Medimaze", "user_domain_name": "Medimaze"})
+    assert kw["project_name"] == "Medimaze" and kw["project_domain_name"] == "Medimaze" and "project_id" not in kw
+    kw = auth_kwargs({"auth_url": "u", "username": "a", "project_name": "P", "user_domain_name": "corp"})
+    assert kw["project_domain_name"] == "corp"                 # defaults to the user's domain
+    with pytest.raises(Exception, match="project_domain_name"):
+        auth_kwargs({"auth_url": "u", "username": "a", "project_name": "P", "user_domain_id": "d1"})
+    kw = auth_kwargs({"auth_url": "u", "username": "a", "project_id": "pid", "project_name": "ignored"})
+    assert kw["project_id"] == "pid" and "project_name" not in kw   # the ID wins when both are given
     kw = auth_kwargs({"auth_url": "u", "username": "a", "password": "p", "project_id": "pid", "user_domain_name": "corp"})
     assert kw["project_id"] == "pid" and kw["load_envvars"] is False and "project_name" not in kw
     env = {"OS_PROJECT_NAME": "x", "OS_PROJECT_DOMAIN_ID": "y", "OS_AUTH_URL": "keep"}
@@ -201,6 +211,13 @@ def _tgt(tmp_path, dry=False, api=None, qemu=None, **cfg):
             "staging_dir": str(tmp_path / "staging"), "chown_backing": False, "poll_interval": 0,
             "network_map": {"VLAN-120": "uuid-net120"}, **cfg}
     return VhiTarget("vhi", conf, ctx, api=api, qemu=qemu or FakeQemu()), api
+
+
+def test_vhi_project_by_name_and_domain_validates(tmp_path):
+    t, _ = _tgt(tmp_path, project_id="", project_name="Medimaze", project_domain_name="Medimaze")
+    assert t.check_connection() == []                 # no project_id to compare: Keystone scoped by name
+    t2, _ = _tgt(tmp_path / "b", project_id="other")
+    assert "expected other" in t2.check_connection()[0]
 
 
 def test_vhi_volume_type_is_optional_cinder_default_used(tmp_path):

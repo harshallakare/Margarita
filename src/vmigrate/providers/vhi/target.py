@@ -9,7 +9,8 @@ Usage (config):
         username: admin
         password: ${VHI_PASSWORD}
         user_domain_name: Default
-        project_id: 0123abcd...               # scope by ID (pitfall 7)
+        project_id: 0123abcd...               # scope by ID (pitfall 7) - or instead:
+        # project_name: Medimaze, project_domain_name: Medimaze
         verify_tls: false
         volume_type: vmds                     # optional: Cinder volume type (default: Cinder's default type)
         multiattach_volume_type: vmds-shared  # optional: type with multiattach="<is> True" (cluster shared disks)
@@ -57,6 +58,7 @@ from ...core.interfaces import (
     VmRef,
 )
 from ...core.retry import poll_until
+from ..common.openstack_auth import project_problem
 from ...ir import DiskBus, Firmware, VmSpec
 from .qemu import (
     QemuImageReader,
@@ -165,10 +167,7 @@ class VhiTarget(TargetProvider):
             pid = self.api.current_project_id()
         except Exception as e:  # noqa: BLE001
             return [f"cannot authenticate to VHI/Keystone: {e}"]
-        p = []
-        if pid != self.config.get("project_id"):
-            p.append(f"token scoped to project {pid}, expected {self.config.get('project_id')} "
-                     "(grant the user a role on the target project)")
+        p = project_problem(pid, self.config)
         if self.volume_type and not self.api.find_volume_type(self.volume_type):
             p.append(f"volume type {self.volume_type!r} not found")
         return p
@@ -177,9 +176,7 @@ class VhiTarget(TargetProvider):
         p: list[str] = []
         try:
             pid = self.api.current_project_id()
-            if pid != self.config.get("project_id"):
-                p.append(f"token scoped to project {pid}, expected {self.config.get('project_id')} "
-                         "(clear OS_PROJECT_* env vars; grant the user a role on the target project)")
+            p += project_problem(pid, self.config)
         except Exception as e:  # noqa: BLE001 - report, don't crash preflight
             p.append(f"cannot authenticate to VHI/Keystone: {e}")
             return p
