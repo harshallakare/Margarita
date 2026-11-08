@@ -150,8 +150,21 @@ export default function MigrationDetail() {
                 <td><Check ok={d.attached} /></td>
                 <td>{d.verify ? <Check ok={!!d.verify.ok} label={d.verify.ok ? "sampled match" : "mismatch"} /> : <span className="muted">—</span>}</td></tr>))}</tbody>
           </table></div>
-          {r.errors.length > 0 && <div className="alert bad" style={{ marginTop: 16 }}><b>Errors</b>
-            <pre>{r.errors.map((e) => `[${e.phase}] ${e.error}`).join("\n")}</pre></div>}
+          {r.errors.length > 0 && (r.phase === "done" ? (
+            // finished: errors from earlier attempts were fixed by retries; keep them as history only
+            <details className="small" style={{ marginTop: 16 }}>
+              <summary className="muted" style={{ cursor: "pointer" }}>
+                {r.errors.length} error{r.errors.length > 1 ? "s" : ""} from earlier attempts (resolved by retries; show history)</summary>
+              <pre className="mono small" style={{ whiteSpace: "pre-wrap" }}>{r.errors.map((e) => `[${e.phase}] ${e.error}`).join("\n")}</pre>
+            </details>
+          ) : (<>
+            <div className="alert bad" style={{ marginTop: 16 }}><b>Latest error</b>
+              <pre style={{ whiteSpace: "pre-wrap" }}>{(() => { const e = r.errors[r.errors.length - 1]; return `[${e.phase}] ${e.error}`; })()}</pre></div>
+            {r.errors.length > 1 && <details className="small" style={{ marginTop: 8 }}>
+              <summary className="muted" style={{ cursor: "pointer" }}>{r.errors.length - 1} earlier error(s)</summary>
+              <pre className="mono small" style={{ whiteSpace: "pre-wrap" }}>{r.errors.slice(0, -1).map((e) => `[${e.phase}] ${e.error}`).join("\n")}</pre>
+            </details>}
+          </>))}
         </div>
       )}
 
