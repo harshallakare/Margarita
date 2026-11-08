@@ -54,6 +54,7 @@ from ...core.fileio import RawFileReader
 from ...core.interfaces import CheckpointRef, DiskReader, SnapshotRef, SourceProvider, VmRef
 from ...core.ranges import ByteRange, normalize
 from ...ir import DiskSpec, VmSpec
+from ..common.openstack_auth import project_problem
 from . import mapping
 from .cloud import PREFIX
 
@@ -184,8 +185,7 @@ class OpenstackSource(SourceProvider):
             pid = self.cloud.project_id()
         except Exception as e:  # noqa: BLE001
             return [f"cannot authenticate to OpenStack: {e}"]
-        return [] if pid == self.config.get("project_id") else [
-            f"token scoped to project {pid}, expected {self.config.get('project_id')}"]
+        return project_problem(pid, self.config)
 
     def preflight(self, spec: VmSpec | None = None) -> list[str]:
         try:
