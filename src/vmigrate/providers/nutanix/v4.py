@@ -38,8 +38,10 @@ response is checked for the fields we use, so a mismatch fails loudly with the r
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -172,11 +174,50 @@ class PrismV4:
             self.sleep(self.poll)
 
     @staticmethod
-    def _affected(task: dict[str, Any], rel_contains: str) -> str:
+    def _affected(task: dict[str, Any], kind: str) -> str | None:
+        """ID of the object a v4 task created. Prism reports it in entitiesAffected (rel spelled e.g.
+        dataprotection:config:recovery-point) or only in completionDetails, depending on the
+        version; seen live: a CreateRecoveryPoint task listing just the VM. None when absent."""
+        want = re.sub(r"[^a-z]", "", kind.lower())                       # "recoverypoint"
         for e in task.get("entitiesAffected") or []:
-            if rel_contains in str(e.get("rel", "")):
-                return e["extId"]
-        raise ProviderError(f"task did not report a created {rel_contains}: {str(task)[:500]}")
+            if want in re.sub(r"[^a-z]", "", str(e.get("rel", "")).lower()) and e.get("extId"):
+                return str(e["extId"])
+        for d in task.get("completionDetails") or []:
+            n = re.sub(r"[^a-z]", "", str(d.get("name", "")).lower())
+            v = d.get("value")
+            v = v.get("value") if isinstance(v, dict) else v
+            if v and isinstance(v, str) and (want in n or n in ("extid", "entityextid")):
+                return v
+        return None
+
+    def _created(self, task: dict[str, Any], kind: str, collection: str, name: str) -> str:
+        """The created object's ID from the task, else by its unique vmigrate- name."""
+        got = self._affected(task, kind)
+        if got:
+            return got
+        log.info("task for %s %s did not report its ID; looking it up by name", kind, name)
+        hits = [x for x in self._list_named(collection, name) if x.get("name") == name and x.get("extId")]
+        if len(hits) == 1:
+            return str(hits[0]["extId"])
+        raise ProviderError(f"{kind} {name!r} was created but its ID could not be determined "
+                            f"({len(hits)} objects with that name); task: {str(task)[:1500]}")
+
+    def find_by_name(self, kind: str, name: str) -> str | None:
+        """ID of the vmigrate-created recovery point / volume group with exactly this name, else None."""
+        if not name.startswith(PREFIX):
+            raise SafetyGateError(f"refusing to look up {name!r}: not a vmigrate name")
+        coll = {"recovery-point": RECOVERY_POINTS, "volume-group": VOLUME_GROUPS}[kind]
+        hits = [x for x in self._list_named(coll, name) if x.get("name") == name and x.get("extId")]
+        return str(hits[0]["extId"]) if len(hits) == 1 else None
+
+    def _list_named(self, collection: str, name: str) -> list[dict[str, Any]]:
+        try:
+            flt = quote(f"name eq '{name}'", safe="'=")
+            data, _ = self._get(f"{collection}?$filter={flt}")
+            return data.get("data") or []
+        except ProviderError:                    # $filter not supported here: scan the first page
+            data, _ = self._get(f"{collection}?$limit=100")
+            return data.get("data") or []
 
     # ------------------------------------------------------------------ clusters
     def clusters(self) -> list[dict[str, Any]]:
@@ -200,7 +241,7 @@ class PrismV4:
     def create_recovery_point(self, vm_ext: str, name: str, *, app_consistent: bool) -> str:
         resp, _ = self._call("POST", RECOVERY_POINTS, body=recovery_point_body(vm_ext, name, app_consistent))
         task = self._task(resp, f"recovery point {name}")
-        return self._affected(task, "recovery-point")
+        return self._created(task, "recovery-point", RECOVERY_POINTS, name)
 
     def recovery_point_layout(self, rp_ext: str) -> dict[str, Any]:
         """{vm_recovery_point: ext, disks: {vm disk ext: disk recovery point ext}} (single-VM recovery point)."""
@@ -286,7 +327,7 @@ class PrismV4:
     # ------------------------------------------------------------------ volume groups
     def create_volume_group(self, name: str, cluster_ext: str) -> str:
         resp, _ = self._call("POST", VOLUME_GROUPS, body=volume_group_body(name, cluster_ext))
-        return self._affected(self._task(resp, f"volume group {name}"), "volume-group")
+        return self._created(self._task(resp, f"volume group {name}"), "volume-group", VOLUME_GROUPS, name)
 
     def volume_group(self, vg_ext: str) -> dict[str, Any]:
         data, _ = self._get(f"{VOLUME_GROUPS}/{vg_ext}")
