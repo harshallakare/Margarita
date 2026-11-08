@@ -154,12 +154,20 @@ class CutoverRequest(BaseModel):
     force_power_off: bool = False         # hard power-off instead of a guest shutdown
     shutdown_timeout: int = Field(900, ge=30, le=7200)
     deploy_name: str | None = None        # default: the VM's name (a cutover takes over its identity)
+    network_map: dict[str, str] | None = Field(
+        None, description="this run only: source network -> target network (e.g. an isolated test network to avoid "
+                          "IP conflicts); unset networks keep the replica's mapping")
+    preserve_mac: bool | None = Field(None, description="this run only: override the replica's preserve_mac")
 
 
 class DeployRequest(BaseModel):
     dry_run: bool = True
     restore_point: str | None = Field(None, description="restore point id; default = latest completed sync")
     deploy_name: str | None = Field(None, pattern=NAME, description="VM name on the target (default <vm>-dr)")
+    network_map: dict[str, str] | None = Field(
+        None, description="this run only: source network -> target network (e.g. an isolated test network to avoid "
+                          "IP conflicts); unset networks keep the replica's mapping")
+    preserve_mac: bool | None = Field(None, description="this run only: override the replica's preserve_mac")
 
 
 class ScheduleCreate(BaseModel):

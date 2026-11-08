@@ -485,7 +485,8 @@ class MigrationRunner:
             "disks_verified": sum(1 for d in self.state.disks.values() if (d.verify or {}).get("ok")),
         }
         if self.engine.boot_check:
-            bc = self.target.check_boot(vm, timeout=self.engine.boot_timeout)
+            bc = self.target.check_boot(vm, timeout=self.engine.boot_timeout, guest_os=spec.guest_os.family.value,
+                                        progress=self.log.info)
             summary["boot"] = {"ok": bc.ok, "detail": bc.detail, "evidence": bc.evidence[-2000:]}
             if not bc.ok:
                 with self._lock:

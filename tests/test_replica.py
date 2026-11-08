@@ -247,3 +247,22 @@ def test_cutover_without_shutdown_and_shutdown_failure(rep):
     assert x["status"] == "failed" and "guest did not respond" in x["error"]
     c = rep.get()["cutovers"][0]
     assert c["status"] == "failed" and "ris-b" not in rep.registry()["vms"]   # nothing deployed after a failed stop
+
+
+def test_deploy_and_cutover_can_use_an_isolated_network_for_that_run(rep):
+    # test failover: boot the copy on an isolated network so it cannot clash with the running source's IPs
+    rep.c.patch(f"/replicas/{rep.rid}", headers=rep.admin,
+                json={"options": {"retention": 2, "target_options": {"network_map": {"VLAN-120": "prod-net",
+                                                                                     "VLAN-130": "backup-net"}}}})
+    rep.run("execute")
+    x = rep.run("deploy", {"dry_run": False, "deploy_name": "ris-test", "network_map": {"VLAN-120": "isolated-test"}})
+    assert x["status"] == "completed", x
+    vm = rep.registry()["vms"]["ris-test"]
+    assert vm["network_map"] == {"VLAN-120": "isolated-test", "VLAN-130": "backup-net"}   # only the named one changed
+    assert rep.get()["deployments"][-1]["network_map"] == {"VLAN-120": "isolated-test"}
+    # the replica's own mapping is untouched; a deploy without an override uses it
+    assert rep.run("deploy", {"dry_run": False, "deploy_name": "ris-plain"})["status"] == "completed"
+    assert rep.registry()["vms"]["ris-plain"]["network_map"] == {"VLAN-120": "prod-net", "VLAN-130": "backup-net"}
+    x = rep.run("cutover", {"dry_run": False, "deploy_name": "ris-cut", "network_map": {"VLAN-130": "isolated-test"}})
+    assert x["status"] == "completed", x
+    assert rep.registry()["vms"]["ris-cut"]["network_map"] == {"VLAN-120": "prod-net", "VLAN-130": "isolated-test"}

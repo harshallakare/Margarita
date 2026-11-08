@@ -321,3 +321,17 @@ def test_vertical_gate_blocks_capped_source(tmp_path):
     with pytest.raises((DiskCountMismatch, NutanixMappingError)):
         r.run()
     assert not api.volumes and not prism.snapshots
+
+
+def test_vhi_boot_check_windows_does_not_wait_for_a_serial_prompt(tmp_path):
+    t, api = _tgt(tmp_path, windows_boot_grace=0)
+    sid = api.create_server(name="w", flavor_id="f", networks=[], block_device_mapping=[], metadata={})["id"]
+    api.console = ""                                     # Windows: nothing on the serial console
+    said: list[str] = []
+    bc = t.check_boot(VmRef(sid, "w"), timeout=30, guest_os="windows", progress=said.append)
+    assert bc.ok and "Windows" in bc.detail and "VHI console" in bc.detail
+    bc = t.check_boot(VmRef(sid, "w"), timeout=0.05, guest_os="linux", progress=said.append)
+    assert bc.ok and "verify boot manually" in bc.detail and said          # progress was reported
+    api.servers[sid]["status"] = "SHUTOFF"
+    bc = t.check_boot(VmRef(sid, "w"), timeout=30, guest_os="windows")
+    assert not bc.ok and "powered off" in bc.detail

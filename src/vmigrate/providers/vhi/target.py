@@ -514,13 +514,23 @@ class VhiTarget(TargetProvider):
         atts = sorted(self.api.attachments(vm.id), key=lambda a: _dev_key(a.get("device", "")))
         return [a["volume_id"] for a in atts]
 
-    def check_boot(self, vm: VmRef, timeout: float = 900) -> BootCheck:
-        deadline = time.monotonic() + timeout
+    def check_boot(self, vm: VmRef, timeout: float = 900, *, guest_os: str | None = None,
+                   progress: Any = None) -> BootCheck:
+        """Linux: wait for a login prompt / boot failure on the serial console. Windows writes nothing
+        there, so after `windows_boot_grace` seconds ACTIVE with no error the check passes (and says to
+        confirm in the VHI console) instead of waiting the whole timeout (seen live: a 15-minute wait)."""
+        say = progress or self.ctx.logger.info
+        grace = float(self.config.get("windows_boot_grace", 120))
+        start = time.monotonic()
+        deadline, last_say = start + timeout, -1e9
         log = ""
         while time.monotonic() < deadline:
             s = self.api.get_server(vm.id)
-            if s.get("status") == "ERROR":
+            status = str(s.get("status", ""))
+            if status == "ERROR":
                 return BootCheck(False, f"server in ERROR: {s.get('fault')}")
+            if status == "SHUTOFF":
+                return BootCheck(False, "server powered off during the boot check (guest shut down or crashed)")
             log = self.api.console_log(vm.id, length=400) or ""
             for pat in BOOT_FAIL_PATTERNS:
                 if re.search(pat, log, re.I | re.M):
@@ -528,6 +538,16 @@ class VhiTarget(TargetProvider):
             for pat in BOOT_OK_PATTERNS:
                 if re.search(pat, log, re.I | re.M):
                     return BootCheck(True, "login prompt reached", log)
+            el = time.monotonic() - start
+            if guest_os == "windows" and status == "ACTIVE" and el >= grace:
+                return BootCheck(True, f"Windows: server ACTIVE for {int(el)}s with no errors. Windows writes nothing to "
+                                       "the serial console, so confirm the login screen in the VHI console", log)
+            if el - last_say >= 60:
+                last_say = el
+                what = (f"Windows: passes after {int(grace)}s ACTIVE without errors" if guest_os == "windows"
+                        else "waiting for a login prompt on the serial console")
+                say(f"boot check: server {status or '?'}, {int(el)}s of {int(timeout)}s, console has "
+                    f"{len(log.splitlines())} line(s); {what}")
             time.sleep(self.poll * 2)
         if not log.strip():
             return BootCheck(True, "server ACTIVE; no serial console output — verify boot manually", log)

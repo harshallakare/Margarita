@@ -348,7 +348,8 @@ class FakeTarget(TargetProvider):
         self.ctx.require_execute("fake create vm", name=spec.name)
         self.calls.append(f"create_vm:{spec.name}")
         disks = [boot_disk.id] + ([d.id for d in data_disks] if self.config.get("attach_at_create") else [])
-        self.vms[spec.name] = {"id": f"vm-{spec.name}", "disks": disks, "spec": spec}
+        self.vms[spec.name] = {"id": f"vm-{spec.name}", "disks": disks, "spec": spec,
+                               "network_map": dict((spec.extra.get("target_options") or {}).get("network_map") or {})}
         self._save()
         return VmRef(f"vm-{spec.name}", spec.name, self.name)
 
@@ -365,7 +366,8 @@ class FakeTarget(TargetProvider):
     def list_attached_disks(self, vm: VmRef) -> list[str]:
         return list(self.vms[vm.name]["disks"])
 
-    def check_boot(self, vm: VmRef, timeout: float = 900) -> BootCheck:
+    def check_boot(self, vm: VmRef, timeout: float = 900, *, guest_os: str | None = None,
+                   progress: Any = None) -> BootCheck:
         return BootCheck(ok=self.boot_ok, detail="fake boot " + ("ok" if self.boot_ok else "dropped to initramfs"))
 
     def cleanup_on_failure(self, created: Mapping[str, Any]) -> None:

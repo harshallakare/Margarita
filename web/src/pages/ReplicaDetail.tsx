@@ -46,20 +46,74 @@ function CronEditor({ onSave, onClose, initial }: { initial?: string; onClose: (
   );
 }
 
+interface NetItem { id: string; name: string; external?: boolean }
+
+/** Per-run network choice for deploy/cutover: keep the replica's mapping, or send every NIC (or
+ *  each source network) to another target network, e.g. an isolated one to avoid IP conflicts with
+ *  the still-running source. Returns the override map, or null for "use the replica's networks". */
+function NetworkOverride({ r, onChange }: { r: Replica; onChange: (m: Record<string, string> | null) => void }) {
+  const saved = ((r.options.target_options?.network_map ?? {}) as Record<string, string>);
+  const srcNets = Object.keys(saved);
+  const res = useLoad(() => api.get<{ networks: NetItem[] }>(`/endpoints/${r.target_endpoint_id}/resources`), [r.target_endpoint_id]);
+  const nets = res.data?.networks ?? [];
+  const label = (id: string) => nets.find((n) => n.id === id || n.name === id)?.name ?? id;
+  const [mode, setMode] = useState<"replica" | "other">("replica");
+  const [map, setMap] = useState<Record<string, string>>({});
+  const emit = (m: "replica" | "other", mm: Record<string, string>) => {
+    const filled = Object.fromEntries(Object.entries(mm).filter(([, v]) => v));
+    onChange(m === "other" && Object.keys(filled).length ? filled : null);
+  };
+  const setAll = (v: string) => { const mm = Object.fromEntries(srcNets.map((s) => [s, v])); setMap(mm); emit("other", mm); };
+  const pick = (v: string, cur: string) => (
+    <select value={cur} onChange={(e) => { const mm = { ...map, [v]: e.target.value }; setMap(mm); emit("other", mm); }}>
+      <option value="">{`keep: ${label(saved[v])}`}</option>
+      {nets.map((n) => <option key={n.id} value={n.id}>{n.name}{n.external ? " · external" : ""}</option>)}
+    </select>);
+  if (!srcNets.length) return null;
+  return (
+    <div className="field"><span>Networks for this run</span>
+      <div className="choices">
+        <button className={`choice ${mode === "replica" ? "on" : ""}`} onClick={() => { setMode("replica"); emit("replica", map); }}>
+          <div className="t">Replica's networks</div>
+          <div className="d">{srcNets.map((s) => `${s} → ${label(saved[s])}`).join(", ")}</div></button>
+        <button className={`choice ${mode === "other" ? "on" : ""}`} onClick={() => { setMode("other"); emit("other", map); }}>
+          <div className="t">Different network</div>
+          <div className="d">e.g. an isolated test network, so the copy cannot clash with the running source's IPs</div></button>
+      </div>
+      {mode === "other" && (
+        <div className="stack" style={{ marginTop: 8 }}>
+          {res.error && <ErrorBox error={res.error} title="Could not list target networks" />}
+          {srcNets.length > 1 && (
+            <label className="field"><span>All NICs to</span>
+              <select value="" onChange={(e) => e.target.value && setAll(e.target.value)}>
+                <option value="">choose a network…</option>
+                {nets.map((n) => <option key={n.id} value={n.id}>{n.name}</option>)}
+              </select></label>)}
+          {srcNets.map((s) => <label key={s} className="field"><span>{s} →</span>{pick(s, map[s] ?? "")}</label>)}
+          <small>Only this run uses these networks; the replica's saved mapping is unchanged. With MAC/IP preservation the
+            copy keeps the source's addresses on the chosen network.</small>
+        </div>)}
+    </div>
+  );
+}
+
 function DeployDialog({ r, onClose, onStarted }: { r: Replica; onClose: () => void; onStarted: (x: Execution) => void }) {
   const [rp, setRp] = useState<string>(r.consistent && !r.current_sync ? "" : r.restore_points[0]?.id ?? "");
   const [name, setName] = useState(`${r.options.target_name || r.vm}-dr`.toLowerCase().replace(/[^a-z0-9._-]+/g, "-"));
   const [dry, setDry] = useState(true);
   const [confirm, setConfirm] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [netMap, setNetMap] = useState<Record<string, string> | null>(null);
   const latestOk = r.consistent && !r.current_sync;
   const go = async () => {
-    const x = await api.post<Execution>(`/replicas/${r.id}/deploy`, { dry_run: dry, deploy_name: name, restore_point: rp || null });
+    const x = await api.post<Execution>(`/replicas/${r.id}/deploy`, { dry_run: dry, deploy_name: name, restore_point: rp || null,
+      network_map: netMap });
     onStarted(x);
   };
   if (confirm) return <ConfirmTyped title="Deploy VM from replica" word={name} action="Deploy" onClose={onClose} onConfirm={go}
     body={<>Clones {r.disks} replica disks{rp ? <> from restore point <code>{rp}</code></> : " from the latest sync"} and creates VM
-      <b> {name}</b> on the target. The source is not contacted; the replica keeps syncing afterwards.</>} />;
+      <b> {name}</b> on the target{netMap ? <> on <b>a different network</b> ({Object.values(netMap).length} NIC mapping(s) changed)</> : ""}.
+      The source is not contacted; the replica keeps syncing afterwards.</>} />;
   return (
     <Modal title="Deploy (failover)" onClose={onClose} footer={<>
       <button className="btn" onClick={onClose}>Cancel</button>
@@ -80,6 +134,7 @@ function DeployDialog({ r, onClose, onStarted }: { r: Replica; onClose: () => vo
           {r.restore_points.length === 0 && <small>This target keeps no restore points, so only the latest consistent sync can be deployed.</small>}
         </div>
         <label className="field"><span>VM name on target</span><input type="text" value={name} onChange={(e) => setName(e.target.value)} /></label>
+        <NetworkOverride r={r} onChange={setNetMap} />
         <label className="check"><input type="checkbox" checked={dry} onChange={(e) => setDry(e.target.checked)} />
           <span>Dry-run<small>Check the replica and show the plan without creating anything.</small></span></label>
         <ErrorBox error={err} title="Could not start" />
@@ -95,14 +150,15 @@ function CutoverDialog({ r, onClose, onStarted }: { r: Replica; onClose: () => v
   const [dry, setDry] = useState(true);
   const [confirm, setConfirm] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [netMap, setNetMap] = useState<Record<string, string> | null>(null);
   const go = async () => {
     const x = await api.post<Execution>(`/replicas/${r.id}/cutover`,
-      { dry_run: dry, deploy_name: name, shutdown_source: shutdown, force_power_off: shutdown && force });
+      { dry_run: dry, deploy_name: name, shutdown_source: shutdown, force_power_off: shutdown && force, network_map: netMap });
     onStarted(x);
   };
   if (confirm) return <ConfirmTyped title="Cut over to the target" word={name} action="Cut over" onClose={onClose} onConfirm={go}
     body={<>{shutdown ? <><b>Shuts down the source VM {r.vm}</b>{force ? " (hard power-off)" : " (guest shutdown)"}, then</> : "Leaves the source running, then"} runs
-      a final sync and creates VM <b>{name}</b> on the target from it. The source is never deleted.</>} />;
+      a final sync and creates VM <b>{name}</b> on the target from it{netMap ? <>, on <b>a different network</b></> : ""}. The source is never deleted.</>} />;
   return (
     <Modal title="Cutover (planned failover)" onClose={onClose} footer={<>
       <button className="btn" onClick={onClose}>Cancel</button>
@@ -116,6 +172,9 @@ function CutoverDialog({ r, onClose, onStarted }: { r: Replica; onClose: () => v
           <span>Shut down the source first<small>Recommended: no writes are lost. Without it the final sync is crash-consistent and later writes stay on the source.</small></span></label>
         {shutdown && <label className="check"><input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
           <span>Hard power-off<small>Only if the guest cannot shut down cleanly (no guest tools/ACPI).</small></span></label>}
+        <NetworkOverride r={r} onChange={setNetMap} />
+        {netMap && !shutdown && <div className="alert info small">The source keeps running and the copy boots on the chosen
+          network, so their IP addresses cannot clash.</div>}
         <label className="check"><input type="checkbox" checked={dry} onChange={(e) => setDry(e.target.checked)} />
           <span>Dry-run<small>Show the plan without touching the source or target.</small></span></label>
         <ErrorBox error={err} title="Could not start" />
@@ -243,7 +302,9 @@ export default function ReplicaDetail() {
           <div className="table-wrap"><table>
             <thead><tr><th>VM</th><th>From</th><th>When</th><th>Status</th></tr></thead>
             <tbody>{r.deployments.map((d) => (
-              <tr key={d.id}><td><b>{d.name}</b>{d.target_vm && <div className="mono small muted">{d.target_vm.id}</div>}</td>
+              <tr key={d.id}><td><b>{d.name}</b>{d.network_map && <span className="tag" style={{ marginLeft: 8 }}
+                  title={Object.entries(d.network_map).map(([a, b]) => `${a} → ${b}`).join(", ")}>other network</span>}
+                {d.target_vm && <div className="mono small muted">{d.target_vm.id}</div>}</td>
                 <td className="small">{d.restore_point ? <>restore point <code>{d.restore_point}</code></> : "latest sync"}</td>
                 <td className="small">{fmt.time(d.at)}</td><td><Status s={d.status === "done" ? "completed" : d.status} label={d.status} /></td></tr>))}</tbody>
           </table></div>)}

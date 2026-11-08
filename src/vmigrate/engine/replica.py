@@ -500,11 +500,19 @@ class ReplicaRunner:
             steps += [{"action": "osmorph"}, {"action": "target.create_vm", "name": name, "disks": len(s.disks)}]
             return TaskOutcome(result={"plan": steps}, message=f"{len(steps)} planned actions (nothing changed)")
 
+        # per-run network override (e.g. boot a test copy on an isolated network to avoid IP conflicts
+        # with the still-running source); networks not named keep the replica's mapping
+        topts = dict(self.job.target_options)
+        if params.get("network_map"):
+            topts["network_map"] = {**(topts.get("network_map") or {}), **params["network_map"]}
+        if params.get("preserve_mac") is not None:
+            topts["preserve_mac"] = bool(params["preserve_mac"])
+
         def runner() -> MigrationRunner:
             if "r" not in holder:
                 job = MigrationConfig(name=name, source=self.job.source, target=self.job.target, vm=self.job.vm,
                                       target_name=name, guest_os=self.job.guest_os,
-                                      target_options=dict(self.job.target_options), osmorph=dict(self.job.osmorph))
+                                      target_options=topts, osmorph=dict(self.job.osmorph))
                 holder["r"] = MigrationRunner(job, self.engine, self.source, self.target, self.ctx,
                                               _DeployStateStore(self, dep_id))  # type: ignore[arg-type]
             return holder["r"]
@@ -517,7 +525,8 @@ class ReplicaRunner:
             with self._lock:
                 if not any(d["id"] == dep_id for d in self.state.deployments):
                     self.state.deployments.append({"id": dep_id, "name": name, "at": time.time(), "restore_point": rp_id,
-                                                   "status": "running", "state": None})
+                                                   "status": "running", "state": None,
+                                                   "network_map": params.get("network_map") or None})
             self._save()
             r = runner()
             r.state.spec = {**s.to_dict(), "name": s.name}
@@ -550,6 +559,7 @@ class ReplicaRunner:
         def instance(ctx: TaskContext) -> TaskOutcome:
             r = runner()
             s, rf = self.spec(), refs(r)
+            s.extra["target_options"] = dict(topts)          # this run's networks (override or replica's)
             vm = r._create_vm(s, rf)
             if not r._done(Phase.DISKS_ATTACHED):
                 r._attach(s, vm, rf)
