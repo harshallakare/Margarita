@@ -244,14 +244,40 @@ class PrismV4:
         return self._created(task, "recovery-point", RECOVERY_POINTS, name)
 
     def recovery_point_layout(self, rp_ext: str) -> dict[str, Any]:
-        """{vm_recovery_point: ext, disks: {vm disk ext: disk recovery point ext}} (single-VM recovery point)."""
+        """{vm_recovery_point, disks: {vm disk ext: disk recovery point ext}, unmapped: [disk RP ext]}
+        for a single-VM recovery point. `diskExtId` is optional in the v4 model (seen live: absent);
+        when missing, the VM-recovery-point endpoint and newer API versions are asked, and whatever
+        is still unknown is returned in `unmapped` (in Prism's order) for the caller to resolve."""
         data, _ = self._get(f"{RECOVERY_POINTS}/{rp_ext}")
         vrps = _need(data, "data", "vmRecoveryPoints")
         if len(vrps) != 1:
             raise ProviderError(f"recovery point {rp_ext} has {len(vrps)} VM recovery points, expected 1")
-        return {"vm_recovery_point": _need(vrps[0], "extId"),
-                "disks": {_need(d, "diskExtId"): _need(d, "diskRecoveryPointExtId")
-                          for d in vrps[0].get("diskRecoveryPoints") or []}}
+        vmrp = _need(vrps[0], "extId")
+        entries = [(d.get("diskExtId"), _need(d, "diskRecoveryPointExtId")) for d in vrps[0].get("diskRecoveryPoints") or []]
+        if any(not de for de, _ in entries):
+            log.info("recovery point %s: diskExtId missing in %s; trying other endpoints", rp_ext, RECOVERY_POINTS)
+            known: dict[str, str] = {}
+            alt = [f"{RECOVERY_POINTS}/{rp_ext}/vm-recovery-points/{vmrp}"]
+            alt += [f"{RECOVERY_POINTS.replace('/v4.0/', f'/{v}/')}/{rp_ext}" for v in ("v4.2", "v4.1")]
+            for path in alt:
+                try:
+                    d2, _ = self._get(path)
+                except ProviderError as e:
+                    log.debug("  %s: %s", path, e)
+                    continue
+                body = (d2 or {}).get("data") or {}
+                vr = body.get("vmRecoveryPoints") or [body]
+                for v in vr:
+                    for d in v.get("diskRecoveryPoints") or []:
+                        if d.get("diskExtId") and d.get("diskRecoveryPointExtId"):
+                            known[d["diskRecoveryPointExtId"]] = d["diskExtId"]
+                if all(known.get(drp) or de for de, drp in entries):
+                    log.info("  disk mapping found via %s", path)
+                    break
+            entries = [(de or known.get(drp), drp) for de, drp in entries]
+        return {"vm_recovery_point": vmrp,
+                "disks": {de: drp for de, drp in entries if de},
+                "unmapped": [drp for de, drp in entries if not de]}
 
     def set_expiration(self, rp_ext: str, hours: float) -> None:
         """Keep a recovery point as the next sync's CRT reference (created with a 24 h expiry)."""

@@ -162,8 +162,10 @@ def test_iscsi_session_logs_out_only_its_targets():
 # ---------------------------------------------------------------------- full migration through NutanixSource
 
 class FakeV4:
-    def __init__(self, n=13, dsip="10.0.0.50", reachable=True, drop_disk=False, rp_id_lost=False):
+    def __init__(self, n=13, dsip="10.0.0.50", reachable=True, drop_disk=False, rp_id_lost=False,
+                 no_disk_ext=False, vg_size=None):
         self.n, self.dsip, self.reachable, self.drop_disk = n, dsip, reachable, drop_disk
+        self.no_disk_ext, self.vg_size = no_disk_ext, vg_size   # Prism omits diskExtId / VG reports this size
         self.rp_id_lost = rp_id_lost          # Prism created the RP but the ID could not be determined
         self.log: list[str] = []
         self.vg_map: dict[int, str] = {}
@@ -192,7 +194,10 @@ class FakeV4:
         return {f"dev-vd-{i:02d}": f"drp-{i:02d}" for i in range(n)}   # v4 diskExtId = device uuid
 
     def recovery_point_layout(self, rp):
-        return {"vm_recovery_point": f"vmrp-{rp}", "disks": self.recovery_point_disks(rp)}
+        d = self.recovery_point_disks(rp)
+        if self.no_disk_ext:
+            return {"vm_recovery_point": f"vmrp-{rp}", "disks": {}, "unmapped": list(d.values())}
+        return {"vm_recovery_point": f"vmrp-{rp}", "disks": d, "unmapped": []}
 
     def create_volume_group(self, name, cluster):
         self.log.append(f"vg:{name}")
@@ -202,7 +207,7 @@ class FakeV4:
         self.vg_map[index] = drp
 
     def vg_disks(self, vg):
-        return [{"ext": f"vgd-{i}", "index": i, "size": SIZE} for i in sorted(self.vg_map)]
+        return [{"ext": f"vgd-{i}", "index": i, "size": self.vg_size or SIZE} for i in sorted(self.vg_map)]
 
     def attach_iscsi_client(self, vg, iqn):
         self.log.append(f"attach:{iqn}")
@@ -243,11 +248,11 @@ def iscsi_factory(fv4, devdir):
     return FakeIscsi
 
 
-def make(tmp_path, fv4, transport="auto", **cfg):
+def make(tmp_path, fv4, transport="auto", disks=13, **cfg):
     ctx = RunContext(dry_run=False, logger=logging.getLogger("t"))
     src = NutanixSource("ahv", {"prism_element": "https://pe:9440", "prism_central": "https://pc:9440",
                                 "username": "admin", "transport": transport, **cfg}, ctx,
-                        client=FakePrism.with_vm(tmp_path, disks=13, size=SIZE), v4=fv4,
+                        client=FakePrism.with_vm(tmp_path, disks=disks, size=SIZE), v4=fv4,
                         iscsi_factory=iscsi_factory(fv4, tmp_path / "dev"), size_of=os.path.getsize)
     tgt = FakeTarget("tgt", {"staging_dir": str(tmp_path / "tgt"), "persist": True}, ctx)
     e = EngineConfig(state_dir=tmp_path / "s", report_dir=tmp_path / "r", chunk_size=1 << 20,
@@ -273,10 +278,55 @@ def test_iscsi_migration_13_disks_no_nfs_no_pd(tmp_path):
 def test_recovery_point_missing_a_disk_is_refused_and_cleaned_up(tmp_path):
     fv4 = FakeV4(drop_disk=True)
     ctx, src, tgt, e = make(tmp_path, fv4)
-    with pytest.raises(SafetyGateError, match="no unique copy of disk scsi.12"):
+    with pytest.raises(SafetyGateError, match="recovery point covers 12 disks, the VM has 13"):
         MigrationRunner(MigrationConfig(name="m", source="ahv", target="tgt", vm="RIS-Sainath"), e, src, tgt, ctx,
                         StateStore(e.state_dir)).run()
     assert "delete-rp" in fv4.log and not tgt.disks             # partial objects removed; nothing created
+
+
+def _run(src, tgt, ctx, e):
+    return MigrationRunner(MigrationConfig(name="m", source="ahv", target="tgt", vm="RIS-Sainath"), e, src, tgt, ctx,
+                           StateStore(e.state_dir)).run()
+
+
+def test_rp_without_disk_ext_ids_single_disk_maps_directly(tmp_path):
+    # seen on a real Prism Central: diskRecoveryPoints carry only diskRecoveryPointExtId
+    fv4 = FakeV4(n=1, no_disk_ext=True)
+    ctx, src, tgt, e = make(tmp_path, fv4, disks=1)
+    st = _run(src, tgt, ctx, e)
+    assert st.phase.value == "done" and fv4.vg_map == {0: "drp-00"}
+    assert tgt._final(tgt.disks["RIS-Sainath-disk00"]).read_bytes() == PatternDisk("vd-00", SIZE).read(0, SIZE)
+
+
+def test_rp_without_disk_ext_ids_equal_sizes_needs_explicit_trust(tmp_path):
+    fv4 = FakeV4(no_disk_ext=True)                       # 13 disks, all the same size in this fake
+    ctx, src, tgt, e = make(tmp_path, fv4)
+    with pytest.raises(SafetyGateError, match="same size.*rp_disk_order_trust"):
+        _run(src, tgt, ctx, e)
+    assert "delete-rp" in fv4.log and not tgt.disks
+    fv4 = FakeV4(no_disk_ext=True)
+    ctx, src, tgt, e = make(tmp_path / "b", fv4, rp_disk_order_trust=True)
+    assert _run(src, tgt, ctx, e).phase.value == "done" and fv4.vg_map == {i: f"drp-{i:02d}" for i in range(13)}
+
+
+def test_rp_order_mapping_is_refused_when_sizes_disagree(tmp_path):
+    fv4 = FakeV4(n=1, no_disk_ext=True, vg_size=SIZE * 2)
+    ctx, src, tgt, e = make(tmp_path, fv4, disks=1)
+    with pytest.raises(SafetyGateError, match="Prism's disk order is not the VM's"):
+        _run(src, tgt, ctx, e)
+    assert "delete-vg" in fv4.log and "delete-rp" in fv4.log
+
+
+def test_v4_layout_asks_vm_recovery_point_endpoint_when_disk_ext_missing():
+    rp = {"data": {"vmRecoveryPoints": [{"extId": "vmrp", "diskRecoveryPoints": [{"diskRecoveryPointExtId": "drp-1"}]}]}}
+    full = {"data": {"extId": "vmrp", "diskRecoveryPoints": [{"diskRecoveryPointExtId": "drp-1", "diskExtId": "disk-a"}]}}
+    s = Session({("GET", f"{v4.RECOVERY_POINTS}/rp"): Resp(200, rp),
+                 ("GET", f"{v4.RECOVERY_POINTS}/rp/vm-recovery-points/vmrp"): Resp(200, full)})
+    lay = v4.PrismV4(s, "https://pc:9440").recovery_point_layout("rp")
+    assert lay == {"vm_recovery_point": "vmrp", "disks": {"disk-a": "drp-1"}, "unmapped": []}
+    s = Session({("GET", f"{v4.RECOVERY_POINTS}/rp"): Resp(200, rp)})          # nobody knows: left unmapped
+    lay = v4.PrismV4(s, "https://pc:9440").recovery_point_layout("rp")
+    assert lay["disks"] == {} and lay["unmapped"] == ["drp-1"]
 
 
 def test_recovery_point_with_unknown_id_is_still_cleaned_up(tmp_path):
