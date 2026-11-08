@@ -80,3 +80,22 @@ def test_old_virt_v2v_and_failure_and_static_ip_note():
     assert calls[0][0][:2] == ["virt-v2v", "--in-place"]
     res = WindowsKvmStrategy(_tools()[0]).run(_req(), RunContext(dry_run=True))
     assert res.status == "planned" and any("windows-static-ip" in s for s in res.steps)
+
+
+def test_ahv_virtio_source_needs_no_driver_injection():
+    # seen live: AHV Windows guest (virtio-scsi) -> VHI (virtio-scsi). The Nutanix VirtIO drivers are
+    # already installed, so OSMorph must not demand virt-v2v / a virtio-win ISO (it blocked the run).
+    r = _req()
+    for d in r.spec.disks:
+        d.controller, d.bus = "virtio-scsi", DiskBus.SCSI
+    t, calls = _tools(have=(), files=())                         # no virt-v2v, no drivers on the worker
+    res = WindowsKvmStrategy(t).run(r, RunContext(dry_run=False, logger=logging.getLogger("t")))
+    assert res.status == "applied" and not calls
+    assert any("virtio-drivers: not needed" in s for s in res.steps)
+    assert any("windows-static-ip" in n for n in res.notes)       # still told about the static IP, not blocked
+    # a bus change (virtio-scsi -> virtio-blk) still needs drivers
+    r2 = _req()
+    for d in r2.spec.disks:
+        d.controller, d.bus = "virtio-scsi", DiskBus.SCSI
+    r2 = MorphRequest(r2.spec, "kvm", DiskBus.VIRTIO, r2.images, {})
+    assert WindowsKvmStrategy(t).run(r2, RunContext(dry_run=False)).status == "manual_required"

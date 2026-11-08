@@ -118,7 +118,10 @@ def test_boot_check_failure_is_reported(make_runner):
 
 
 def test_windows_to_kvm_requires_manual_morph_and_stops_before_vm(make_runner):
-    runner, src, tgt = make_runner(disks=2, os="windows")
+    # a VMware-style controller: virtio drivers must be injected, and nothing can do it here
+    from .conftest import fake_vm
+    vm = {**fake_vm(disks=2, os="windows"), "controller": "pvscsi"}
+    runner, src, tgt = make_runner(disks=2, os="windows", src_cfg={"vms": [vm]})
     with pytest.raises(ManualMorphRequired):
         runner.run()
     assert not tgt.vms

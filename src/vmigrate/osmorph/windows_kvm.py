@@ -32,6 +32,7 @@ from xml.sax.saxutils import escape, quoteattr
 
 from ..ir import DiskBus, Firmware, OsFamily
 from .base import MorphRequest, MorphStep, MorphStrategy, register
+from .linux_kvm import needs_virtio
 
 DEFAULT_VIRTIO_WIN = ("/usr/share/virtio-win/virtio-win.iso", "/usr/share/virtio-win")
 _BUS = {DiskBus.SCSI: "scsi", DiskBus.SATA: "sata", DiskBus.IDE: "ide", DiskBus.VIRTIO: "virtio",
@@ -134,6 +135,14 @@ class WindowsKvmStrategy(MorphStrategy):
 
     def plan(self, req: MorphRequest) -> list[MorphStep]:
         opts = req.options
+        boot = req.spec.boot_disk()
+        if not needs_virtio(boot.controller, boot.bus, req.target_boot_bus) and not opts.get("force_v2v"):
+            # e.g. Nutanix AHV -> VHI: both KVM, the guest already boots from virtio-scsi on the same
+            # bus, so its installed virtio drivers (Nutanix VirtIO) keep working; nothing to inject.
+            why = (f"not needed: the guest already boots from {boot.controller} ({boot.bus.value}) and the target "
+                   f"presents the same virtio controller, so its virtio drivers are already installed")
+            steps = [MorphStep("virtio-drivers", why, required=False, run=lambda: why)]
+            return steps + self._extra_steps(req)
         conv = self.tools.converter()
         drivers = self.tools.virtio_win(opts.get("virtio_win"))
         images_ok = bool(req.images)
@@ -147,7 +156,11 @@ class WindowsKvmStrategy(MorphStrategy):
             run=(lambda: self._convert(req, conv, drivers)) if not missing else None)]  # type: ignore[arg-type]
         if opts.get("windows_ip"):
             steps[0].description += f"; static IPs for {len(opts['windows_ip'])} NIC(s)"
-        elif any(n.ipv4 for n in req.spec.nics):
+        return steps + self._extra_steps(req, v2v=True)
+
+    def _extra_steps(self, req: MorphRequest, *, v2v: bool = False) -> list[MorphStep]:
+        opts, steps, images_ok = req.options, [], bool(req.images)
+        if not (v2v and opts.get("windows_ip")) and any(n.ipv4 for n in req.spec.nics):
             steps.append(MorphStep(
                 "windows-static-ip",
                 "the guest has fixed IPs and the NIC changes to virtio-net: Windows will see a new adapter; "
