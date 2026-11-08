@@ -56,6 +56,7 @@ DP_CONTENT = "/api/dataprotection/{ver}/content/recovery-points"
 DP_CONFIG = "/api/dataprotection/{ver}/config/recovery-points"
 OT = "dataprotection.v4.content."
 VOLUME_GROUPS = "/api/volumes/v4.0/config/volume-groups"
+ISCSI_CLIENTS = "/api/volumes/v4.0/config/iscsi-clients"
 TASKS = "/api/prism/v4.0/config/tasks"
 
 
@@ -374,9 +375,32 @@ class PrismV4:
         self._task(resp, "attach iSCSI client")
 
     def detach_iscsi_client(self, vg_ext: str, iqn: str) -> None:
-        resp, _ = self._call("POST", f"{VOLUME_GROUPS}/{vg_ext}/$actions/detach-iscsi-client",
-                             body={"iscsiInitiatorName": iqn})
-        self._task(resp, "detach iSCSI client")
+        """Detach takes the iSCSI client's UUID, not its IQN (seen live: VOL-40101 "the iSCSI client
+        UUID must be specified"). The UUID comes from the VG's iscsi-client-attachments, else from the
+        iscsi-clients list by initiator name. Only ever acts on a vmigrate- volume group."""
+        vg = self.volume_group(vg_ext)
+        if not str(vg.get("name", "")).startswith(PREFIX):
+            raise SafetyGateError(f"refusing to detach clients from volume group {vg_ext} ({vg.get('name')!r})")
+        ids: list[str] = []
+        try:
+            data, _ = self._get(f"{VOLUME_GROUPS}/{vg_ext}/iscsi-client-attachments")
+            atts = [a for a in data.get("data") or [] if a.get("extId")]
+            mine = [a for a in atts if iqn and iqn in str(a)]
+            ids = [str(a["extId"]) for a in (mine or atts)]       # our VG: every client on it is ours
+        except ProviderError as e:
+            log.info("iscsi-client-attachments for %s not available (%s); looking the client up by IQN", vg_ext, e)
+        if not ids and iqn:
+            flt = quote(f"iscsiInitiatorName eq '{iqn}'", safe="'=")
+            data, _ = self._get(f"{ISCSI_CLIENTS}?$filter={flt}")
+            ids = [str(c["extId"]) for c in data.get("data") or []
+                   if c.get("extId") and c.get("iscsiInitiatorName", iqn) == iqn]
+        if not ids:
+            log.info("volume group %s has no iSCSI client attached", vg_ext)
+            return
+        for cid in ids:
+            resp, _ = self._call("POST", f"{VOLUME_GROUPS}/{vg_ext}/$actions/detach-iscsi-client",
+                                 body={"extId": cid})
+            self._task(resp, f"detach iSCSI client {cid}")
 
     def delete_volume_group(self, vg_ext: str) -> None:
         vg = self.volume_group(vg_ext)
