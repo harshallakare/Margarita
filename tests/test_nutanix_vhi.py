@@ -203,6 +203,15 @@ def _tgt(tmp_path, dry=False, api=None, qemu=None, **cfg):
     return VhiTarget("vhi", conf, ctx, api=api, qemu=qemu or FakeQemu()), api
 
 
+def test_vhi_volume_type_is_optional_cinder_default_used(tmp_path):
+    t, api = _tgt(tmp_path, volume_type="")
+    assert t.check_connection() == [] and not any("volume type" in x for x in t.preflight())
+    ref = t.create_disk("vm-disk00", 1 << 20, DiskHints(bus=DiskBus.SCSI))
+    assert api.get_volume(ref.id)["volume_type"] == "__default__"        # type omitted -> Cinder default
+    t2, api2 = _tgt(tmp_path / "b", volume_type="vmds")
+    assert api2.get_volume(t2.create_disk("d", 1 << 20, DiskHints(bus=DiskBus.SCSI)).id)["volume_type"] == "vmds"
+
+
 def test_vhi_create_write_commit(tmp_path):
     t, api = _tgt(tmp_path)
     ref = t.create_disk("vm-disk00", (1 << 20) * 3, DiskHints(bus=DiskBus.SCSI))
