@@ -46,6 +46,7 @@ export interface Migration {
   target_endpoint_id: string; vm: string; options: MigrationOptions; phase: string | null;
   disks: number | null; crosscheck: Record<string, number> | null; created_at: number; updated_at: number;
   last_execution: Execution | null;
+  deleted_at?: number | null; deleted_by?: string | null;
 }
 export interface MigrationOptions {
   target_name?: string; app_consistent?: boolean; guest_os?: Record<string, unknown>;

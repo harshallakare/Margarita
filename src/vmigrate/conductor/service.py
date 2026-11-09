@@ -167,8 +167,9 @@ class Conductor:
                 repo.remove_worker(w["id"])
         # 5) auto-provisioned worker pools: keep min_size members
         stats["minions"] = self.scale_pools()
-        # 6) audit retention (daily)
+        # 6) audit retention + run history of deleted migrations (daily)
         self.purge_audit()
+        self.purge_deleted()
         # 7) replica helper VMs kept between syncs: remove the ones idle past their time
         stats["helpers_released"] = self.reap_helpers()
         # 8) alerts: evaluate rules, fire / resolve, email (every 30 s; delivery runs in the background)
@@ -261,6 +262,20 @@ class Conductor:
         n = self.repo.purge_audit(now - days * 86400)
         if n:
             self.audit("audit.purge", "audit", None, None, {"deleted_rows": n, "retention_days": days})
+        return n
+
+    def purge_deleted(self, now: float | None = None) -> int:
+        """Daily: a deleted migration/replica keeps its runs and logs for VMIGRATE_DELETED_RETENTION_DAYS
+        (default 90; 0 = keep forever), then it is removed for good with them."""
+        import os as _os
+        now = now or time.time()
+        days = float(_os.environ.get("VMIGRATE_DELETED_RETENTION_DAYS", "90"))
+        if days <= 0 or now - getattr(self, "_last_purge_deleted", 0) < 86400:
+            return 0
+        self._last_purge_deleted = now
+        n = self.repo.purge_deleted_migrations(now - days * 86400)
+        if n:
+            self.audit("migration.purge", "migration", None, None, {"purged": n, "retention_days": days})
         return n
 
     def scale_pools(self, now: float | None = None) -> int:

@@ -92,6 +92,10 @@ migrations = Table(
     Column("created_by", String(32), nullable=True),
     Column("created_at", Float, nullable=False),
     Column("updated_at", Float, nullable=False),
+    # deleted rows stay (hidden) so their runs and logs remain searchable; the name gets a
+    # " (deleted <id>)" suffix so it can be reused. Purged after VMIGRATE_DELETED_RETENTION_DAYS.
+    Column("deleted_at", Float, nullable=True),
+    Column("deleted_by", String(64), nullable=True),
     UniqueConstraint("project", "name"),
 )
 
@@ -316,7 +320,8 @@ _ADDED_COLUMNS = [("executions", "params", "JSON"), ("executions", "region", "VA
                   ("endpoints", "region", "VARCHAR(64)"), ("endpoints", "required_tags", "JSON"),
                   ("workers", "region", "VARCHAR(64)"), ("workers", "capabilities", "JSON"),
                   ("workers", "export_url", "VARCHAR(512)"), ("workers", "export_fp", "VARCHAR(128)"),
-                  ("task_logs", "logger", "VARCHAR(128)")]
+                  ("task_logs", "logger", "VARCHAR(128)"),
+                  ("migrations", "deleted_at", "FLOAT"), ("migrations", "deleted_by", "VARCHAR(64)")]
 
 
 def upgrade_schema(engine: Engine) -> list[str]:

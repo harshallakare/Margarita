@@ -180,7 +180,8 @@ export default function MigrationDetail() {
         <button className="btn danger solid" onClick={async () => {
           try { await api.del(`/migrations/${m.id}`); nav("/migrations"); } catch (e) { setErr(errText(e)); setDel(false); }
         }}>Delete record</button></>}>
-        <p style={{ marginTop: 0 }}>Deletes this migration's record and run history from vmigrate. <b>Nothing on the source or target is deleted</b>; any disks or VM it created stay where they are.</p>
+        <p style={{ marginTop: 0 }}>Removes this migration from the list. <b>Nothing on the source or target is deleted</b>; any disks or VM it created stay where they are.
+          Its runs and logs are kept for 90 days (by default) and stay searchable on the Logs page under "Deleted".</p>
       </Modal>}
       {showMd !== null && <Modal title="Report" onClose={() => setShowMd(null)}><pre className="md">{showMd}</pre></Modal>}
       <Toast msg={toast} onDone={() => setToast(null)} />

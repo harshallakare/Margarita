@@ -26,8 +26,11 @@ export default function Logs() {
   const [range, setRange] = useState(86400);
   const [typ, setTyp] = useState("");
   const [open, setOpen] = useState<number | null>(null);
-  const migs = useLoad(() => Promise.all([api.get<Migration[]>("/migrations"), api.get<Migration[]>("/replicas")])
-    .then(([a, b]) => [...a, ...b]));
+  // deleted migrations / replicas keep their runs and logs, so they stay selectable here
+  const migs = useLoad(() => Promise.all([api.get<Migration[]>("/migrations"), api.get<Migration[]>("/replicas"),
+    api.get<Migration[]>("/migrations?deleted=true")]).then(([a, b, c]) => [...a, ...b, ...c]));
+  const live = (migs.data ?? []).filter((m) => !m.deleted_at);
+  const gone = (migs.data ?? []).filter((m) => m.deleted_at);
   const query = useMemo(() => {
     const p = new URLSearchParams();
     if (q.trim()) p.set("q", q.trim());
@@ -63,7 +66,9 @@ export default function Logs() {
           <label className="field" style={{ flex: "1 1 200px" }}><span>Migration / replica</span>
             <select value={mig} onChange={(e) => setMig(e.target.value)}>
               <option value="">all</option>
-              {(migs.data ?? []).map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}</select></label>
+              {live.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+              {gone.length > 0 && <optgroup label="Deleted (logs kept)">
+                {gone.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}</optgroup>}</select></label>
           <label className="field" style={{ flex: "1 1 140px" }}><span>Time</span>
             <select value={range} onChange={(e) => setRange(Number(e.target.value))}>
               {RANGES.map(([l, s]) => <option key={l} value={s}>{l}</option>)}</select></label>

@@ -88,10 +88,10 @@ def create_app(services: Services | None = None) -> FastAPI:
             if otype == "endpoint":
                 r = repo.get_endpoint(oid)
             elif otype in ("migration", "replica"):
-                r = repo.get_migration(oid)
+                r = repo.get_migration(oid, include_deleted=True)
             elif otype == "execution":
                 x = repo.get_execution(oid)
-                r = repo.get_migration(x["migration_id"]) if x else None
+                r = repo.get_migration(x["migration_id"], include_deleted=True) if x else None
             elif otype == "pool":
                 r = repo.get_pool(oid)
             elif otype == "notification_channel":
@@ -561,7 +561,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         e = scoped(repo.get_endpoint(eid), p, "endpoint")
         if repo.endpoint_in_use(eid):
             raise HTTPException(409, "endpoint is used by a migration/replica; delete those first")
-        repo.delete_endpoint(eid)
+        repo.delete_endpoint(eid)   # also purges deleted migrations that used it, with their run logs
         if e.get("secret_id"):
             svc.secrets.delete(e["secret_id"])
 
@@ -712,11 +712,17 @@ def create_app(services: Services | None = None) -> FastAPI:
                               vm=r["vm"], options=r["options"], phase=st.get("phase"),
                               disks=len((st.get("spec") or {}).get("disks", [])) or None,
                               crosscheck=st.get("crosscheck"), created_at=r["created_at"], updated_at=r["updated_at"],
-                              last_execution=ex_out(execs[0]) if execs else None)
+                              last_execution=ex_out(execs[0]) if execs else None,
+                              deleted_at=r.get("deleted_at"), deleted_by=r.get("deleted_by"))
 
     @app.get("/migrations", response_model=list[m.MigrationOut], tags=["migrations"])
-    def list_migrations(p: Principal = Depends(viewer)) -> list[m.MigrationOut]:
-        return [mig_out(r) for r in repo.list_migrations(None if p.role == "admin" else p.project, "migration")]
+    def list_migrations(deleted: bool = Query(False, description="true: deleted migrations AND replicas, whose "
+                                                             "runs and logs are kept"),
+                        p: Principal = Depends(viewer)) -> list[m.MigrationOut]:
+        proj = None if p.role == "admin" else p.project
+        if deleted:
+            return [mig_out(r) for r in repo.list_migrations(proj, deleted=True)]
+        return [mig_out(r) for r in repo.list_migrations(proj, "migration")]
 
     @app.post("/migrations", response_model=m.MigrationOut, status_code=201, tags=["migrations"])
     def create_migration(body: m.MigrationCreate, p: Principal = Depends(operator)) -> m.MigrationOut:
@@ -736,8 +742,8 @@ def create_app(services: Services | None = None) -> FastAPI:
         return mig_out(repo.get_migration(mid))  # type: ignore[arg-type]
 
     @app.get("/migrations/{mid}", response_model=m.MigrationOut, tags=["migrations"])
-    def get_migration(mid: str, p: Principal = Depends(viewer)) -> m.MigrationOut:
-        return mig_out(scoped(repo.get_migration(mid), p, "migration"))
+    def get_migration(mid: str, include_deleted: bool = False, p: Principal = Depends(viewer)) -> m.MigrationOut:
+        return mig_out(scoped(repo.get_migration(mid, include_deleted), p, "migration"))
 
     @app.patch("/migrations/{mid}", response_model=m.MigrationOut, tags=["migrations"])
     def update_migration(mid: str, body: m.MigrationUpdate, p: Principal = Depends(operator)) -> m.MigrationOut:
@@ -754,7 +760,7 @@ def create_app(services: Services | None = None) -> FastAPI:
             raise HTTPException(409, "this is a replica; use DELETE /replicas/{id}")
         if repo.active_execution(mid):
             raise HTTPException(409, "migration has an active execution; cancel it first")
-        repo.delete_migration(mid)   # never touches source or target resources
+        repo.delete_migration(mid, p.username)   # hidden, runs + logs kept; never touches source or target
 
     @app.post("/migrations/{mid}/start", response_model=m.ExecutionOut, status_code=202, tags=["migrations"])
     def start_migration(mid: str, body: m.StartRequest | None = None, p: Principal = Depends(operator)) -> m.ExecutionOut:
@@ -802,18 +808,21 @@ def create_app(services: Services | None = None) -> FastAPI:
                 "target_vm": st.target_vm}
 
     # ------------------------------------------------------------------ executions
-    def exec_scoped(xid: str, p: Principal) -> dict[str, Any]:
+    def exec_scoped(xid: str, p: Principal, write: bool = False) -> dict[str, Any]:
+        """Runs of deleted migrations stay readable (logs, tasks, diagnostics) but cannot be acted on."""
         x = repo.get_execution(xid)
         if x is None:
             raise HTTPException(404, "execution not found")
-        scoped(repo.get_migration(x["migration_id"]), p, "execution")
+        mg = scoped(repo.get_migration(x["migration_id"], include_deleted=True), p, "execution")
+        if write and mg.get("deleted_at"):
+            raise HTTPException(409, "its migration was deleted; the run is kept only for its logs")
         return x
 
     @app.get("/executions", response_model=list[m.ExecutionOut], tags=["executions"])
     def list_execs(migration_id: str | None = None, status: str | None = None,
                    p: Principal = Depends(viewer)) -> list[m.ExecutionOut]:
         rows = repo.list_executions(migration_id, status)
-        allowed = {x["id"] for x in repo.list_migrations(None if p.role == "admin" else p.project)}
+        allowed = {x["id"] for x in repo.list_migrations(None if p.role == "admin" else p.project, deleted=None)}
         rows = [x for x in rows if x["migration_id"] in allowed]
         ids = [x["id"] for x in rows]
         counts, transfers = repo.task_counts(ids), repo.transfer_summary(ids)
@@ -836,7 +845,7 @@ def create_app(services: Services | None = None) -> FastAPI:
 
     # ------------------------------------------------------------------ investigation: logs, events, bundle
     def visible_migrations(p: Principal) -> list[dict[str, Any]] | None:
-        return None if p.role == "admin" else repo.list_migrations(p.project)
+        return None if p.role == "admin" else repo.list_migrations(p.project, deleted=None)
 
     @app.get("/logs", tags=["logs"])
     def search_logs(q: str | None = None, level: str | None = Query(None, description="comma list: ERROR,WARNING"),
@@ -847,7 +856,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         if execution_id:
             ids: list[str] | None = [exec_scoped(execution_id, p)["id"]]
         elif migration_id:
-            scoped(repo.get_migration(migration_id), p, "migration")
+            scoped(repo.get_migration(migration_id, include_deleted=True), p, "migration")
             ids = [x["id"] for x in repo.list_executions(migration_id)]
         else:
             vis = visible_migrations(p)
@@ -859,7 +868,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         for r in rows:
             x = ex_cache.get(r["execution_id"]) or ex_cache.setdefault(r["execution_id"], repo.get_execution(r["execution_id"]))
             if x:
-                mg = mig_cache.get(x["migration_id"]) or mig_cache.setdefault(x["migration_id"], repo.get_migration(x["migration_id"]))
+                mg = mig_cache.get(x["migration_id"]) or mig_cache.setdefault(x["migration_id"], repo.get_migration(x["migration_id"], include_deleted=True))
                 r["kind"], r["migration_id"] = x["kind"], x["migration_id"]
                 r["migration_name"] = mg["name"] if mg else None
         return rows
@@ -871,7 +880,7 @@ def create_app(services: Services | None = None) -> FastAPI:
                       p: Principal = Depends(viewer)) -> list[dict[str, Any]]:
         """Platform events (lifecycle, worker, schedule, requeue ...) newest first; non-streaming."""
         if migration_id:
-            scoped(repo.get_migration(migration_id), p, "migration")
+            scoped(repo.get_migration(migration_id, include_deleted=True), p, "migration")
             mids: list[str] | None = [migration_id]
         else:
             vis = visible_migrations(p)
@@ -890,7 +899,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         from .. import __version__
         from ..security.audit import redact
         x = exec_scoped(xid, p)
-        mg = repo.get_migration(x["migration_id"]) or {}
+        mg = repo.get_migration(x["migration_id"], include_deleted=True) or {}
 
         def ep(eid: str | None) -> dict[str, Any] | None:
             e = repo.get_endpoint(eid) if eid else None
@@ -970,7 +979,7 @@ def create_app(services: Services | None = None) -> FastAPI:
 
     @app.post("/executions/{xid}/cancel", tags=["executions"])
     def cancel_exec(xid: str, p: Principal = Depends(operator)) -> dict[str, Any]:
-        x = exec_scoped(xid, p)
+        x = exec_scoped(xid, p, write=True)
         if ExecStatus(x["status"]) in TERMINAL_EXEC:
             raise HTTPException(409, f"execution is {x['status']}")
         repo.set_execution(xid, cancel_requested=True)
@@ -979,7 +988,7 @@ def create_app(services: Services | None = None) -> FastAPI:
     @app.post("/executions/{xid}/retry", response_model=m.ExecutionOut, tags=["executions"])
     def retry_exec(xid: str, p: Principal = Depends(operator)) -> m.ExecutionOut:
         from ..conductor.service import requeue_for_retry
-        exec_scoped(xid, p)
+        exec_scoped(xid, p, write=True)
         try:
             requeue_for_retry(repo, xid)
         except RuntimeError as e:
@@ -1092,7 +1101,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         if any(d.get("target") for d in ((r.get("state") or {}).get("disks") or {}).values()):
             raise HTTPException(409, "replica disks still exist on the target; run delete-disks first "
                                      "(or they would be orphaned)")
-        repo.delete_migration(rid)
+        repo.delete_migration(rid, p.username)
 
     @app.post("/replicas/{rid}/execute", response_model=m.ExecutionOut, status_code=202, tags=["replicas"])
     def execute_replica(rid: str, body: m.StartRequest | None = None, p: Principal = Depends(operator)) -> m.ExecutionOut:
@@ -1199,8 +1208,8 @@ def create_app(services: Services | None = None) -> FastAPI:
         if execution_id:
             exec_scoped(execution_id, p)
         if migration_id:
-            scoped(repo.get_migration(migration_id), p, "migration")
-        allowed = None if p.role == "admin" else {x["id"] for x in repo.list_migrations(p.project)}
+            scoped(repo.get_migration(migration_id, include_deleted=True), p, "migration")
+        allowed = None if p.role == "admin" else {x["id"] for x in repo.list_migrations(p.project, deleted=None)}
         cursor = int(last_event_id) if last_event_id and last_event_id.isdigit() else after
 
         async def gen() -> AsyncIterator[str]:

@@ -108,13 +108,22 @@ class Repo:
         with self.engine.begin() as c:
             c.execute(update(s.endpoints).where(s.endpoints.c.id == eid).values(**values, updated_at=time.time()))
 
-    def delete_endpoint(self, eid: str) -> None:
+    def delete_endpoint(self, eid: str) -> int:
+        """Deletes the endpoint and purges deleted migrations that still reference it (with their
+        runs and logs). Returns how many such migrations were purged."""
+        m = s.migrations
         with self.engine.begin() as c:
+            gone = [r.id for r in c.execute(select(m.c.id).where(
+                or_(m.c.source_endpoint_id == eid, m.c.target_endpoint_id == eid), m.c.deleted_at.is_not(None)))]
+            for mid in gone:
+                c.execute(delete(m).where(m.c.id == mid))
             c.execute(delete(s.endpoints).where(s.endpoints.c.id == eid))
+        return len(gone)
 
     def endpoint_in_use(self, eid: str) -> bool:
         q = select(func.count()).select_from(s.migrations).where(
-            or_(s.migrations.c.source_endpoint_id == eid, s.migrations.c.target_endpoint_id == eid))
+            or_(s.migrations.c.source_endpoint_id == eid, s.migrations.c.target_endpoint_id == eid),
+            s.migrations.c.deleted_at.is_(None))
         with self.engine.connect() as c:
             return int(c.execute(q).scalar_one()) > 0
 
@@ -129,16 +138,23 @@ class Repo:
                                                   created_at=now, updated_at=now))
         return mid
 
-    def get_migration(self, mid: str) -> dict[str, Any] | None:
+    def get_migration(self, mid: str, include_deleted: bool = False) -> dict[str, Any] | None:
+        q = select(s.migrations).where(s.migrations.c.id == mid)
+        if not include_deleted:
+            q = q.where(s.migrations.c.deleted_at.is_(None))
         with self.engine.connect() as c:
-            return _row(c.execute(select(s.migrations).where(s.migrations.c.id == mid)).first())
+            return _row(c.execute(q).first())
 
-    def list_migrations(self, project: str | None, mode: str | None = None) -> list[dict[str, Any]]:
+    def list_migrations(self, project: str | None, mode: str | None = None,
+                        deleted: bool | None = False) -> list[dict[str, Any]]:
+        """deleted=False: live ones (default); True: only deleted ones; None: both."""
         q = select(s.migrations).order_by(s.migrations.c.created_at.desc())
         if project is not None:
             q = q.where(s.migrations.c.project == project)
         if mode is not None:
             q = q.where(s.migrations.c.mode == mode)
+        if deleted is not None:
+            q = q.where(s.migrations.c.deleted_at.is_not(None) if deleted else s.migrations.c.deleted_at.is_(None))
         with self.engine.connect() as c:
             return [_row(r) for r in c.execute(q)]  # type: ignore[misc]
 
@@ -146,10 +162,34 @@ class Repo:
         with self.engine.begin() as c:
             c.execute(update(s.migrations).where(s.migrations.c.id == mid).values(**values, updated_at=time.time()))
 
-    def delete_migration(self, mid: str) -> None:
+    def delete_migration(self, mid: str, by: str | None = None) -> None:
+        """Soft delete: the migration disappears everywhere, but its executions, tasks and logs stay
+        so the run history can still be searched. Schedules and replica checksums are removed now."""
+        now = time.time()
+        with self.engine.begin() as c:
+            r = c.execute(select(s.migrations.c.name).where(s.migrations.c.id == mid,
+                                                             s.migrations.c.deleted_at.is_(None))).first()
+            if r is None:
+                return
+            suffix = f" (deleted {mid[:8]})"
+            c.execute(delete(s.replica_hashes).where(s.replica_hashes.c.migration_id == mid))
+            c.execute(delete(s.schedules).where(s.schedules.c.migration_id == mid))
+            c.execute(update(s.migrations).where(s.migrations.c.id == mid).values(
+                name=r.name[:128 - len(suffix)] + suffix, deleted_at=now, deleted_by=by, updated_at=now))
+
+    def purge_migration(self, mid: str) -> None:
+        """Hard delete: the migration row with its executions, tasks and logs (cascade)."""
         with self.engine.begin() as c:
             c.execute(delete(s.replica_hashes).where(s.replica_hashes.c.migration_id == mid))
             c.execute(delete(s.migrations).where(s.migrations.c.id == mid))
+
+    def purge_deleted_migrations(self, deleted_before: float) -> int:
+        with self.engine.begin() as c:
+            ids = [r.id for r in c.execute(select(s.migrations.c.id).where(
+                s.migrations.c.deleted_at.is_not(None), s.migrations.c.deleted_at < deleted_before))]
+            for mid in ids:
+                c.execute(delete(s.migrations).where(s.migrations.c.id == mid))
+        return len(ids)
 
     # ------------------------------------------------------------------ replica block checksums
     def get_replica_hashes(self, mid: str, disk_id: str) -> tuple[int, bytes] | None:
