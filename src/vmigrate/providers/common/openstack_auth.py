@@ -53,6 +53,9 @@ def auth_kwargs(cfg: Mapping[str, Any], who: str = "openstack") -> dict[str, Any
         # without response" on reused keep-alive connections) and 503s, with backoff
         "connect_retries": int(cfg.get("connect_retries", 5)),
         "status_code_retries": int(cfg.get("status_code_retries", 3)),
+        # without a timeout a dropped network hangs each call for minutes (seen live: Keystone
+        # "connect timeout=None" took 4.5 min to fail); a failed call is retried by the task
+        "api_timeout": float(cfg.get("api_timeout", 30)),
     }
     if cfg.get("user_domain_id"):
         kw["user_domain_id"] = cfg["user_domain_id"]

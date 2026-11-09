@@ -14,8 +14,9 @@ Semantics:
     TaskOutcome or None. TaskOutcome.children EXPANDS the graph at runtime (e.g. "deploy disks"
     returns one "replicate_disk" task per disk): children depend on the parent, and every task
     that depended on the parent now also depends on all the children.
-  * Retries: only errors whose class is in `retry_on` are retried (exponential backoff, up to
-    TaskSpec.max_attempts). Safety-gate errors are never retried.
+  * Retries: only errors whose class is in `retry_on`, or for which `retry_if(e)` is true, are
+    retried (exponential backoff capped at backoff_max, up to TaskSpec.max_attempts; a cancel ends
+    the wait). Safety-gate errors are never retried.
   * Resume: COMPLETED tasks are never re-run. reset_for_resume() turns FAILED/CANCELED/RUNNING
     back into PENDING so a re-queued execution continues where it stopped.
   * Cancel: cancel_check() polled between tasks and inside handlers via ctx.check_cancel();
@@ -35,6 +36,12 @@ from enum import StrEnum
 from typing import Any, Protocol
 
 log = logging.getLogger("vmigrate.dag")
+
+# Disk copy tasks resume from their durable watermark, so retrying them is cheap and safe. 8 attempts
+# with backoff 2^n s capped at 5 min ride out a network outage of ~8-10 minutes (seen live: a cut
+# mid-copy used to fail the task after 3 attempts within ~6 s).
+COPY_ATTEMPTS = 8
+BACKOFF_MAX = 300.0
 
 
 class TaskStatus(StrEnum):
@@ -223,6 +230,7 @@ class DagRunner:
         max_parallel: int = 4,
         cancel_check: Callable[[], bool] = lambda: False,
         retry_on: tuple[type[BaseException], ...] = (),
+        retry_if: Callable[[BaseException], bool] | None = None,
         backoff_base: float = 2.0,
         backoff_max: float = 120.0,
         on_event: EventSink | None = None,
@@ -235,6 +243,7 @@ class DagRunner:
         self._cancel_check = cancel_check
         self._cancelled = threading.Event()
         self.retry_on = retry_on
+        self.retry_if = retry_if
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
         self.on_event = on_event
@@ -273,13 +282,22 @@ class DagRunner:
                     return handler(TaskContext(self, rec))
                 except TaskCanceled:
                     raise
-                except self.retry_on as e:  # type: ignore[misc]
-                    if rec.attempts >= rec.max_attempts or self.cancelled():
+                except Exception as e:
+                    retryable = isinstance(e, self.retry_on) or (self.retry_if is not None and self.retry_if(e))
+                    if not retryable or rec.attempts >= rec.max_attempts or self.cancelled():
                         raise
                     delay = min(self.backoff_max, self.backoff_base ** rec.attempts)
-                    rec.message = f"attempt {rec.attempts} failed ({type(e).__name__}: {e}); retrying in {delay:.0f}s"
+                    rec.message = (f"attempt {rec.attempts}/{rec.max_attempts} failed ({type(e).__name__}: "
+                                   f"{str(e)[:300]}); retrying in {delay:.0f}s")
+                    log.warning("task %s: %s", rec.id, rec.message)
                     self._persist(rec, event="task.retry")
-                    self.sleep(delay)
+                    left = delay
+                    while left > 0 and not self.cancelled():   # a cancel ends the wait, not just the next try
+                        step = min(1.0, left)
+                        self.sleep(step)
+                        left -= step
+                    if self.cancelled():
+                        raise
         finally:
             current.task_id = None
 

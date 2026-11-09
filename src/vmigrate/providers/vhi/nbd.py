@@ -23,7 +23,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import IO
 
-from ...core.errors import ProviderError
+from ...core.errors import ProviderError, TransientProviderError
 from ...core.interfaces import DiskReader, DiskWriter
 from . import nbd_agent as A
 
@@ -40,6 +40,11 @@ def agent_command(device: str, *, writable: bool, python: str = "python3", sudo:
 
 class NbdError(ProviderError):
     pass
+
+
+class NbdConnectionLost(NbdError, TransientProviderError):
+    """The SSH/NBD stream to the helper broke (network cut, helper rebooted). Retryable: the copy
+    resumes from its durable watermark over a fresh connection."""
 
 
 class _Pending:
@@ -96,7 +101,8 @@ class NbdClient:
                     err = proc.stderr.read() or b""
                 except OSError:
                     pass
-            raise NbdError(f"helper NBD agent did not start: {e}; {err.decode(errors='replace').strip()[:800]}") from e
+            raise NbdConnectionLost(f"helper NBD agent did not start: {e}; "
+                                    f"{err.decode(errors='replace').strip()[:800]}") from e
 
     def _read(self, n: int) -> bytes:
         buf = bytearray()
@@ -152,11 +158,11 @@ class NbdClient:
                 self._slots.release()
         except BaseException as e:  # noqa: BLE001 - fail every waiter, never hang
             if not self._closing:
-                self._err = self._err or (e if isinstance(e, NbdError) else NbdError(f"NBD connection lost: {e}"))
+                self._err = self._err or (e if isinstance(e, NbdError) else NbdConnectionLost(f"NBD connection lost: {e}"))
             with self._plock:
                 left, self._pending = list(self._pending.values()), {}
             for p in left:
-                p.err = self._err or NbdError("NBD connection closed")
+                p.err = self._err or NbdConnectionLost("NBD connection closed")
                 p.done.set()
                 self._slots.release()
 
