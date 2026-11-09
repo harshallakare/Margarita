@@ -422,7 +422,8 @@ export default function ReplicaDetail() {
       {modal === "delete" && <Modal title={`Delete ${r.name}?`} onClose={() => setModal(null)} footer={<>
         <button className="btn" onClick={() => setModal(null)}>Cancel</button>
         <button className="btn danger solid" onClick={() => act(async () => { await api.del(`/replicas/${r.id}`); nav("/replicas"); })}>Delete record</button></>}>
-        <p style={{ marginTop: 0 }}>Removes the replica record, its schedules and run history from vmigrate.</p></Modal>}
+        <p style={{ marginTop: 0 }}>Removes the replica from the list and deletes its schedules. Its runs and logs are kept for 90 days (by default)
+          and stay searchable on the Logs page under "Deleted".</p></Modal>}
       {(modal === "sched" || (modal && typeof modal === "object")) && (
         <CronEditor initial={typeof modal === "object" ? modal.cron : undefined} onClose={() => setModal(null)} onSave={async (c) => {
           if (typeof modal === "object" && modal) await api.patch(`/schedules/${modal.id}`, { cron: c });

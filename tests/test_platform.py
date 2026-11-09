@@ -283,3 +283,49 @@ def test_execution_transfer_bytes(plat):
     assert listed == t
     tasks = plat.c.get(f"/executions/{xid}/tasks", headers=plat.admin).json()
     assert all(tk["params"]["size_bytes"] == 9 << 20 for tk in tasks if tk["kind"] == "replicate_disk")
+
+
+def test_deleted_migration_keeps_runs_and_logs_until_purged(plat):
+    c, repo = plat.c, plat.svc.repo
+    src, tgt = plat.endpoints()
+    mid = plat.migration(src, tgt)
+    xid = c.post(f"/migrations/{mid}/start", headers=plat.admin, json={"dry_run": False}).json()["id"]
+    plat.drive()
+    assert c.get(f"/executions/{xid}", headers=plat.viewer).json()["status"] == "completed"
+    assert c.delete(f"/migrations/{mid}", headers=plat.admin).status_code == 204
+    # gone from lists and detail pages, actions refused ...
+    assert c.get("/migrations", headers=plat.viewer).json() == []
+    assert c.get(f"/migrations/{mid}", headers=plat.viewer).status_code == 404
+    assert c.post(f"/migrations/{mid}/start", headers=plat.admin, json={}).status_code == 404
+    assert c.post(f"/executions/{xid}/retry", headers=plat.admin).status_code == 409
+    # ... but the run, its tasks and logs are still there
+    gone = c.get("/migrations?deleted=true", headers=plat.viewer).json()
+    assert [g["id"] for g in gone] == [mid] and gone[0]["deleted_by"] == "admin"
+    assert gone[0]["name"] == f"ris (deleted {mid[:8]})"
+    d = c.get(f"/migrations/{mid}?include_deleted=true", headers=plat.viewer).json()
+    assert d["deleted_at"]
+    assert c.get(f"/executions/{xid}/tasks", headers=plat.viewer).json()
+    assert c.get(f"/executions/{xid}/logs", headers=plat.viewer).json()
+    rows = c.get(f"/logs?migration_id={mid}&level=INFO", headers=plat.viewer).json()
+    assert rows and rows[0]["migration_name"] == f"ris (deleted {mid[:8]})"
+    assert c.get("/logs?level=INFO", headers=plat.viewer).json()                  # in the "all" search too
+    assert any(x["id"] == xid for x in c.get("/executions", headers=plat.viewer).json())
+    # the name is free again, and endpoints are no longer "in use"
+    assert plat.migration(src, tgt)
+    # retention: purged with its runs after VMIGRATE_DELETED_RETENTION_DAYS
+    import time as _t
+    assert plat.conductor.purge_deleted(_t.time() + 30 * 86400) == 0               # default 90 days
+    plat.conductor._last_purge_deleted = 0
+    assert plat.conductor.purge_deleted(_t.time() + 91 * 86400) == 1
+    assert repo.get_migration(mid, include_deleted=True) is None and repo.get_execution(xid) is None
+    assert repo.get_logs(xid, None, 0, 10) == []
+
+
+def test_deleting_an_endpoint_purges_deleted_migrations_that_used_it(plat):
+    c, repo = plat.c, plat.svc.repo
+    src, tgt = plat.endpoints()
+    mid = plat.migration(src, tgt)
+    assert c.delete(f"/endpoints/{src}", headers=plat.admin).status_code == 409
+    assert c.delete(f"/migrations/{mid}", headers=plat.admin).status_code == 204
+    assert c.delete(f"/endpoints/{src}", headers=plat.admin).status_code == 204     # FK would otherwise refuse
+    assert repo.get_migration(mid, include_deleted=True) is None

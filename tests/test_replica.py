@@ -173,6 +173,9 @@ def test_delete_disks_then_delete_replica(rep):
     assert rep.run("delete-disks")["status"] == "completed"
     assert not [k for k in rep.registry()["disks"] if k.startswith("ris-dr-r")]
     assert rep.c.delete(f"/replicas/{rep.rid}", headers=rep.admin).status_code == 204
+    assert rep.c.get(f"/replicas/{rep.rid}", headers=rep.viewer).status_code == 404
+    gone = rep.c.get("/migrations?deleted=true", headers=rep.viewer).json()       # runs + logs kept
+    assert [g["mode"] for g in gone] == ["replica"] and rep.svc.repo.list_executions(rep.rid)
 
 
 def test_schema_upgrade_adds_columns(tmp_path):

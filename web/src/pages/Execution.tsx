@@ -33,7 +33,7 @@ export default function Execution() {
   const { can } = useAuth();
   const ex = useLoad(() => api.get<Exec>(`/executions/${id}`), [id], 5000);
   const tasks = useLoad(() => api.get<Task[]>(`/executions/${id}/tasks`), [id], 5000);
-  const mig = useLoad(() => ex.data ? api.get<Migration>(`/migrations/${ex.data.migration_id}`) : Promise.resolve(null),
+  const mig = useLoad(() => ex.data ? api.get<Migration>(`/migrations/${ex.data.migration_id}?include_deleted=true`) : Promise.resolve(null),
                       [ex.data?.migration_id]);
   const [sel, setSel] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogLine[]>([]);
@@ -117,7 +117,8 @@ export default function Execution() {
     <>
       <div className="page-head">
         <div>
-          <div className="crumbs"><Link to={isRep ? "/replicas" : "/migrations"}>{isRep ? "Replicas" : "Migrations"}</Link> / {mig.data ? <Link to={home}>{mig.data.name}</Link> : "…"} /</div>
+          <div className="crumbs"><Link to={isRep ? "/replicas" : "/migrations"}>{isRep ? "Replicas" : "Migrations"}</Link> / {mig.data ? (mig.data.deleted_at ? <span title={`deleted by ${mig.data.deleted_by ?? "?"}`}>{mig.data.name}</span>
+            : <Link to={home}>{mig.data.name}</Link>) : "…"} /</div>
           <div className="row"><h1>{KIND_LABEL[x.kind] ?? x.kind}{x.dry_run ? " · dry-run" : ""}</h1><Status s={x.status} />
             {x.dry_run && <span className="tag">nothing is changed</span>}
             {x.cancel_requested && LIVE.includes(x.status) && <span className="pill warn">cancelling</span>}</div>
@@ -129,7 +130,7 @@ export default function Execution() {
                     .catch((e) => setErr(errText(e)))}>Download diagnostics</button>
           {can("admin") && <Link className="btn ghost" to={`/audit?object_id=${x.migration_id}`}>Audit trail</Link>}
         </div>
-        {can("operator") && <div className="row">
+        {can("operator") && !mig.data?.deleted_at && <div className="row">
           {live && !x.cancel_requested && <button className="btn danger" onClick={async () => {
             try { await api.post(`/executions/${x.id}/cancel`); setToast("Cancel requested; running disk copies stop at their next checkpoint"); ex.reload(); }
             catch (e) { setErr(errText(e)); }
@@ -141,6 +142,9 @@ export default function Execution() {
         </div>}
       </div>
       <ErrorBox error={err} title="Action failed" />
+      {mig.data?.deleted_at && <div className="alert info" style={{ marginBottom: 16 }}>
+        <b>Its {isRep ? "replica" : "migration"} was deleted</b> {fmt.ago(mig.data.deleted_at)}{mig.data.deleted_by ? ` by ${mig.data.deleted_by}` : ""}.
+        This run is kept so its tasks and logs can still be read.</div>}
       {x.status === "queued" && x.waiting_reason && <div className="alert warn" style={{ marginBottom: 16 }}>
         <b>Waiting for a suitable worker.</b> {x.waiting_reason}</div>}
       {x.status === "failed" && <div className="alert bad" style={{ marginBottom: 16 }}><b>Failed{failedTask ? ` in “${failedTask.label}”` : ""}.</b>

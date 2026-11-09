@@ -261,6 +261,8 @@ class MigrationOut(BaseModel):
     created_at: float
     updated_at: float
     last_execution: ExecutionOut | None = None
+    deleted_at: float | None = None       # set on deleted migrations/replicas (GET /migrations?deleted=true)
+    deleted_by: str | None = None
 
 
 class TaskOut(BaseModel):

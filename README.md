@@ -392,6 +392,10 @@ injection on your image, and throughput over SSH (expect lower speeds than `vsto
   removed directly in the database.
 - **Retention:** entries older than `VMIGRATE_AUDIT_RETENTION_DAYS` (default 365; 0 keeps them forever) are
   purged daily, and the purge itself is recorded. **Export CSV** (`GET /audit/export`) saves a copy first.
+- **Deleted migrations keep their run history:** deleting a migration or replica hides it everywhere, but its
+  runs, tasks and logs stay searchable on the Logs page (listed as "name (deleted <id>)"; `GET
+  /migrations?deleted=true`). They are removed for good after `VMIGRATE_DELETED_RETENTION_DAYS` (default 90;
+  0 keeps them forever), or when an endpoint they used is deleted. Deleting never touches source or target VMs.
 
 ## Repository layout
 
