@@ -46,7 +46,7 @@ from ..core.interfaces import CheckpointRef, DiskHints, SnapshotRef, SourceProvi
 from ..ir import DiskSpec, GuestOS, OsFamily, VmSpec
 from . import safety
 from .copier import HASH_BLOCK, BlockHashes, RateMeter, align_ranges, copy_disk
-from .dag import Handler, TaskContext, TaskOutcome, TaskSpec
+from .dag import COPY_ATTEMPTS, Handler, TaskContext, TaskOutcome, TaskSpec
 from .pipeline import MigrationRunner, _ref_to_dict, _snap, _tdisk
 from .state import DiskState, MigrationState, Phase
 from .verify import check_size, compare_samples, full_verify, sample_offsets
@@ -395,7 +395,7 @@ class ReplicaRunner:
             self.state.consistent = False   # writes start now
         self._save()
         children = [TaskSpec(f"replicate_disk:{d.id}", "replicate_disk", params={"disk_id": d.id, "size_bytes": d.size_bytes},
-                             max_attempts=3,
+                             max_attempts=COPY_ATTEMPTS,
                              label=f"Disk {d.order:02d} {d.address} ({_gib(d.size_bytes)}) · {self._mode_for(d)}")
                     for d in sorted(s.disks, key=lambda d: -d.size_bytes)]
         return TaskOutcome(children=children, message=f"{len(s.disks)} replica disks ready")

@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from ...core.context import RunContext
-from ...core.errors import ConfigError, ProviderError, SafetyGateError
+from ...core.errors import ConfigError, ProviderError, SafetyGateError, TransientProviderError
 from ...core.retry import poll_until
 
 MANAGED = "vmigrate:managed"
@@ -68,8 +68,10 @@ class SshTransport:
     def run(self, cmd: str, timeout: float = 120) -> str:
         p = subprocess.run(self.argv(cmd), capture_output=True, timeout=timeout)
         if p.returncode != 0:
-            raise ProviderError(f"helper ssh `{cmd[:80]}` failed ({p.returncode}): "
-                                f"{p.stderr.decode(errors='replace').strip()[:600]}")
+            # ssh exits 255 when it cannot connect / the connection drops (not the remote command)
+            cls = TransientProviderError if p.returncode == 255 else ProviderError
+            raise cls(f"helper ssh `{cmd[:80]}` failed ({p.returncode}): "
+                      f"{p.stderr.decode(errors='replace').strip()[:600]}")
         return p.stdout.decode(errors="replace")
 
     def popen(self, cmd: str) -> subprocess.Popen:
@@ -405,6 +407,15 @@ class HelperVm:
         if (vol.get("metadata") or {}).get(MANAGED) != "true":
             raise SafetyGateError(f"refusing to attach volume {volume_id} to the helper: not vmigrate-managed")
         self.ctx.require_execute("attach volume to helper VM", volume=volume_id, helper=self.name)
+        if vol.get("status") != "available":
+            # resumed run: the previous helper was just deleted; Cinder releases its volumes a little later
+            self.ctx.logger.info("volume %s is %s; waiting for it to be released before attaching",
+                                 volume_id, vol.get("status"))
+            poll_until(lambda: self.api.get_volume(volume_id), lambda v: v.get("status") == "available",
+                       failed=lambda v: str(v.get("status", "")).startswith("error"),
+                       timeout=float(self.cfg.get("helper_release_timeout", 600)), interval=self.poll,
+                       what=f"volume {volume_id} released (status {vol.get('status')}; still attached to "
+                            f"another server?)")
         self.api.attach_volume(self.server["id"], volume_id)
         poll_until(lambda: self.api.get_volume(volume_id), lambda v: v.get("status") == "in-use",
                    failed=lambda v: str(v.get("status", "")).startswith("error"),
@@ -478,6 +489,7 @@ class HelperVm:
         self.transport = self.host = None
         shutil.rmtree(self.dir, ignore_errors=True)
         if errors:
-            raise ProviderError(f"helper VM cleanup incomplete; remove by hand anything named {self.name}*: "
-                                + "; ".join(errors))
+            raise ProviderError(f"helper VM cleanup incomplete: {self.name} may still exist. Resuming this "
+                                f"execution removes it; otherwise delete anything named {self.name}* by hand. "
+                                + "; ".join(e[:400] for e in errors))
         self.ctx.logger.info("helper VM %s removed", self.name)

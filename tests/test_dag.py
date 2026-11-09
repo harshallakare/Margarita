@@ -87,7 +87,9 @@ def test_transient_errors_retry_with_backoff_but_gates_do_not():
 
     store = MemoryTaskStore([TaskSpec("f", "flaky", max_attempts=3)])
     r = DagRunner(store, {"flaky": flaky}, retry_on=(TransientProviderError,), sleep=sleeps.append)
-    assert r.run() == ExecStatus.COMPLETED and calls["flaky"] == 3 and sleeps == [2.0, 4.0]
+    assert r.run() == ExecStatus.COMPLETED and calls["flaky"] == 3
+    assert sleeps == [1.0] * 6                       # backoff 2 s then 4 s, waited in 1 s steps (cancel-aware)
+    sleeps.clear()
 
     store = MemoryTaskStore([TaskSpec("g", "gate", max_attempts=5)])
     assert DagRunner(store, {"gate": gate}, retry_on=(TransientProviderError,), sleep=sleeps.append).run() \

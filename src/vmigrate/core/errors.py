@@ -63,3 +63,33 @@ class ManualMorphRequired(MigrationError):
 class ChangeTrackingUnavailable(ProviderError):
     """The source cannot answer "what changed" for this disk right now (e.g. VMware CBT was reset or
     the change id is unknown). Replica sync falls back to compare mode for that disk; never fatal."""
+
+
+def is_transient(e: BaseException) -> bool:
+    """Safe to retry after a pause: provider-declared transient errors and network-level failures
+    (connection refused / reset / unreachable, connect and read timeouts), including those raised by
+    requests and keystoneauth (OpenStack). Seen live: a network cut mid-copy surfaced as an NBD
+    "connection lost" and then as Keystone ConnectTimeout / Nova "No route to host" on resume.
+    TLS/certificate errors are NOT transient: retrying cannot fix a wrong certificate."""
+    import ssl
+    import subprocess
+    if isinstance(e, TransientProviderError):
+        return True
+    names = {c.__name__ for c in type(e).__mro__}
+    if isinstance(e, ssl.SSLError) or "SSLError" in names:
+        return False
+    if isinstance(e, (ConnectionError, TimeoutError, subprocess.TimeoutExpired)):
+        return True
+    try:
+        import requests
+        if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+            return True
+    except ImportError:
+        pass
+    try:
+        from keystoneauth1.exceptions import connection as ksa
+        if isinstance(e, (ksa.ConnectFailure, ksa.ConnectTimeout, ksa.UnknownConnectionError)):
+            return True
+    except ImportError:
+        pass
+    return False

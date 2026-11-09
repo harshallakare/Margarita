@@ -18,6 +18,8 @@ Replica simulation (source): `generation: N` advances the disks N "change genera
 generation rewrites ~1/8 of the 64 KiB blocks. A snapshot captures the generation it was taken at.
 `cbt: true` makes changed_regions() report exactly the blocks changed between two snapshots
 (like Nutanix CRT / VMware CBT); without it the engine falls back to full read + compare.
+`drop_reads: N` makes the first N reads past 1 MiB fail with ConnectionResetError (network cut);
+target `fail_close: true` makes cleanup fail (tests of resilience).
 `change_limit: <bytes>` confines changes to the start of each disk (tests of localized writes).
 """
 
@@ -52,6 +54,9 @@ from ...ir import CpuSpec, DiskBus, DiskSpec, Firmware, GuestOS, NicSpec, OsFami
 
 _BLOCK = 64 << 10
 _ZERO_STRIDE = 4 << 20
+
+
+_DROP_LOCK = threading.Lock()
 
 
 def _changed_in(seed: bytes, i: int, gen: int) -> bool:
@@ -186,6 +191,17 @@ class FakeSource(SourceProvider):
                 _time.sleep(delay)
                 return inner_read(offset, length)
             r.read = slow_read  # type: ignore[method-assign]
+        if int(self.config.get("drop_reads") or 0) > 0:     # tests: a network cut mid-copy, N times
+            inner = r.read
+
+            def dropping_read(offset: int, length: int) -> bytes:
+                with _DROP_LOCK:
+                    left = self.__dict__.setdefault("_drops_left", int(self.config["drop_reads"]))
+                    if offset >= (1 << 20) and left > 0:
+                        self._drops_left = left - 1
+                        raise ConnectionResetError("fake: connection reset by peer (network cut)")
+                return inner(offset, length)
+            r.read = dropping_read  # type: ignore[method-assign]
         return r
 
     def supports_cbt(self) -> bool:
@@ -296,6 +312,8 @@ class FakeTarget(TargetProvider):
         if self._helper_id is not None:
             self.release_helper({"server_id": self._helper_id})
             self._helper_id = None
+        if self.config.get("fail_close"):                    # tests: cleanup cannot reach the platform
+            raise ProviderError("fake: cleanup failed: No route to host")
 
     def _save(self) -> None:
         if not self.persist:

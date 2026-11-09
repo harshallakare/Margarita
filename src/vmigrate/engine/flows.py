@@ -26,7 +26,7 @@ from typing import Any
 from ..core.errors import SafetyGateError
 from ..core.interfaces import TargetDiskRef, VmRef
 from ..ir import VmSpec
-from .dag import Handler, TaskContext, TaskOutcome, TaskSpec
+from .dag import COPY_ATTEMPTS, Handler, TaskContext, TaskOutcome, TaskSpec
 from .pipeline import MigrationRunner, _snap, _tdisk
 from .report import write_report
 from .state import Phase
@@ -131,7 +131,7 @@ def migration_handlers(runner: MigrationRunner) -> dict[str, Handler]:
         r = runner._create_disks(s)
         children = [
             TaskSpec(f"replicate_disk:{d.id}", "replicate_disk", params={"disk_id": d.id, "size_bytes": d.size_bytes},
-                     max_attempts=3,
+                     max_attempts=COPY_ATTEMPTS,
                      label=f"Disk {d.order:02d} {d.address} ({_gib(d.size_bytes)})")
             for d in sorted(s.disks, key=lambda d: -d.size_bytes)   # pitfall 10: largest first
         ]

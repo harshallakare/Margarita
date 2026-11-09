@@ -23,10 +23,10 @@ import uuid
 from typing import Any
 
 from ..core.context import RunContext
-from ..core.errors import TransientProviderError
+from ..core.errors import TransientProviderError, is_transient
 from ..db.repo import SqlTaskStore
 from ..engine import dag as dagmod
-from ..engine.dag import DagRunner, ExecStatus, TaskRecord, TaskStatus
+from ..engine.dag import BACKOFF_MAX, DagRunner, ExecStatus, TaskRecord, TaskStatus
 from ..engine.flows import migration_handlers, record_failure
 from ..platform.factory import Services
 
@@ -191,7 +191,8 @@ class Worker:
             try:
                 dag = DagRunner(SqlTaskStore(repo, xid), handlers,
                                 max_parallel=runner.engine.max_parallel_disks, cancel_check=cancel_check,
-                                retry_on=(TransientProviderError,), on_event=on_event)
+                                retry_on=(TransientProviderError,), retry_if=is_transient,
+                                backoff_max=BACKOFF_MAX, on_event=on_event)
                 dag_ref["dag"] = dag
                 status = dag.run()
                 if status != ExecStatus.COMPLETED:
@@ -203,11 +204,24 @@ class Worker:
                     else:
                         runner.record_failure(kind, error)
             finally:
+                # Cleanup (helper VM, sessions) must never replace the run's real outcome. Seen live: a
+                # network cut failed the copy, then the helper cleanup failed too and its error became
+                # the execution's error. A leftover helper is removed when the execution is resumed.
+                def quietly(what: str, fn: Any) -> None:
+                    nonlocal error
+                    try:
+                        fn()
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("execution %s: %s failed: %s", xid, what, e)
+                        note = f"cleanup ({what}) incomplete: {e}"
+                        error = f"{error}; {note}" if error else None
+                        repo.add_event("execution.cleanup_failed", {"what": what, "error": str(e)[:2000]},
+                                       execution_id=xid, migration_id=mid)
                 if kind == "migration":
-                    runner.source.close()
-                    runner.target.close()
+                    quietly("source", runner.source.close)
+                    quietly("target", runner.target.close)
                 else:
-                    runner.finish(kind, status == ExecStatus.COMPLETED)
+                    quietly("source + target", lambda: runner.finish(kind, status == ExecStatus.COMPLETED))
         except Exception as e:  # noqa: BLE001 - provider build / config errors
             status, error = ExecStatus.FAILED, f"{type(e).__name__}: {e}"
             log.exception("execution %s failed before/outside the task graph", xid)
