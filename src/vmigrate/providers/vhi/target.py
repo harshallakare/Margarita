@@ -34,6 +34,8 @@ Usage (config):
         preserve_mac: false                   # create Neutron ports with the source MAC/IP
         boot_bus: scsi                        # hw_disk_bus on the boot volume (pitfall 6)
         verify_after_commit: true             # sampled read-back of the qcow2 via qemu-img dd
+        windows_boot_grace: 120               # boot check: Windows passes after this long ACTIVE, no errors
+        linux_console_quiet: 240              # boot check: Linux passes when the serial console is silent this long
     migrations[].target_options: {flavor, network_map, availability_zone}
 
 Disk path (proven by hand):
@@ -538,12 +540,17 @@ class VhiTarget(TargetProvider):
                    progress: Any = None) -> BootCheck:
         """Linux: wait for a login prompt / boot failure on the serial console. Windows writes nothing
         there, so after `windows_boot_grace` seconds ACTIVE with no error the check passes (and says to
-        confirm in the VHI console) instead of waiting the whole timeout (seen live: a 15-minute wait)."""
+        confirm in the VHI console) instead of waiting the whole timeout (seen live: a 15-minute wait).
+        Many Linux guests have no serial console either (no console=ttyS0, no getty on ttyS0): seen
+        live, a booted guest left 2 firmware lines and the check failed after 15 minutes. So when the
+        console has not changed for `linux_console_quiet` seconds while the server is ACTIVE, the
+        check passes the same way, asking to confirm in the VHI console."""
         say = progress or self.ctx.logger.info
         grace = float(self.config.get("windows_boot_grace", 120))
+        quiet = float(self.config.get("linux_console_quiet", 240))
         start = time.monotonic()
         deadline, last_say = start + timeout, -1e9
-        log = ""
+        log, prev, changed_at = "", None, start
         while time.monotonic() < deadline:
             s = self.api.get_server(vm.id)
             status = str(s.get("status", ""))
@@ -558,14 +565,22 @@ class VhiTarget(TargetProvider):
             for pat in BOOT_OK_PATTERNS:
                 if re.search(pat, log, re.I | re.M):
                     return BootCheck(True, "login prompt reached", log)
-            el = time.monotonic() - start
+            now = time.monotonic()
+            if log != prev:
+                prev, changed_at = log, now
+            el = now - start
+            if guest_os != "windows" and status == "ACTIVE" and now - changed_at >= quiet:
+                return BootCheck(True, f"server ACTIVE for {int(el)}s with no errors; the serial console stayed silent "
+                                       f"for {int(now - changed_at)}s ({len(log.splitlines())} line(s)), so this guest "
+                                       "does not log there. Confirm the login screen in the VHI console", log)
             if guest_os == "windows" and status == "ACTIVE" and el >= grace:
                 return BootCheck(True, f"Windows: server ACTIVE for {int(el)}s with no errors. Windows writes nothing to "
                                        "the serial console, so confirm the login screen in the VHI console", log)
             if el - last_say >= 60:
                 last_say = el
                 what = (f"Windows: passes after {int(grace)}s ACTIVE without errors" if guest_os == "windows"
-                        else "waiting for a login prompt on the serial console")
+                        else f"waiting for a login prompt on the serial console (passes after {int(quiet)}s "
+                             "of console silence with the server ACTIVE)")
                 say(f"boot check: server {status or '?'}, {int(el)}s of {int(timeout)}s, console has "
                     f"{len(log.splitlines())} line(s); {what}")
             time.sleep(self.poll * 2)

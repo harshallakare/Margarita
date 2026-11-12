@@ -349,3 +349,21 @@ def test_vhi_cleanup_treats_already_deleted_objects_as_done(tmp_path):
     t.cleanup_on_failure(created)
     assert api.volumes == {}
     t.cleanup_on_failure(created)                     # repeat: still no error
+
+
+def test_vhi_boot_check_linux_without_serial_console_passes_after_silence(tmp_path):
+    """Seen live: a booted Linux guest (no console=ttyS0) left 2 firmware lines on the serial
+    console; the check waited 15 minutes and failed. A silent console with the server ACTIVE passes
+    with a note to confirm in the VHI console; boot failure patterns still fail at once."""
+    t, api = _tgt(tmp_path, linux_console_quiet=0)
+    sid = api.create_server(name="l", flavor_id="f", networks=[], block_device_mapping=[], metadata={})["id"]
+    api.console = "BdsDxe: loading Boot0001\nBdsDxe: starting Boot0001"
+    bc = t.check_boot(VmRef(sid, "l"), timeout=30, guest_os="linux")
+    assert bc.ok and "serial console stayed silent" in bc.detail and "VHI console" in bc.detail
+    api.console += "\nYou are in emergency mode."
+    assert not t.check_boot(VmRef(sid, "l"), timeout=30, guest_os="linux").ok
+    t2, api2 = _tgt(tmp_path / "b")                       # default quiet window (240 s) > timeout
+    sid2 = api2.create_server(name="l", flavor_id="f", networks=[], block_device_mapping=[], metadata={})["id"]
+    api2.console = "BdsDxe: loading Boot0001"
+    bc = t2.check_boot(VmRef(sid2, "l"), timeout=0.05, guest_os="linux")
+    assert not bc.ok and "no login prompt" in bc.detail
