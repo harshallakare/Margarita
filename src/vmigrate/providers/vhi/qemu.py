@@ -15,10 +15,10 @@ from __future__ import annotations
 
 import os
 import struct
-import subprocess
 import tempfile
 from pathlib import Path
 
+from ...core import cancel
 from ...core.errors import ProviderError
 from ...core.interfaces import DiskReader
 
@@ -62,7 +62,7 @@ class QemuImg:
         self.binary = binary
 
     def run(self, argv: list[str], timeout: float | None = None) -> str:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        p = cancel.run(argv, capture_output=True, text=True, timeout=timeout)
         if p.returncode != 0:
             raise ProviderError(f"{' '.join(argv[:2])} failed ({p.returncode}): {p.stderr.strip()[:2000]}")
         return p.stdout

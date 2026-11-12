@@ -35,6 +35,9 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Protocol
 
+from ..core import cancel
+from ..core.errors import OperationCanceled
+
 log = logging.getLogger("vmigrate.dag")
 
 # Disk copy tasks resume from their durable watermark, so retrying them is cheap and safe. 8 attempts
@@ -64,7 +67,7 @@ class ExecStatus(StrEnum):
 TERMINAL_EXEC = {ExecStatus.COMPLETED, ExecStatus.FAILED, ExecStatus.CANCELED}
 
 
-class TaskCanceled(Exception):
+class TaskCanceled(OperationCanceled):
     """Raised inside a handler when the execution was canceled."""
 
 
@@ -294,8 +297,9 @@ class DagRunner:
             while True:
                 rec.attempts += 1
                 try:
-                    return handler(TaskContext(self, rec))
-                except TaskCanceled:
+                    with cancel.bound(self.cancelled):   # waits/commands in this thread stop on cancel
+                        return handler(TaskContext(self, rec))
+                except OperationCanceled:
                     raise
                 except Exception as e:
                     retryable = isinstance(e, self.retry_on) or (self.retry_if is not None and self.retry_if(e))
@@ -371,7 +375,7 @@ class DagRunner:
                         rec.message = out.message or rec.message
                         self.results[rec.id] = rec.result
                         self._persist(rec, event="task.completed")
-                    elif isinstance(exc, TaskCanceled):
+                    elif isinstance(exc, OperationCanceled):
                         rec.status, rec.error = TaskStatus.CANCELED, str(exc)
                         self._persist(rec, event="task.canceled")
                     else:

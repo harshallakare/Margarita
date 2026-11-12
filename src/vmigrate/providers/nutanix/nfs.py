@@ -23,11 +23,11 @@ from __future__ import annotations
 import os
 import re
 import socket
-import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from ...core import cancel
 from ...core.errors import ProviderError
 
 BASE = "/run/margarita/ntnx"
@@ -55,7 +55,7 @@ def is_mounted(path: str, mounts_file: str = "/proc/mounts") -> bool:
 
 class NfsMounter:
     def __init__(self, host: str, *, base: str = BASE, options: str = OPTIONS,
-                 run: Callable[..., Any] = subprocess.run, mounted: Callable[[str], bool] = is_mounted):
+                 run: Callable[..., Any] = cancel.run, mounted: Callable[[str], bool] = is_mounted):
         self.host, self.base, self.options = host, base, options
         self._run, self._mounted = run, mounted
         self.ours: list[str] = []

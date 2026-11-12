@@ -222,6 +222,9 @@ class Repo:
         """Creates a PENDING execution. Refuses a second active execution for the same migration
         (one state blob per migration => one writer)."""
         xid = _id()
+        stopping = self.stopping_execution(mid)
+        if stopping is not None:
+            raise RuntimeError(f"a worker is still stopping the force-canceled run {stopping}; try again in a minute")
         with self.engine.begin() as c:
             busy = c.execute(select(s.executions.c.id).where(
                 s.executions.c.migration_id == mid, s.executions.c.status.in_(ACTIVE_EXEC))).first()
@@ -231,6 +234,36 @@ class Repo:
                                                   status=ExecStatus.PENDING.value, cancel_requested=False,
                                                   runs=0, created_by=user_id, created_at=time.time()))
         return xid
+
+    def stopping_execution(self, mid: str, *, fresh_s: float = 180) -> str | None:
+        """A force-canceled run that a live worker is still winding down (its threads finish the
+        current step, remove the helper VM). Starting another run of the same migration meanwhile
+        would put two writers on one state blob, so callers refuse until it is gone."""
+        since = time.time() - fresh_s
+        q = (select(s.executions.c.id)
+             .join(s.workers, s.workers.c.current_execution == s.executions.c.id)
+             .where(s.executions.c.migration_id == mid, s.executions.c.status.notin_(ACTIVE_EXEC),
+                    s.workers.c.heartbeat_at >= since))
+        with self.engine.connect() as c:
+            row = c.execute(q).first()
+        return row[0] if row else None
+
+    def force_cancel_execution(self, xid: str, by: str | None) -> int:
+        """Force-cancel: the execution is CANCELED now, without waiting for its worker. Running and
+        pending tasks are marked canceled. The worker loses its lease, stops at its next check and
+        never writes over this outcome. Returns how many tasks were marked."""
+        msg = f"force-canceled by {by or 'unknown'}"
+        if not self.transition(xid, ACTIVE_EXEC, ExecStatus.CANCELED.value, cancel_requested=True, error=msg,
+                               finished_at=time.time(), lease_owner=None, lease_expires=None):
+            return -1
+        store, n = SqlTaskStore(self, xid), 0
+        for t in store.load_tasks():
+            if t.status in (TaskStatus.RUNNING, TaskStatus.PENDING):
+                prior = t.status.value
+                t.status, t.error = TaskStatus.CANCELED, f"{msg} (was {prior})"
+                store.save_task(t)
+                n += 1
+        return n
 
     def get_execution(self, xid: str) -> dict[str, Any] | None:
         with self.engine.connect() as c:

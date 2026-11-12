@@ -12,9 +12,10 @@ All images of the VM are added in disk order so the appliance sees the same mult
 from __future__ import annotations
 
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
+
+from ..core import cancel
 
 
 def octal_mode(mode: int) -> str:
@@ -51,7 +52,7 @@ class Guestfish:
         return argv
 
     def _run(self, script: str, *, rw: bool, inspect: bool, timeout: int = 1800) -> str:
-        p = subprocess.run(self._argv(rw, inspect), input=script, capture_output=True, text=True, timeout=timeout)
+        p = cancel.run(self._argv(rw, inspect), input=script, capture_output=True, text=True, timeout=timeout)
         if p.returncode != 0:
             raise GuestfishError(f"guestfish failed ({p.returncode}): {p.stderr.strip()[:2000]}")
         return p.stdout

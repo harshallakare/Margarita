@@ -45,6 +45,7 @@ from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from ...core import cancel
 from ...core.errors import ProviderError, SafetyGateError, TransientProviderError
 
 log = logging.getLogger("vmigrate.nutanix.v4")
@@ -152,7 +153,7 @@ def _route_missing(r: Any) -> bool:
 
 class PrismV4:
     def __init__(self, session: Any, pc_url: str, *, timeout: float = 60, task_timeout: float = 3600,
-                 poll: float = 2, sleep: Any = time.sleep, crt_version: str = "v4.0"):
+                 poll: float = 2, sleep: Any = cancel.sleep, crt_version: str = "v4.0"):
         self.crt_version = crt_version
         self._compute_ver: str | None = None    # API version the cluster answered compute-changed-regions on
         self.s, self.base = session, pc_url.rstrip("/")

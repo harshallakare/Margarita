@@ -19,11 +19,11 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 import time
 from collections.abc import Callable
 from typing import Any
 
+from ...core import cancel
 from ...core.errors import ProviderError, SafetyGateError
 
 _TGT = re.compile(r"-tgt(\d+)$")
@@ -97,8 +97,8 @@ def block_size_of(path: str) -> int:
 
 
 class IscsiSession:
-    def __init__(self, portal: str, *, run: Callable[..., Any] = subprocess.run,
-                 listdir: Callable[[str], list[str]] = os.listdir, settle_timeout: float = 60, sleep: Any = time.sleep):
+    def __init__(self, portal: str, *, run: Callable[..., Any] = cancel.run,
+                 listdir: Callable[[str], list[str]] = os.listdir, settle_timeout: float = 60, sleep: Any = cancel.sleep):
         self.portal = portal if ":" in portal else f"{portal}:3260"
         self._run, self._listdir, self.settle_timeout, self.sleep = run, listdir, settle_timeout, sleep
         self.logged_in: list[str] = []

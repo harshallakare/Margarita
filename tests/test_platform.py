@@ -157,7 +157,7 @@ def test_full_13_disk_execution_through_api_conductor_worker(plat):
     xid = x["id"]
     x = plat.c.get(f"/executions/{xid}", headers=plat.viewer).json()
     assert x["status"] == "completed", x
-    assert x["task_counts"] == {"completed": 21}  # 8 fixed tasks + 13 replicate_disk tasks
+    assert x["task_counts"] == {"completed": 23}  # 10 fixed tasks (2 helper steps not needed) + 13 replicate_disk
     tasks = plat.c.get(f"/executions/{xid}/tasks", headers=plat.viewer).json()
     disk_tasks = [t for t in tasks if t["kind"] == "replicate_disk"]
     assert len(disk_tasks) == 13 and all(t["progress"] == 100 for t in disk_tasks)

@@ -7,6 +7,10 @@ Usage: raise DiskCountMismatch(vm, counts) ; except MigrationError: ...
 from __future__ import annotations
 
 
+class OperationCanceled(Exception):
+    """The execution was canceled while this wait or command was running (core.cancel)."""
+
+
 class MigrationError(Exception):
     """Base class for all vmigrate errors."""
 

@@ -60,6 +60,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from ...core import cancel
 from ...core.context import RunContext
 from ...core.errors import ConfigError, ProviderError, SafetyGateError
 from ...core.fileio import RawFileWriter
@@ -199,6 +200,25 @@ class VhiTarget(TargetProvider):
     def release_helper(self, record: dict[str, Any], *, wait: bool = True) -> None:
         HelperVm.release_record(self.api, record, self.ctx.logger, wait=wait, poll=self.poll,
                                 op_timeout=self.op_timeout)
+
+    # ------------------------------------------------------------------ helper VM as visible tasks
+    def prepare_helper(self) -> str | None:
+        """Create the helper VM up front (its own task, in parallel with the source snapshot).
+        None when this target writes without one (vStorage mount)."""
+        if self.write_mode != "helper_vm":
+            return None
+        self.helper.ensure()
+        h = self.helper
+        return f"helper VM {h.name} ready at {h.host}" + (f" ({h.summary})" if h.summary else "")
+
+    def remove_helper(self) -> str | None:
+        """Remove the helper VM once the migrated VM exists (its own task, in parallel with verify).
+        None when there is no helper to remove."""
+        if self._helper is None or (self._helper.server is None and self._helper.transport is None):
+            return None
+        name = self._helper.name
+        self.close()
+        return f"helper VM {name} removed"
 
     def close(self) -> None:
         if self._helper is None:
@@ -583,7 +603,7 @@ class VhiTarget(TargetProvider):
                              "of console silence with the server ACTIVE)")
                 say(f"boot check: server {status or '?'}, {int(el)}s of {int(timeout)}s, console has "
                     f"{len(log.splitlines())} line(s); {what}")
-            time.sleep(self.poll * 2)
+            cancel.sleep(self.poll * 2)
         if not log.strip():
             return BootCheck(True, "server ACTIVE; no serial console output — verify boot manually", log)
         return BootCheck(False, f"no login prompt within {timeout}s", log)

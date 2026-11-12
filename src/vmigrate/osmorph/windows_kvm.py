@@ -24,12 +24,12 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape, quoteattr
 
+from ..core import cancel
 from ..ir import DiskBus, Firmware, OsFamily
 from .base import MorphRequest, MorphStep, MorphStrategy, register
 from .linux_kvm import needs_virtio
@@ -100,7 +100,7 @@ def mac_args(windows_ip: dict[str, dict[str, Any]]) -> list[str]:
 class Tools:
     """Locates the converter and drivers; injectable for tests."""
 
-    def __init__(self, which=shutil.which, exists=os.path.exists, env=None, run=subprocess.run):
+    def __init__(self, which=shutil.which, exists=os.path.exists, env=None, run=cancel.run):
         self.which, self.exists, self.env, self._run = which, exists, (os.environ if env is None else env), run
 
     def converter(self) -> list[str] | None:

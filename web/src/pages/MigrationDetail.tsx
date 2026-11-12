@@ -67,9 +67,10 @@ export default function MigrationDetail() {
           <div className="row">
             {active ? <>
               <Link className="btn" to={`/executions/${active.id}`}>View {active.dry_run ? "dry-run" : "run"}</Link>
-              <button className="btn danger" onClick={async () => {
+              {!active.cancel_requested ? <button className="btn danger" onClick={async () => {
                 try { await api.post(`/migrations/${m.id}/cancel`); setToast("Cancel requested"); } catch (e) { setErr(errText(e)); }
-              }}>Cancel</button>
+              }}>Cancel</button> : <Link className="btn danger" to={`/executions/${active.id}`}
+                                         title="Cancel is in progress; force-cancel from the run page">Cancelling… (force)</Link>}
             </> : <>
               <button className="btn" onClick={() => start(true).catch((e) => setErr(errText(e)))}>Dry-run</button>
               <button className="btn primary" disabled={m.phase === "done" || !dryOk} title={!dryOk ? "Run a dry-run first" : ""}

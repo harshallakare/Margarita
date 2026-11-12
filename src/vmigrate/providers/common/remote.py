@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ...core import cancel
 from ...core.errors import ConfigError, ProviderError, TransientProviderError
 from ...core.interfaces import DiskReader
 from ...core.nbd import NbdReader
@@ -62,7 +63,7 @@ class SshNode:
         remote = " ".join(shlex.quote(a) for a in argv)
         if self.user != "root":
             remote = "sudo -n " + remote
-        p = subprocess.run([*self.base_argv(), "--", remote], capture_output=True, text=True,
+        p = cancel.run([*self.base_argv(), "--", remote], capture_output=True, text=True,
                            timeout=timeout or self.timeout)
         if p.returncode == 255:
             raise TransientProviderError(f"ssh {self.host}: {p.stderr.strip()[-500:]}")
@@ -98,7 +99,7 @@ class LocalShell:
         os.chmod(self.run_dir, 0o700)
 
     def run(self, argv: list[str], *, check: bool = True, timeout: float | None = None) -> str:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout or self.timeout)
+        p = cancel.run(argv, capture_output=True, text=True, timeout=timeout or self.timeout)
         if check and p.returncode != 0:
             raise ProviderError(f"`{argv[0]}` failed ({p.returncode}): {p.stderr.strip()[-1000:]}")
         return p.stdout

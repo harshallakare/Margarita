@@ -6,7 +6,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, download, fmt, KIND_LABEL, subscribe, type Execution as Exec, type LogLine, type Migration, type Task } from "../api";
-import { Bar, ErrorBox, Loading, Status, Toast, TransferBar, errText, useAuth, useLoad } from "../ui";
+import { Bar, ErrorBox, Loading, Modal, Status, Toast, TransferBar, errText, useAuth, useLoad } from "../ui";
 
 const LIVE = ["pending", "queued", "running"];
 
@@ -41,6 +41,7 @@ export default function Execution() {
   const [follow, setFollow] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [forceAsk, setForceAsk] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
   const cursor = useRef(0);
   const live = ex.data ? LIVE.includes(ex.data.status) : true;
@@ -84,7 +85,8 @@ export default function Execution() {
     if (follow && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [logs, follow, onlySel, sel]);
 
-  const all = tasks.data ?? [];
+  // helper-VM steps a target does not need complete at once with result.not_needed: not shown
+  const all = (tasks.data ?? []).filter((t) => !(t.status === "completed" && t.result?.not_needed));
   const disks = all.filter((t) => t.kind === "replicate_disk");
   const top = all.filter((t) => t.kind !== "replicate_disk");
   const stepPct = all.length ? all.reduce((a, t) => a + (t.status === "completed" ? 100 : t.progress), 0) / all.length : 0;
@@ -132,9 +134,11 @@ export default function Execution() {
         </div>
         {can("operator") && !mig.data?.deleted_at && <div className="row">
           {live && !x.cancel_requested && <button className="btn danger" onClick={async () => {
-            try { await api.post(`/executions/${x.id}/cancel`); setToast("Cancel requested; running disk copies stop at their next checkpoint"); ex.reload(); }
+            try { await api.post(`/executions/${x.id}/cancel`); setToast("Cancel requested; running steps stop within seconds, then the helper VM is removed"); ex.reload(); }
             catch (e) { setErr(errText(e)); }
           }}>Cancel</button>}
+          {live && x.cancel_requested && <button className="btn danger" title="Mark the run canceled now, without waiting for the worker"
+                                                 onClick={() => setForceAsk(true)}>Force cancel</button>}
           {(x.status === "failed" || x.status === "canceled") && <button className="btn primary" onClick={async () => {
             try { await api.post(`/executions/${x.id}/retry`); setToast("Re-queued: completed tasks are kept"); ex.reload(); tasks.reload(); }
             catch (e) { setErr(errText(e)); }
@@ -142,6 +146,22 @@ export default function Execution() {
         </div>}
       </div>
       <ErrorBox error={err} title="Action failed" />
+      {forceAsk && <Modal title="Force cancel this run?" onClose={() => setForceAsk(false)} footer={<>
+        <button className="btn" onClick={() => setForceAsk(false)}>Keep waiting</button>
+        <button className="btn danger" onClick={async () => {
+          setForceAsk(false);
+          try { await api.post(`/executions/${x.id}/cancel?force=true`); setToast("Force-canceled"); ex.reload(); tasks.reload(); }
+          catch (e) { setErr(errText(e)); }
+        }}>Force cancel</button></>}>
+        <p style={{ marginTop: 0 }}>The run is marked canceled now, without waiting for the worker to finish its current step.</p>
+        <ul className="small">
+          <li>The worker still stops in the background and removes its helper VM. A new run of this migration
+            can start once it has, usually within a minute.</li>
+          <li>Anything the step was creating on the target (a disk, the VM) is left as it is. Check the target
+            before you retry.</li>
+          <li>The source VM is never touched.</li>
+        </ul>
+      </Modal>}
       {mig.data?.deleted_at && <div className="alert info" style={{ marginBottom: 16 }}>
         <b>Its {isRep ? "replica" : "migration"} was deleted</b> {fmt.ago(mig.data.deleted_at)}{mig.data.deleted_by ? ` by ${mig.data.deleted_by}` : ""}.
         This run is kept so its tasks and logs can still be read.</div>}

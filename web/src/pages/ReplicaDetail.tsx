@@ -288,7 +288,9 @@ export default function ReplicaDetail() {
         {can("operator") && <div className="row">
           {active ? <>
             <Link className="btn" to={`/executions/${active.id}`}>View {KIND_LABEL[active.kind]?.toLowerCase() ?? "run"}</Link>
-            <button className="btn danger" onClick={() => act(async () => { await api.post(`/replicas/${r.id}/cancel`); setToast("Cancel requested"); })}>Cancel</button>
+            {!active.cancel_requested
+              ? <button className="btn danger" onClick={() => act(async () => { await api.post(`/replicas/${r.id}/cancel`); setToast("Cancel requested"); })}>Cancel</button>
+              : <Link className="btn danger" to={`/executions/${active.id}`} title="Cancel is in progress; force-cancel from the run page">Cancelling… (force)</Link>}
           </> : <>
             <button className="btn" onClick={() => act(() => start("execute", { dry_run: true }))}>Dry-run sync</button>
             <button className="btn" disabled={!dryOk && !hasDisks} title={!dryOk && !hasDisks ? "Run a dry-run first" : ""}

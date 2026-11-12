@@ -57,6 +57,9 @@ def requeue_for_retry(repo: Repo, xid: str) -> int:
         raise KeyError(xid)
     if repo.active_execution(ex["migration_id"]) is not None:
         raise RuntimeError("migration already has an active execution")
+    stopping = repo.stopping_execution(ex["migration_id"])
+    if stopping is not None:
+        raise RuntimeError(f"a worker is still stopping the force-canceled run {stopping}; try again in a minute")
     store = SqlTaskStore(repo, xid)
     mig = repo.get_migration(ex["migration_id"], include_deleted=True) or {}
     cleaned = ex.get("kind") == "migration" and bool((mig.get("state") or {}).get("target_cleaned"))

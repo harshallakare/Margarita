@@ -37,6 +37,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from ...core import cancel
 from ...core.context import RunContext
 from ...core.errors import ConfigError, ProviderError, SafetyGateError, TransientProviderError
 from ...core.retry import poll_until
@@ -66,7 +67,7 @@ class SshTransport:
                 f"{self.user}@{self.host}", cmd]
 
     def run(self, cmd: str, timeout: float = 120) -> str:
-        p = subprocess.run(self.argv(cmd), capture_output=True, timeout=timeout)
+        p = cancel.run(self.argv(cmd), capture_output=True, timeout=timeout)
         if p.returncode != 0:
             # ssh exits 255 when it cannot connect / the connection drops (not the remote command)
             cls = TransientProviderError if p.returncode == 255 else ProviderError
@@ -145,6 +146,8 @@ class HelperVm:
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ checks (read-only)
+        self.summary = ""
+
     def problems(self) -> list[str]:
         p: list[str] = []
         img, net = self.cfg.get("helper_image"), self.cfg.get("helper_network")
@@ -208,6 +211,9 @@ class HelperVm:
         img = self.api.find_image(self.cfg["helper_image"])
         net = self.api.find_network(self.cfg["helper_network"])
         flavor = self._flavor()
+        self.summary = (f"image {img.get('name')}, flavor {flavor.get('name') or flavor.get('id')} "
+                        f"({flavor.get('vcpus')} vCPU, {(flavor.get('ram') or 0) // 1024} GiB), "
+                        f"network {net.get('name') or self.cfg['helper_network']}")
         ud = cloud_config(client_pub, host_priv, host_pub)
         kw: dict[str, Any] = {
             "name": self.name, "flavor_id": flavor["id"], "networks": [{"uuid": net["id"]}],
@@ -267,7 +273,7 @@ class HelperVm:
                 return
             except (ProviderError, subprocess.TimeoutExpired) as e:
                 last = str(e)
-                time.sleep(self.poll)
+                cancel.sleep(self.poll)
         raise ProviderError(f"helper VM {self.name}: no SSH to {host}:{self.cfg.get('helper_ssh_port', 22)} within "
                             f"{self.cfg.get('helper_boot_timeout', 600)}s. Check that this worker can reach it and that the "
                             f"helper's security group(s) {self.security_groups()} allow TCP/22 from this worker "

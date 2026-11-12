@@ -126,12 +126,16 @@ class Worker:
         def beat() -> None:
             while not done.wait(max(1.0, st.lease_seconds / 3)):
                 try:
-                    if not repo.renew_lease(xid, self.id, st.lease_seconds):
-                        log.error("execution %s: lease lost; stopping locally", xid)
+                    if not lost.is_set() and not repo.renew_lease(xid, self.id, st.lease_seconds):
+                        cur = repo.get_execution(xid) or {}
+                        if cur.get("status") == ExecStatus.CANCELED.value:
+                            log.warning("execution %s was force-canceled; stopping locally", xid)
+                        else:
+                            log.error("execution %s: lease lost; stopping locally", xid)
                         lost.set()
                         if "dag" in dag_ref:
                             dag_ref["dag"].cancel()
-                        return
+                    # keep heart-beating while winding down: new runs of this migration wait for it
                     self.heartbeat()
                 except Exception:  # noqa: BLE001
                     log.exception("lease renewal failed")
@@ -232,9 +236,14 @@ class Worker:
             handler.flush()
             self.current = None
         if lost.is_set():
-            return status  # the conductor re-queued it; another worker owns it now
-        repo.transition(xid, (ExecStatus.RUNNING.value,), status.value, error=error, finished_at=time.time(),
-                        lease_owner=None, lease_expires=None)
+            self.heartbeat()   # current_execution cleared: a new run of this migration may start
+            return status  # the conductor re-queued it, or it was force-canceled
+        if not repo.transition(xid, (ExecStatus.RUNNING.value,), status.value, error=error, finished_at=time.time(),
+                               lease_owner=None, lease_expires=None):
+            log.info("execution %s was finalized elsewhere (force-canceled); its outcome is kept", xid)
+            self.current = None
+            self.heartbeat()
+            return status
         repo.add_event(f"execution.{status.value}", {"error": error}, execution_id=xid, migration_id=mid)
         log.info("execution %s -> %s%s", xid, status.value, f" ({error})" if error else "")
         return status
