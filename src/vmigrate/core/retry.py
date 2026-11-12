@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable
 from typing import TypeVar
 
+from . import cancel
 from .errors import ProviderError, SafetyGateError, TransientProviderError
 
 T = TypeVar("T")
@@ -28,7 +29,7 @@ def retry(
     base_delay: float = 1.0,
     max_delay: float = 60.0,
     retry_on: tuple[type[BaseException], ...] = (TransientProviderError,),
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] = cancel.sleep,
     what: str = "operation",
 ) -> T:
     last: BaseException | None = None
@@ -56,7 +57,7 @@ def poll_until(
     interval: float = 5.0,
     failed: Callable[[T], bool] | None = None,
     what: str = "condition",
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] = cancel.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> T:
     deadline = clock() + timeout

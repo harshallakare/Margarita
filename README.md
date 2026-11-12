@@ -48,6 +48,15 @@ dry-run:  validate_endpoints → inspect_instance → plan          (no mutating
 Every task records its status, attempts, progress %, message, result and logs. You can cancel any
 execution, and you can retry a failed or cancelled one; a retry resumes it. Safety-gate errors are never retried.
 
+- **Cancel** asks the worker to stop. Waits (boot check, polling Nutanix/OpenStack) and external commands
+  (guestfish, ssh, qemu-img) stop within about a second; the worker then removes its helper VM.
+- **Force cancel** (shown once a cancel is in progress; API `POST /executions/{id}/cancel?force=true`) marks
+  the run canceled at once, without waiting for the worker, like Coriolis's force option. The worker still
+  stops in the background. A new run of the same migration is refused until it has, usually within a minute.
+- With the VHI helper-VM write mode, the run shows **Deploy helper VM** (booted while the source snapshot is
+  taken; name, IP, image, flavor, network) and **Remove helper VM** (removed once the VM exists, while the
+  boot is checked) as their own steps.
+
 ### Replica mode (incremental DR)
 
 A **replica** keeps a set of replica disks on the target and brings them up to date on every **sync**.

@@ -10,10 +10,12 @@ Usage:
     if status != ExecStatus.COMPLETED: record_failure(runner, "...")
 
 Graph (execute):
-  validate_endpoints -> inspect_instance (DISK-COUNT GATE, preflight) -> create_snapshot
+  validate_endpoints -> inspect_instance (DISK-COUNT GATE, preflight) -> create_snapshot | deploy_helper
   -> deploy_disks ==expands==> replicate_disk:<disk-id> x N (parallel, largest first)
-  -> osmorphing -> deploy_instance (create VM + attach + attach-count gate) -> verify_instance
+  -> osmorphing -> deploy_instance (create VM + attach + attach-count gate) -> verify_instance | remove_helper
   -> finalize (cleanup source snapshot, report)
+  deploy_helper / remove_helper: the target's temporary helper VM (VHI helper_vm write mode), shown as
+  its own steps; targets without a helper complete them at once with result {"not_needed": true}.
 Graph (dry-run): validate_endpoints -> inspect_instance -> plan   (nothing mutating is reachable)
 """
 
@@ -31,8 +33,9 @@ from .pipeline import MigrationRunner, _snap, _tdisk, keep_target_vm
 from .report import write_report
 from .state import Phase
 
-MIGRATION_TASKS = ["validate_endpoints", "inspect_instance", "create_snapshot", "deploy_disks",
-                   "replicate_disk", "osmorphing", "deploy_instance", "verify_instance", "finalize", "plan"]
+MIGRATION_TASKS = ["validate_endpoints", "inspect_instance", "create_snapshot", "deploy_helper", "deploy_disks",
+                   "replicate_disk", "osmorphing", "deploy_instance", "remove_helper", "verify_instance",
+                   "finalize", "plan"]
 
 
 def migration_dag(dry_run: bool) -> list[TaskSpec]:
@@ -45,11 +48,15 @@ def migration_dag(dry_run: bool) -> list[TaskSpec]:
         return t + [TaskSpec("plan", "plan", ["inspect_instance"], label="Build dry-run plan")]
     return t + [
         TaskSpec("create_snapshot", "create_snapshot", ["inspect_instance"], label="Snapshot source"),
-        TaskSpec("deploy_disks", "deploy_disks", ["create_snapshot"], label="Create target disks"),
+        # the helper VM boots while the source snapshot is taken (targets without one skip it)
+        TaskSpec("deploy_helper", "deploy_helper", ["inspect_instance"], label="Deploy helper VM"),
+        TaskSpec("deploy_disks", "deploy_disks", ["create_snapshot", "deploy_helper"], label="Create target disks"),
         TaskSpec("osmorphing", "osmorphing", ["deploy_disks"], label="OSMorphing"),
         TaskSpec("deploy_instance", "deploy_instance", ["osmorphing"], label="Create VM + attach disks"),
+        # the VM exists, its volumes are detached from the helper: remove it while the boot is checked
+        TaskSpec("remove_helper", "remove_helper", ["deploy_instance"], label="Remove helper VM"),
         TaskSpec("verify_instance", "verify_instance", ["deploy_instance"], label="Verify (counts, boot)"),
-        TaskSpec("finalize", "finalize", ["verify_instance"], label="Finalize + cleanup snapshot"),
+        TaskSpec("finalize", "finalize", ["verify_instance", "remove_helper"], label="Finalize + cleanup snapshot"),
     ]
 
 
@@ -153,6 +160,21 @@ def migration_handlers(runner: MigrationRunner) -> dict[str, Handler]:
         return TaskOutcome(result={"copy_stats": ds.copy_stats, "verify": ds.verify},
                            message=f"copied + verified ({(ds.copy_stats or {}).get('mb_per_s', 0):.0f} MB/s)")
 
+    def deploy_helper(ctx: TaskContext) -> TaskOutcome:
+        prep = getattr(runner.target, "prepare_helper", None)
+        msg = prep() if prep else None
+        if msg is None:
+            return TaskOutcome(result={"not_needed": True}, message="not needed: this target writes disks directly")
+        return TaskOutcome(result={"helper": msg}, message=msg)
+
+    def remove_helper(ctx: TaskContext) -> TaskOutcome:
+        rm = getattr(runner.target, "remove_helper", None)
+        msg = rm() if rm else None
+        if msg is None:
+            return TaskOutcome(result={"not_needed": bool(ctx.result("deploy_helper").get("not_needed"))},
+                               message="no helper VM to remove")
+        return TaskOutcome(result={"removed": msg}, message=msg)
+
     def osmorphing(ctx: TaskContext) -> TaskOutcome:
         if not runner._done(Phase.DISKS_COPIED):
             runner._phase(Phase.DISKS_COPIED)
@@ -185,7 +207,7 @@ def migration_handlers(runner: MigrationRunner) -> dict[str, Handler]:
         "validate_endpoints": validate_endpoints, "inspect_instance": inspect_instance, "plan": plan,
         "create_snapshot": create_snapshot, "deploy_disks": deploy_disks, "replicate_disk": replicate_disk,
         "osmorphing": osmorphing, "deploy_instance": deploy_instance, "verify_instance": verify_instance,
-        "finalize": finalize,
+        "finalize": finalize, "deploy_helper": deploy_helper, "remove_helper": remove_helper,
     }
 
 

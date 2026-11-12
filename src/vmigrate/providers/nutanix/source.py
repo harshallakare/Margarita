@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from ...core import cancel
 from ...core.context import RunContext
 from ...core.errors import ChangeTrackingUnavailable, ConfigError, LiveDiskReadRefused, ProviderError, SafetyGateError
 from ...core.fileio import RawFileReader
@@ -312,7 +313,7 @@ class NutanixSource(SourceProvider):
         while str(self.client.v2_get(f"/vms/{vm.id}").get("power_state", "")).lower() != "off":
             if time.monotonic() > deadline:
                 raise ProviderError(f"{vm.name}: still on {timeout}s after {how}; retry with force_power_off")
-            time.sleep(5)
+            cancel.sleep(5)
         return f"{vm.name} powered off ({how})"
 
     def create_snapshot(self, vm: VmRef, app_consistent: bool) -> SnapshotRef:

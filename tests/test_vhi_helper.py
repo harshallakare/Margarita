@@ -401,3 +401,19 @@ def test_kept_helper_not_adopted_without_keys_or_when_gone(tmp_path):
     api.servers[rec["server_id"]]["metadata"] = {}              # not ours: never deleted
     with pytest.raises(SafetyGateError, match="not a vmigrate helper"):
         t2.release_helper(rec)
+
+
+def test_helper_vm_is_deployed_and_removed_as_its_own_steps(tmp_path):
+    """The Tasks panel shows "Deploy helper VM" / "Remove helper VM" with the helper's name, IP and
+    sizing; a vStorage-mode target has nothing to deploy."""
+    t, api, _ = _tgt(tmp_path)
+    msg = t.prepare_helper()
+    assert msg.startswith("helper VM vmigrate-helper-run-abcdef12 ready at 10.9.0.5")
+    assert "flavor" in msg and "vCPU" in msg and "network" in msg
+    assert any(s["name"] == "vmigrate-helper-run-abcdef12" for s in api.servers.values())
+    assert t.remove_helper() == "helper VM vmigrate-helper-run-abcdef12 removed"
+    assert not any(s["name"].startswith("vmigrate-helper") for s in api.servers.values())
+    assert t.remove_helper() is None                                  # nothing left to remove
+    (tmp_path / "v").mkdir()
+    direct, _, _ = _tgt(tmp_path / "v", write_mode="vstorage")
+    assert direct.prepare_helper() is None and direct.remove_helper() is None

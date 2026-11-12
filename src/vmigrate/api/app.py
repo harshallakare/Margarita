@@ -778,14 +778,32 @@ def create_app(services: Services | None = None) -> FastAPI:
                        migration_id=mid)
         return ex_out(repo.get_execution(xid))  # type: ignore[arg-type]
 
+    def cancel_run(x: dict[str, Any], force: bool, p: Principal) -> dict[str, Any]:
+        """Cancel asks the worker to stop: running steps end at their next check (about a second
+        for waits and commands) and the failure cleanup is skipped. Force-cancel (like Coriolis's
+        --force) also marks the run CANCELED at once, without waiting for the worker: use it when a
+        cancel is stuck. The worker still stops in the background and removes its helper VM; a new
+        run of the same migration is refused until it has (see Repo.stopping_execution)."""
+        xid = x["id"]
+        if not force:
+            repo.set_execution(xid, cancel_requested=True)
+            repo.add_event("execution.cancel_requested", {"by": p.username}, execution_id=xid,
+                           migration_id=x["migration_id"])
+            return {"execution_id": xid, "cancel_requested": True, "force": False}
+        n = repo.force_cancel_execution(xid, p.username)
+        if n < 0:
+            raise HTTPException(409, f"execution is {(repo.get_execution(xid) or {}).get('status')}")
+        repo.add_event("execution.canceled", {"force": True, "by": p.username, "tasks": n}, execution_id=xid,
+                       migration_id=x["migration_id"])
+        return {"execution_id": xid, "cancel_requested": True, "force": True, "status": "canceled"}
+
     @app.post("/migrations/{mid}/cancel", tags=["migrations"])
-    def cancel_migration(mid: str, p: Principal = Depends(operator)) -> dict[str, Any]:
+    def cancel_migration(mid: str, force: bool = False, p: Principal = Depends(operator)) -> dict[str, Any]:
         scoped(repo.get_migration(mid), p, "migration")
         x = repo.active_execution(mid)
         if x is None:
             raise HTTPException(409, "no active execution")
-        repo.set_execution(x["id"], cancel_requested=True)
-        return {"execution_id": x["id"], "cancel_requested": True}
+        return cancel_run(x, force, p)
 
     @app.get("/migrations/{mid}/report", tags=["migrations"])
     def report(mid: str, format: str = Query("json", pattern="^(json|md)$"), p: Principal = Depends(viewer)):
@@ -978,12 +996,11 @@ def create_app(services: Services | None = None) -> FastAPI:
                                  headers={"Content-Disposition": 'attachment; filename="margarita-audit.csv"'})
 
     @app.post("/executions/{xid}/cancel", tags=["executions"])
-    def cancel_exec(xid: str, p: Principal = Depends(operator)) -> dict[str, Any]:
+    def cancel_exec(xid: str, force: bool = False, p: Principal = Depends(operator)) -> dict[str, Any]:
         x = exec_scoped(xid, p, write=True)
         if ExecStatus(x["status"]) in TERMINAL_EXEC:
             raise HTTPException(409, f"execution is {x['status']}")
-        repo.set_execution(xid, cancel_requested=True)
-        return {"execution_id": xid, "cancel_requested": True}
+        return cancel_run(x, force, p)
 
     @app.post("/executions/{xid}/retry", response_model=m.ExecutionOut, tags=["executions"])
     def retry_exec(xid: str, p: Principal = Depends(operator)) -> m.ExecutionOut:
@@ -1141,13 +1158,12 @@ def create_app(services: Services | None = None) -> FastAPI:
         return start_kind(rep_scoped(rid, p), "replica_delete", (body or m.StartRequest()).dry_run, p)
 
     @app.post("/replicas/{rid}/cancel", tags=["replicas"])
-    def cancel_replica(rid: str, p: Principal = Depends(operator)) -> dict[str, Any]:
+    def cancel_replica(rid: str, force: bool = False, p: Principal = Depends(operator)) -> dict[str, Any]:
         rep_scoped(rid, p)
         x = repo.active_execution(rid)
         if x is None:
             raise HTTPException(409, "no active execution")
-        repo.set_execution(x["id"], cancel_requested=True)
-        return {"execution_id": x["id"], "cancel_requested": True}
+        return cancel_run(x, force, p)
 
     # ------------------------------------------------------------------ schedules
     @app.get("/schedules/preview", tags=["schedules"])
