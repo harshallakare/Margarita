@@ -164,9 +164,21 @@ def test_target_that_attaches_at_create(make_runner):
 
 
 def test_on_failure_cleanup_removes_only_created(make_runner):
-    runner, src, tgt = make_runner(disks=2, tgt_cfg={"boot_ok": False}, engine={"on_failure": "cleanup"})
+    runner, src, tgt = make_runner(disks=2, tgt_cfg={"fail_commit_disk": "RIS-Sainath-disk01"},
+                                   engine={"on_failure": "cleanup"})
     tgt.disks["unrelated"] = "keep-me"
-    with pytest.raises(VerificationError):
+    with pytest.raises(Exception, match="disk01"):
         runner.run()
     assert "cleanup" in tgt.calls
     assert list(tgt.disks) == ["unrelated"] and not tgt.vms
+
+
+def test_failed_boot_check_keeps_the_created_vm_even_with_cleanup(make_runner):
+    """Seen live: a booted Linux guest failed the serial-console boot check; the failure cleanup
+    would have deleted a working VM. Once the target VM exists it is kept with its disks."""
+    runner, src, tgt = make_runner(disks=2, tgt_cfg={"boot_ok": False}, engine={"on_failure": "cleanup"})
+    with pytest.raises(VerificationError):
+        runner.run()
+    assert "cleanup" not in tgt.calls
+    assert "RIS-Sainath" in tgt.vms and len(tgt.disks) == 2
+    assert not runner.state.target_cleaned

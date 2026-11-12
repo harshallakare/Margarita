@@ -52,6 +52,19 @@ def _snap(d: dict[str, Any]) -> SnapshotRef:
     return SnapshotRef(id=d["id"], vm=VmRef(**d["vm"]), app_consistent=d["app_consistent"], data=d.get("data", {}))
 
 
+def keep_target_vm(state: Any, log: Any) -> bool:
+    """A target VM that was created and reached ACTIVE is never deleted by the automatic failure
+    cleanup: what failed after that point is verification (seen live: a booted Linux guest failed
+    the serial-console boot check, and the cleanup would have deleted a working VM). The VM and its
+    disks are kept for the operator to inspect, fix or delete by hand."""
+    vm = getattr(state, "target_vm", None)
+    if vm:
+        log.warning("failure cleanup skipped: target VM %s (%s) was already created and is kept with its "
+                    "disks; check it in the target console, then fix it or delete it by hand",
+                    vm.get("name"), vm.get("id"))
+    return bool(vm)
+
+
 class MigrationRunner:
     def __init__(
         self,
@@ -534,7 +547,8 @@ class MigrationRunner:
                 self.state.set_phase(Phase.FAILED)
                 self.store.save(self.state)
             self.log.error("migration %s FAILED in phase %s: %s", self.job.name, self.state.last_good_phase.value, e)
-            if not self.ctx.dry_run and self.engine.on_failure == "cleanup":
+            if (not self.ctx.dry_run and self.engine.on_failure == "cleanup"
+                    and not keep_target_vm(self.state, self.log)):
                 self.target.cleanup_on_failure(self.state.created)
                 with self._lock:
                     self.state.forget_target()

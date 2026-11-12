@@ -27,7 +27,7 @@ from ..core.errors import SafetyGateError
 from ..core.interfaces import TargetDiskRef, VmRef
 from ..ir import VmSpec
 from .dag import COPY_ATTEMPTS, Handler, TaskContext, TaskOutcome, TaskSpec
-from .pipeline import MigrationRunner, _snap, _tdisk
+from .pipeline import MigrationRunner, _snap, _tdisk, keep_target_vm
 from .report import write_report
 from .state import Phase
 
@@ -199,6 +199,8 @@ def record_failure(runner: MigrationRunner, error: str, *, cleanup: bool | None 
         runner.state.set_phase(Phase.FAILED)
         runner.store.save(runner.state)
     do_cleanup = (runner.engine.on_failure == "cleanup") if cleanup is None else cleanup
+    if do_cleanup and keep_target_vm(runner.state, runner.log):
+        do_cleanup = False
     cleaned = False
     if not runner.ctx.dry_run and do_cleanup:
         runner.target.cleanup_on_failure(runner.state.created)
