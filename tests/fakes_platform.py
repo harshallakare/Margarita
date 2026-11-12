@@ -168,6 +168,7 @@ class FakeOpenStack:
         return dict(v)
 
     def get_volume(self, vid): return dict(self.volumes[vid])
+    def volume_or_none(self, vid): return dict(self.volumes[vid]) if vid in self.volumes else None
     def volumes_by_name(self, name): return [dict(v) for v in self.volumes.values() if v["name"] == name]
     def delete_volume(self, vid): self.volumes.pop(vid, None)
     def volume_action(self, vid, body): self.actions.append((vid, body))
@@ -190,6 +191,7 @@ class FakeOpenStack:
         return {"id": sid, "status": "BUILD"}
 
     def get_server(self, sid): return dict(self.servers[sid])
+    def server_or_none(self, sid): return dict(self.servers[sid]) if sid in self.servers else None
     def find_server(self, name): return next((dict(s) for s in self.servers.values() if s["name"] == name), None)
     def delete_server(self, sid): self.servers.pop(sid, None)
 

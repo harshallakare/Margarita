@@ -269,6 +269,7 @@ class MigrationRunner:
             with self._lock:
                 ds.target = _ref_to_dict(ref)
                 self.state.created["target_disks"].append(_ref_to_dict(ref))
+                self.state.target_cleaned = False
             self._save()
             if d.shared_id:
                 self.shared.update(self.job.cluster, d.shared_id, self.migration_id, status="created",
@@ -535,6 +536,9 @@ class MigrationRunner:
             self.log.error("migration %s FAILED in phase %s: %s", self.job.name, self.state.last_good_phase.value, e)
             if not self.ctx.dry_run and self.engine.on_failure == "cleanup":
                 self.target.cleanup_on_failure(self.state.created)
+                with self._lock:
+                    self.state.forget_target()
+                    self.store.save(self.state)
             raise
         finally:
             if not self.ctx.dry_run:

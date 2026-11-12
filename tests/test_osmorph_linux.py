@@ -227,3 +227,15 @@ def test_dry_run_plan_lists_user_scripts_and_offline_script_needs_tooling():
             return False
     res = _run(NoTool(RHEL), {"offline_script": "echo x"}, dry=True)
     assert res.status == "manual_required"                              # can't run the operator's script here
+
+
+def test_guestfish_write_file_sends_c_style_octal_mode(monkeypatch):
+    """Seen live: `chmod 0o755` (Python's #o format) failed in guestfish with "invalid integer
+    parameter"; guestfish wants C-style octal."""
+    from vmigrate.osmorph.guestfs import Guestfish, octal_mode
+    assert octal_mode(0o755) == "0755" and octal_mode(0o644) == "0644" and octal_mode(0o100600) == "0600"
+    scripts: list[str] = []
+    gf = Guestfish([])
+    monkeypatch.setattr(gf, "_run", lambda script, **kw: scripts.append(script) or "")
+    gf.write_file("/etc/vmigrate/firstboot.sh", "#!/bin/sh\n", 0o755)
+    assert 'chmod 0755 "/etc/vmigrate/firstboot.sh"' in scripts[0] and "0o" not in scripts[0]

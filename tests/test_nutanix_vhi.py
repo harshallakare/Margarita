@@ -335,3 +335,17 @@ def test_vhi_boot_check_windows_does_not_wait_for_a_serial_prompt(tmp_path):
     api.servers[sid]["status"] = "SHUTOFF"
     bc = t.check_boot(VmRef(sid, "w"), timeout=30, guest_os="windows")
     assert not bc.ok and "powered off" in bc.detail
+
+
+def test_vhi_cleanup_treats_already_deleted_objects_as_done(tmp_path):
+    """Seen live: a second failure cleanup crashed with a Cinder 404 on a volume the first cleanup
+    had already deleted. Gone means cleaned up; the remaining objects are still removed."""
+    t, api = _tgt(tmp_path)
+    gone = t.create_disk("vm-disk00", 1 << 20, DiskHints(bus=DiskBus.SCSI))
+    kept = t.create_disk("vm-disk01", 1 << 20, DiskHints(bus=DiskBus.SCSI))
+    api.delete_volume(gone.id)
+    created = {"target_disks": [{"id": r.id, "name": r.name, "size_bytes": r.size_bytes} for r in (gone, kept)],
+               "target_vm": {"id": "srv-gone", "name": "vm"}}
+    t.cleanup_on_failure(created)
+    assert api.volumes == {}
+    t.cleanup_on_failure(created)                     # repeat: still no error

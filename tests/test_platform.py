@@ -208,6 +208,35 @@ def test_failure_then_retry_resumes_without_recopying(plat):
     assert all(attempts[t] == 1 for t in done_before)  # completed tasks were not re-run
 
 
+def test_retry_after_failure_cleanup_recreates_the_disks(plat):
+    """Seen live: osmorphing failed, on_failure=cleanup deleted the copied volumes, then Retry
+    resumed at osmorphing and tried to attach a deleted volume (404). After a cleanup the retry
+    must start again from disk creation."""
+    src, tgt = plat.endpoints(tgt_extra={"fail_commit_disk": "RIS-Sainath-disk07"})
+    mid = plat.migration(src, tgt, engine={"max_parallel_disks": 4, "on_failure": "cleanup"})
+    xid = plat.c.post(f"/migrations/{mid}/start", headers=plat.admin, json={"dry_run": False}).json()["id"]
+    plat.drive()
+    x = plat.c.get(f"/executions/{xid}", headers=plat.viewer).json()
+    assert x["status"] == "failed" and "disk07" in x["error"]
+    assert plat.registry()["disks"] == {}                                    # cleanup removed them
+    st = plat.svc.repo.get_migration(mid)["state"]
+    assert st["target_cleaned"] and st["created"]["target_disks"] == []
+    assert all(d["target"] is None and d["bytes_copied"] == 0 for d in st["disks"].values())
+    store = SqlTaskStore(plat.svc.repo, xid)
+    assert any(t.status == TaskStatus.FAILED for t in store.load_tasks())  # failed task still shown
+    plat.c.patch(f"/endpoints/{tgt}", headers=plat.admin,
+                 json={"config": {"staging_dir": str(plat.tmp / "tgt"), "persist": True}})
+    assert plat.c.post(f"/executions/{xid}/retry", headers=plat.admin).json()["status"] == "queued"
+    plat.drive()
+    x = plat.c.get(f"/executions/{xid}", headers=plat.viewer).json()
+    assert x["status"] == "completed", x["error"]
+    assert len(plat.registry()["vms"]["RIS-Sainath"]["disks"]) == 13
+    tasks = store.load_tasks()
+    assert len([t for t in tasks if t.kind == "replicate_disk"]) == 13     # children not duplicated
+    assert all(t.status == TaskStatus.COMPLETED for t in tasks)
+    assert not plat.svc.repo.get_migration(mid)["state"]["target_cleaned"]
+
+
 def test_cancel_before_a_worker_picks_it_up(plat):
     src, tgt = plat.endpoints()
     mid = plat.migration(src, tgt)
