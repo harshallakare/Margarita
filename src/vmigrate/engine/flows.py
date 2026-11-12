@@ -189,17 +189,25 @@ def migration_handlers(runner: MigrationRunner) -> dict[str, Handler]:
     }
 
 
-def record_failure(runner: MigrationRunner, error: str, *, cleanup: bool | None = None) -> None:
+def record_failure(runner: MigrationRunner, error: str, *, cleanup: bool | None = None) -> bool:
     """Mirror MigrationRunner.run()'s failure path for a DAG execution: persist the error and FAILED
-    phase, optionally clean up what this migration created on the target, write the report."""
+    phase, optionally clean up what this migration created on the target, write the report.
+    Returns True when the cleanup ran: the target disks are gone, so the caller must make a retry
+    start again from disk creation (see dag.reset_after_cleanup)."""
     with runner._lock:
         runner.state.errors.append({"phase": runner.state.phase.value, "error": error})
         runner.state.set_phase(Phase.FAILED)
         runner.store.save(runner.state)
     do_cleanup = (runner.engine.on_failure == "cleanup") if cleanup is None else cleanup
+    cleaned = False
     if not runner.ctx.dry_run and do_cleanup:
         runner.target.cleanup_on_failure(runner.state.created)
+        with runner._lock:
+            runner.state.forget_target()
+            runner.store.save(runner.state)
+        cleaned = True
     write_report(runner.state, runner.engine.report_dir)
+    return cleaned
 
 
 def summarize(results: dict[str, dict[str, Any]]) -> dict[str, Any]:

@@ -17,6 +17,12 @@ import tempfile
 from pathlib import Path
 
 
+def octal_mode(mode: int) -> str:
+    """File mode as guestfish parses it: C-style octal with a leading 0 ("0755"). Python's
+    f"{mode:#o}" gives "0o755", which guestfish rejects ("invalid integer parameter")."""
+    return f"0{mode & 0o7777:o}"
+
+
 class GuestfishError(RuntimeError):
     pass
 
@@ -87,7 +93,7 @@ class Guestfish:
             tmp = f.name
         parent = path.rsplit("/", 1)[0] or "/"
         try:
-            self._run(f"mkdir-p {_q(parent)}\nupload {_q(tmp)} {_q(path)}\nchmod {mode:#o} {_q(path)}\n",
+            self._run(f"mkdir-p {_q(parent)}\nupload {_q(tmp)} {_q(path)}\nchmod {octal_mode(mode)} {_q(path)}\n",
                       rw=True, inspect=True)
         finally:
             Path(tmp).unlink(missing_ok=True)

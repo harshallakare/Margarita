@@ -185,6 +185,21 @@ def reset_for_resume(store: TaskStore) -> int:
     return n
 
 
+def reset_after_cleanup(store: TaskStore) -> int:
+    """The failure cleanup deleted the run's target disks/VM (MigrationState.target_cleaned): every
+    task must run again on retry
+    (COMPLETED ones too: "disks created/copied" no longer holds). Validate/inspect are cheap and
+    the snapshot task reuses the kept source snapshot. Returns how many were reset."""
+    n = 0
+    for t in store.load_tasks():
+        if t.status != TaskStatus.PENDING:
+            t.status, t.error, t.message, t.progress = TaskStatus.PENDING, None, "", 0.0
+            t.attempts = 0
+            store.save_task(t)
+            n += 1
+    return n
+
+
 class TaskContext:
     def __init__(self, runner: DagRunner, rec: TaskRecord):
         self._runner = runner
@@ -303,6 +318,11 @@ class DagRunner:
 
     def _expand(self, parent: TaskRecord, children: list[TaskSpec]) -> None:
         tasks = {t.id: t for t in self.store.load_tasks()}
+        # A parent re-run after reset_after_cleanup returns the same children again: they are
+        # already in the graph (reset to PENDING, still wired), so only genuinely new ones are added.
+        children = [c for c in children if c.id not in tasks]
+        if not children:
+            return
         base = max((t.seq for t in tasks.values()), default=0) + 1
         new = []
         for i, c in enumerate(children):

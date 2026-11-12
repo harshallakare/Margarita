@@ -19,7 +19,7 @@ import time
 from typing import Any
 
 from ..db.repo import Repo, SqlTaskStore
-from ..engine.dag import ExecStatus, TaskRecord, TaskStatus, reset_for_resume, validate_graph
+from ..engine.dag import ExecStatus, TaskRecord, TaskStatus, reset_after_cleanup, reset_for_resume, validate_graph
 from ..core.cron import Cron, CronError
 from ..core.routing import Requirement, requirements, waiting_reason
 from ..engine.flows import migration_dag
@@ -57,11 +57,16 @@ def requeue_for_retry(repo: Repo, xid: str) -> int:
         raise KeyError(xid)
     if repo.active_execution(ex["migration_id"]) is not None:
         raise RuntimeError("migration already has an active execution")
-    n = reset_for_resume(SqlTaskStore(repo, xid))
+    store = SqlTaskStore(repo, xid)
+    mig = repo.get_migration(ex["migration_id"], include_deleted=True) or {}
+    cleaned = ex.get("kind") == "migration" and bool((mig.get("state") or {}).get("target_cleaned"))
+    # after a failure cleanup the target disks are gone: resuming would reuse deleted volumes,
+    # so every task runs again (the kept source snapshot is reused, the disks are re-created)
+    n = reset_after_cleanup(store) if cleaned else reset_for_resume(store)
     if not repo.transition(xid, (S.FAILED.value, S.CANCELED.value), S.QUEUED.value, error=None,
                            cancel_requested=False, lease_owner=None, lease_expires=None, finished_at=None):
         raise RuntimeError(f"execution {xid} is {ex['status']}; only failed/canceled executions can be retried")
-    repo.add_event("execution.queued", {"reason": "retry", "reset_tasks": n}, execution_id=xid,
+    repo.add_event("execution.queued", {"reason": "retry", "reset_tasks": n, "restart": cleaned}, execution_id=xid,
                    migration_id=ex["migration_id"])
     return n
 

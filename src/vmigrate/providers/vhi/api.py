@@ -45,6 +45,10 @@ class OpenStackApi:
     def get_volume(self, vol_id: str) -> dict[str, Any]:
         return _d(self.conn.block_storage.get_volume(vol_id))
 
+    def volume_or_none(self, vol_id: str) -> dict[str, Any] | None:
+        v = self.conn.block_storage.find_volume(vol_id, ignore_missing=True)
+        return _d(v) if v is not None else None
+
     def volumes_by_name(self, name: str) -> list[dict[str, Any]]:
         return [_d(v) for v in self.conn.block_storage.volumes(details=True, name=name)]
 
@@ -67,6 +71,10 @@ class OpenStackApi:
 
     def get_server(self, server_id: str) -> dict[str, Any]:
         return _d(self.conn.compute.get_server(server_id))
+
+    def server_or_none(self, server_id: str) -> dict[str, Any] | None:
+        s = self.conn.compute.find_server(server_id, ignore_missing=True)
+        return _d(s) if s is not None else None
 
     def find_server(self, name: str) -> dict[str, Any] | None:
         s = self.conn.compute.find_server(name, ignore_missing=True)

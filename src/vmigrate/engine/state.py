@@ -80,6 +80,8 @@ class MigrationState:
     verification: dict[str, Any] | None = None
     created: dict[str, Any] = field(default_factory=lambda: {"target_disks": [], "target_vm": None, "source": []})
     errors: list[dict[str, Any]] = field(default_factory=list)
+    #: the failure cleanup deleted the target disks/VM; a retry must start again from disk creation
+    target_cleaned: bool = False
     history: list[dict[str, Any]] = field(default_factory=list)
 
     def set_phase(self, p: Phase) -> None:
@@ -87,6 +89,29 @@ class MigrationState:
         if p != Phase.FAILED:
             self.last_good_phase = p
         self.history.append({"t": time.time(), "phase": p.value})
+
+    def forget_target(self) -> None:
+        """The failure cleanup deleted what this migration created on the target (disks, VM). Drop
+        every reference to them so the next run (or a retry) creates and copies the disks again
+        instead of resuming onto volumes that no longer exist. Disks owned by another migration
+        (cluster shared disks) were not deleted and are kept. The source snapshot is kept too."""
+        gone = {d.get("id") for d in self.created.get("target_disks", [])}
+        for ds in self.disks.values():
+            if ds.target and ds.target.get("id") in gone:
+                ds.target, ds.staged_path, ds.shared_owner = None, None, None
+            ds.bytes_copied = ds.progress_bytes = 0
+            ds.rate_mb_s, ds.progress_at = 0.0, None
+            ds.copied = ds.committed = ds.attached = False
+            ds.copy_stats = ds.verify = None
+        self.created["target_disks"] = []
+        self.created["target_vm"] = None
+        self.created.pop("target_vm_pending", None)
+        self.target_vm = self.morph = self.verification = None
+        self.target_cleaned = True
+        back = Phase.SNAPSHOTTED if self.snapshot else Phase.NEW
+        if phase_at_least(self.last_good_phase, back):
+            self.last_good_phase = back
+        self.history.append({"t": time.time(), "phase": "target_cleaned"})
 
     def resume_phase(self) -> Phase:
         return self.last_good_phase if self.phase == Phase.FAILED else self.phase

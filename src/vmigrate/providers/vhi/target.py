@@ -578,8 +578,10 @@ class VhiTarget(TargetProvider):
         self.ctx.require_execute("vhi cleanup created resources")
         self.close()                     # helper VM first: its attachments block volume deletion
         vm = created.get("target_vm")
-        if vm:
-            s = self.api.get_server(vm["id"])
+        s = self.api.server_or_none(vm["id"]) if vm else None
+        if vm and s is None:
+            self.ctx.logger.info("cleanup: server %s is already gone", vm["id"])
+        elif vm and s is not None:
             if (s.get("metadata") or {}).get(MANAGED) != "true":
                 raise SafetyGateError(f"refusing to delete server {vm['id']}: not vmigrate-managed")
             self.api.delete_server(vm["id"])
@@ -591,7 +593,11 @@ class VhiTarget(TargetProvider):
                     self.api.delete_port(p["id"])
                 i += 1
         for d in created.get("target_disks", []):
-            v = self.api.get_volume(d["id"])
+            v = self.api.volume_or_none(d["id"])
+            if v is None:                # removed by an earlier cleanup or by hand
+                self.ctx.logger.info("cleanup: volume %s (%s) is already gone", d["id"], d.get("name"))
+                self._staged(TargetDiskRef(d["id"], d["name"], d["size_bytes"])).unlink(missing_ok=True)
+                continue
             if (v.get("metadata") or {}).get(MANAGED) != "true":
                 raise SafetyGateError(f"refusing to delete volume {d['id']}: not vmigrate-managed")
             self.api.delete_volume(d["id"])
