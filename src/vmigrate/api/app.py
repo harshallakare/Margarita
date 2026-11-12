@@ -311,13 +311,48 @@ def create_app(services: Services | None = None) -> FastAPI:
             raise HTTPException(404, "notification channel not found")
         return c
 
-    def check_channel(cfg: dict[str, Any], password: str | None) -> None:
-        """Save-time check: connect, TLS, log in (no mail sent). 422 with the server's answer on failure."""
+    def build_channel(cfg: dict[str, Any], password: str | None) -> Any:
+        from ..alerts.providers import problems
+        bad = problems(cfg, password)
+        if bad:
+            raise HTTPException(422, "; ".join(bad))
         try:
-            svc.alert_manager().channel_factory(cfg, password).check()
+            return svc.alert_manager().channel_factory(cfg, password)
+        except ConfigError as e:
+            raise HTTPException(422, str(e)) from e
+
+    def check_channel(cfg: dict[str, Any], password: str | None, *, skip: bool = False) -> None:
+        """Save-time check: SMTP connect + TLS + log in, or a Microsoft sign-in (no mail sent). 422 with
+        the server's answer on failure. The settings are always validated, even with skip_check."""
+        ch = build_channel(cfg, password)
+        if skip:
+            return
+        try:
+            ch.check()
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(422, f"SMTP check failed ({type(e).__name__}): {e}. Fix the settings, or save "
-                                     "with skip_check to store them anyway.") from e
+            raise HTTPException(422, f"Connection check failed ({type(e).__name__}): {e}. Fix the settings, or "
+                                     "save with skip_check to store them anyway.") from e
+
+    @app.get("/notification-providers", tags=["alerts"])
+    def notification_providers(_: Principal = Depends(admin)) -> list[dict[str, Any]]:
+        """Email provider presets: pick one and enter only the account and its secret."""
+        from ..alerts.providers import catalog
+        return catalog()
+
+    @app.post("/notification-channels/test", tags=["alerts"])
+    def test_unsaved_channel(body: m.ChannelTest, _: Principal = Depends(admin)) -> dict[str, Any]:
+        """Send a test email with the editor's current settings, before (or without) saving them."""
+        pw = body.password
+        if not pw and body.channel_id:
+            c = channel_or_404(body.channel_id)
+            pw = (svc.secrets.get(c["secret_id"]) or {}).get("password") if c.get("secret_id") else None
+        cfg = body.config.model_dump()
+        ch = build_channel(cfg, pw)
+        try:
+            svc.alert_manager().send_test(ch, "unsaved settings")
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(422, f"test message failed ({type(e).__name__}): {e}") from e
+        return {"ok": True, "sent_to": cfg.get("to")}
 
     @app.get("/notification-channels", tags=["alerts"])
     def list_channels(_: Principal = Depends(admin)) -> list[dict[str, Any]]:
@@ -328,8 +363,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         if repo.get_channel_by_name(body.name):
             raise HTTPException(409, "a notification channel with this name exists")
         cfg = body.config.model_dump()
-        if not body.skip_check:
-            check_channel(cfg, body.password)
+        check_channel(cfg, body.password, skip=body.skip_check)
         sid = svc.secrets.put({"password": body.password}) if body.password else None
         cid = repo.create_channel(name=body.name, type=body.type, config=cfg, secret_id=sid, enabled=body.enabled,
                                   min_severity=body.min_severity, notify_resolved=body.notify_resolved,
@@ -345,8 +379,8 @@ def create_app(services: Services | None = None) -> FastAPI:
             vals["config"] = cfg
         old_pw = (svc.secrets.get(c["secret_id"]) or {}).get("password") if c.get("secret_id") else None
         pw = None if body.clear_password else (body.password if body.password is not None else old_pw)
-        if (body.config is not None or body.password is not None or body.clear_password) and not body.skip_check:
-            check_channel(cfg, pw)
+        if body.config is not None or body.password is not None or body.clear_password:
+            check_channel(cfg, pw, skip=body.skip_check)
         if body.clear_password and c.get("secret_id"):
             svc.secrets.delete(c["secret_id"])
             vals["secret_id"] = None

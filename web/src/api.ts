@@ -225,8 +225,13 @@ export interface Alert {
 }
 export interface AlertSummary { firing: number; critical: number; unacknowledged: number }
 export interface EmailConfig {
-  host: string; port: number; security: "starttls" | "ssl" | "none"; username?: string | null; from_addr: string;
-  to: string[]; verify_tls: boolean; subject_prefix: string;
+  provider: string; host: string; port: number; security: "starttls" | "ssl" | "none"; username?: string | null;
+  from_addr: string; to: string[]; verify_tls: boolean; subject_prefix: string;
+  tenant_id?: string | null; client_id?: string | null;
+}
+export interface EmailProvider {
+  id: string; label: string; kind: "smtp" | "graph"; host?: string; port?: number; security?: EmailConfig["security"];
+  username?: string; username_is_from?: boolean; secret_label: string; help: string; warning?: string;
 }
 export interface Channel {
   id: string; name: string; type: "email"; config: EmailConfig; enabled: boolean; min_severity: "warning" | "critical";

@@ -143,7 +143,8 @@ def test_channel_api_checks_before_saving_and_never_returns_the_password(mgr):
     rep, box = mgr, mgr.box
     ch = rep.channel
     assert ch["has_password"] and "password" not in ch and "smtp-test-pw" not in str(ch)
-    assert box.checked[-1] == (CFG | {"verify_tls": True, "subject_prefix": "[Margarita]"}, "smtp-test-pw")
+    assert box.checked[-1] == (CFG | {"verify_tls": True, "subject_prefix": "[Margarita]", "provider": "custom",
+                                      "tenant_id": None, "client_id": None}, "smtp-test-pw")
     assert rep.c.get("/notification-channels", headers=rep.viewer).status_code == 403
     box.fail = "535 authentication failed"
     bad = rep.c.post("/notification-channels", headers=rep.admin, json={"name": "b", "config": CFG, "password": "x"})
@@ -207,3 +208,100 @@ def test_email_channel_smtp_conversation():
     assert validate({**CFG, "to": ["not-an-address"], "port": 0})
     with pytest.raises(ConfigError, match="to must list"):
         EmailChannel({**CFG, "to": []})
+
+
+# ================================================================ provider presets + Microsoft 365 (Graph)
+from vmigrate.alerts.graph import GraphMailChannel  # noqa: E402
+from vmigrate.alerts.providers import PROVIDERS, apply_preset, make_channel  # noqa: E402
+
+TENANT, CLIENT = "11111111-2222-3333-4444-555555555555", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def test_presets_fill_server_and_username_and_keep_explicit_values():
+    g = apply_preset({"provider": "gmail", "from_addr": "ops@gmail.com", "to": ["a@x.test"]})
+    assert (g["host"], g["port"], g["security"], g["username"]) == ("smtp.gmail.com", 587, "starttls", "ops@gmail.com")
+    y = apply_preset({"provider": "yahoo", "from_addr": "me@yahoo.com", "to": ["a@x.test"]})
+    assert (y["host"], y["port"], y["security"]) == ("smtp.mail.yahoo.com", 465, "ssl")
+    sg = apply_preset({"provider": "sendgrid", "from_addr": "alerts@x.test", "to": ["a@x.test"]})
+    assert sg["username"] == "apikey"
+    eu = apply_preset({"provider": "zoho", "host": "smtp.zoho.eu", "port": 465, "security": "ssl",
+                       "from_addr": "me@x.eu", "to": ["a@x.test"]})
+    assert eu["host"] == "smtp.zoho.eu"                                    # operator's server wins
+    for pid, p in PROVIDERS.items():                                       # every preset builds a channel
+        cfg = {"provider": pid, "from_addr": "alerts@x.test", "to": ["a@x.test"], "host": "" if pid != "custom"
+               else "smtp.x.test", "port": 587, "tenant_id": TENANT, "client_id": CLIENT}
+        assert make_channel(cfg, "s3cret") is not None, pid
+        assert p["label"] and p["help"] and p["secret_label"]
+    with pytest.raises(ConfigError, match="unknown email provider"):
+        make_channel({"provider": "nope", "from_addr": "a@x.test", "to": ["a@x.test"]}, None)
+
+
+class FakeGraph:
+    def __init__(self, token_status=200, send_status=202):
+        self.calls: list[tuple[str, str, dict, bytes | None]] = []
+        self.token_status, self.send_status = token_status, send_status
+
+    def __call__(self, method, url, headers, body, timeout):
+        import json as _json
+        self.calls.append((method, url, headers, body))
+        if url.endswith("/oauth2/v2.0/token"):
+            if self.token_status != 200:
+                return self.token_status, _json.dumps({"error": "invalid_client", "error_description":
+                                                       "AADSTS7000215: Invalid client secret provided.\nTrace"}).encode()
+            return 200, b'{"access_token": "tok-1", "expires_in": 3600}'
+        if self.send_status != 202:
+            return self.send_status, b'{"error": {"code": "ErrorAccessDenied", "message": "Access is denied."}}'
+        return 202, b""
+
+
+def test_graph_channel_signs_in_and_sends_as_the_mailbox():
+    import json as _json
+    import urllib.parse as _up
+    cfg = {"provider": "office365_graph", "tenant_id": TENANT, "client_id": CLIENT,
+           "from_addr": "alerts@contoso.test", "to": ["ops@contoso.test", "dr@contoso.test"]}
+    http = FakeGraph()
+    ch = GraphMailChannel(cfg, "client-secret", http=http)
+    ch.check()
+    m, url, _, body = http.calls[0]
+    form = _up.parse_qs(body.decode())
+    assert url == f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
+    assert form["grant_type"] == ["client_credentials"] and form["client_secret"] == ["client-secret"]
+    assert form["scope"] == ["https://graph.microsoft.com/.default"]
+    ch.send("CRITICAL: x", "body\n")
+    m, url, headers, body = http.calls[-1]
+    assert url == "https://graph.microsoft.com/v1.0/users/alerts@contoso.test/sendMail"
+    assert headers["Authorization"] == "Bearer tok-1" and len(http.calls) == 2      # token reused
+    msg = _json.loads(body)["message"]
+    assert msg["subject"] == "[Margarita] CRITICAL: x" and msg["body"] == {"contentType": "Text", "content": "body\n"}
+    assert [r["emailAddress"]["address"] for r in msg["toRecipients"]] == ["ops@contoso.test", "dr@contoso.test"]
+    with pytest.raises(PermissionError, match="Invalid client secret"):
+        GraphMailChannel(cfg, "bad", http=FakeGraph(token_status=401)).check()
+    with pytest.raises(RuntimeError, match="Mail.Send"):
+        GraphMailChannel(cfg, "s", http=FakeGraph(send_status=403)).send("s", "b")
+    with pytest.raises(ConfigError, match="client_id"):
+        GraphMailChannel({**cfg, "client_id": "not-a-guid"}, "s")
+    with pytest.raises(ConfigError, match="client secret"):
+        GraphMailChannel(cfg, None)
+
+
+def test_providers_list_and_test_before_saving(mgr):
+    rep, box = mgr, mgr.box
+    prov = rep.c.get("/notification-providers", headers=rep.admin).json()
+    assert {"gmail", "office365_graph", "office365_smtp", "custom"} <= {p["id"] for p in prov}
+    assert rep.c.get("/notification-providers", headers=rep.viewer).status_code == 403
+    unsaved = {"config": {"provider": "gmail", "from_addr": "ops@gmail.test", "to": ["dr@x.test"]},
+               "password": "app-pw"}
+    r = rep.c.post("/notification-channels/test", headers=rep.admin, json=unsaved)
+    assert r.json() == {"ok": True, "sent_to": ["dr@x.test"]} and box.sent[-1][0] == "Test notification"
+    # editing a saved channel: its stored secret is used when no password is typed
+    n = len(box.sent)
+    r = rep.c.post("/notification-channels/test", headers=rep.admin,
+                   json={"config": CFG, "channel_id": rep.channel["id"]})
+    assert r.status_code == 200 and len(box.sent) == n + 1
+    box.fail = "535 5.7.8 Username and Password not accepted"
+    r = rep.c.post("/notification-channels/test", headers=rep.admin, json=unsaved)
+    assert r.status_code == 422 and "not accepted" in r.text
+    bad = rep.c.post("/notification-channels", headers=rep.admin, json={
+        "name": "m365", "skip_check": True,
+        "config": {"provider": "office365_graph", "from_addr": "a@x.test", "to": ["b@x.test"]}})
+    assert bad.status_code == 422                                        # validated even with skip_check
