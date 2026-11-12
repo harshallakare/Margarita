@@ -374,6 +374,26 @@ attached. A dry-run never creates a helper.
 Not yet verified on a real VHI cluster: the virtio serial lookup inside the helper, cloud-init host key
 injection on your image, and throughput over SSH (expect lower speeds than `vstorage` mode).
 
+## Alert notifications (email)
+
+Settings → Alert notifications → **Add email**. Pick your provider; Margarita fills in the server, port and
+security, so you enter only the account and its secret:
+
+| Provider | You enter | Notes |
+|---|---|---|
+| Gmail / Google Workspace | address + App password | needs 2-Step Verification; normal passwords are refused |
+| Microsoft 365 (Graph API, recommended) | tenant ID, client ID, client secret, sending mailbox | app registration with Graph application permission `Mail.Send` + admin consent; no SMTP AUTH needed |
+| Microsoft 365 (SMTP AUTH) | mailbox + password | Authenticated SMTP must be on for the mailbox; Microsoft is retiring basic-auth SMTP AUTH, so prefer Graph |
+| Outlook.com, Yahoo, iCloud, Zoho, Fastmail | address + (app) password | Zoho EU/IN/AU: change the server under Server settings |
+| Amazon SES, SendGrid, Mailgun, Brevo | SMTP login + SMTP key/API key | SES: set your region in the server name; SendGrid username is `apikey` |
+| Custom SMTP | server, port, security, optional login | internal relays without login work too |
+
+- **Send test email** in the dialog sends one message with the settings as typed, before saving. Saved channels
+  have **Send test** in the list. API: `POST /notification-channels/test` and `POST /notification-channels/{id}/test`.
+- Saving checks the login first (SMTP login, or a Microsoft sign-in for Graph); nothing is sent. Secrets are stored
+  encrypted and never returned. `GET /notification-providers` lists the presets.
+- Provider server names are the providers' published ones; the tests use fakes, so confirm with **Send test**.
+
 ## Logs, diagnostics and audit trail
 
 **Investigating a failure:**

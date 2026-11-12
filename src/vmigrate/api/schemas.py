@@ -287,7 +287,9 @@ ReplicaOut.model_rebuild()
 
 
 class EmailChannelConfig(BaseModel):
-    host: str = Field(..., min_length=1, max_length=255)
+    provider: str = Field("custom", pattern="^[a-z0-9_]{1,32}$",
+                          description="preset from GET /notification-providers (gmail, office365_graph, ...)")
+    host: str = Field("", max_length=255, description="SMTP server; empty = the provider preset's")
     port: int = Field(587, ge=1, le=65535)
     security: str = Field("starttls", pattern="^(starttls|ssl|none)$")
     username: str | None = Field(None, max_length=255)
@@ -295,6 +297,8 @@ class EmailChannelConfig(BaseModel):
     to: list[str] = Field(..., min_length=1, max_length=50)
     verify_tls: bool = True
     subject_prefix: str = Field("[Margarita]", max_length=64)
+    tenant_id: str | None = Field(None, max_length=255, description="Microsoft 365 (Graph): directory (tenant) ID")
+    client_id: str | None = Field(None, max_length=64, description="Microsoft 365 (Graph): application (client) ID")
 
 
 class ChannelCreate(BaseModel):
@@ -307,6 +311,14 @@ class ChannelCreate(BaseModel):
     notify_resolved: bool = True
     notify_success: bool = False
     skip_check: bool = Field(False, description="save without first connecting + logging in to the SMTP server")
+
+
+class ChannelTest(BaseModel):
+    """Send a test email with settings that are not saved yet (the channel editor's Send test)."""
+    config: EmailChannelConfig
+    password: str | None = Field(None, max_length=1024)
+    channel_id: str | None = Field(None, description="editing a saved channel: use its stored secret when "
+                                                     "no password is given")
 
 
 class ChannelUpdate(BaseModel):

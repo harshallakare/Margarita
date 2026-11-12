@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .email import EmailChannel
+from .providers import make_channel
 from .rules import evaluate
 
 log = logging.getLogger("vmigrate.alerts")
@@ -58,7 +58,7 @@ class AlertManager:
         self.public_url = (public_url or "").rstrip("/") or None
         self.repeat_hours = repeat_hours
         self.background = background
-        self.channel_factory = channel_factory or (lambda cfg, pw: EmailChannel(cfg, pw))
+        self.channel_factory = channel_factory or make_channel
         self._last_run = 0.0
         self._success_since = time.time()      # no flood of old successes after a restart
         self._send_lock = threading.Lock()
@@ -203,8 +203,12 @@ class AlertManager:
 
     def test_channel(self, row: dict[str, Any]) -> None:
         """Send one test message now (raises on failure)."""
-        body = ("This is a test message from Margarita alerting.\n\n"
-                f"Channel: {row['name']}\nSent:    {_utc(time.time())}\n"
-                + ("\n".join([""] + self._link(None, None)) if self.public_url else "") + "\n")
-        self.channel(row).send("Test notification", body)
+        self.send_test(self.channel(row), row["name"])
         self.repo.update_channel(row["id"], last_sent_at=time.time(), last_error=None)
+
+    def send_test(self, ch: Any, name: str) -> None:
+        body = ("This is a test message from Margarita alerting. If you can read it, alert emails will reach "
+                "you.\n\n"
+                f"Channel: {name}\nSent:    {_utc(time.time())}\n"
+                + ("\n".join([""] + self._link(None, None)) if self.public_url else "") + "\n")
+        ch.send("Test notification", body)
