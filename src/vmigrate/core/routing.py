@@ -29,13 +29,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 SDK = {"vmware": "pyVmomi", "hyperv": "winrm", "openstack": "openstack", "vhi": "openstack", "aws": "boto3",
-       "azure": None, "nutanix": "requests", "proxmox": "requests", "fake": None, "physical": None}
+       "azure": None, "libvirt": None, "ovirt": None, "xen": None, "gcp": "cryptography", "oci": "cryptography",
+       "nutanix": "requests", "proxmox": "requests", "fake": None, "physical": None}
 TOOLS = ("qemu-img", "iscsiadm", "nbdkit", "guestfish", "mount.nfs", "ssh", "virt-v2v-in-place", "rbd", "qemu-nbd")
 # inherent per-role needs: (provider type, role) -> capabilities
 PROVIDER_NEEDS: dict[tuple[str, str], set[str]] = {
     ("vhi", "target"): {"tool:qemu-img", "root"},          # writes VMDS qcow2 backings on the node
     ("physical", "source"): {"tool:ssh"},                   # disks stream over ssh pipes
-    ("proxmox", "source"): {"tool:ssh"},                    # qemu-nbd on the node, socket forwarded over ssh
+    ("proxmox", "source"): {"tool:ssh"},
+    ("libvirt", "source"): {"tool:ssh"},                    # virsh + NBD over ssh                    # qemu-nbd on the node, socket forwarded over ssh
 }
 
 

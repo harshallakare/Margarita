@@ -29,6 +29,11 @@ hyperv = ["pywinrm>=0.4"]
 proxmox = ["proxmoxer>=2", "requests>=2.31"]
 aws = ["boto3>=1.28"]
 azure = []                     # plain REST (ARM + blob); no Azure SDK
+libvirt = []                   # virsh + qemu-nbd on the KVM host over ssh
+ovirt = []                     # REST v4 + ImageIO
+xen = []                       # XAPI JSON-RPC + NBD
+gcp = ["cryptography>=42"]     # service-account JWT signing
+oci = ["cryptography>=42"]     # OCI request signing
 dev = ["pytest>=7", "requests>=2.31", "httpx>=0.27", "fastapi>=0.110", "uvicorn>=0.29", "sqlalchemy>=2.0", "cryptography>=42"]
 
 [project.scripts]

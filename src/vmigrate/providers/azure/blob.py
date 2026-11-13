@@ -32,7 +32,7 @@ from typing import Any
 from ...core.errors import ProviderError, TransientProviderError
 from ...core.interfaces import DiskReader
 from ...core.ranges import ByteRange, normalize
-from .http import Http
+from ..common.http import Http
 
 VERSION = "2021-08-06"
 PIECE = 4 << 20                 # largest range for which Azure returns a Content-MD5
