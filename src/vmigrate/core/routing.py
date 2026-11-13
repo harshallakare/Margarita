@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 SDK = {"vmware": "pyVmomi", "hyperv": "winrm", "openstack": "openstack", "vhi": "openstack", "aws": "boto3",
-       "nutanix": "requests", "proxmox": "requests", "fake": None, "physical": None}
+       "azure": None, "nutanix": "requests", "proxmox": "requests", "fake": None, "physical": None}
 TOOLS = ("qemu-img", "iscsiadm", "nbdkit", "guestfish", "mount.nfs", "ssh", "virt-v2v-in-place", "rbd", "qemu-nbd")
 # inherent per-role needs: (provider type, role) -> capabilities
 PROVIDER_NEEDS: dict[tuple[str, str], set[str]] = {

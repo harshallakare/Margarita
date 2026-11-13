@@ -280,7 +280,7 @@ runs only on that pool, in the pool's region. Settings → Worker pools creates 
 shuts the source VM down, then runs a final delta sync and deploys from it in one execution.
 - Shutting down the source happens **only** when `shutdown_source` is true. It is the only source-state change
   Margarita makes. `force_power_off` does a hard power-off instead of a guest shutdown.
-- Implemented for Nutanix, VMware, Hyper-V, Proxmox, OpenStack, AWS and physical servers.
+- Implemented for Nutanix, VMware, Hyper-V, Proxmox, OpenStack, AWS, Azure and physical servers.
 
 **Full checksum verification.** The `engine.verify_full` option (wizard → Options) adds a SHA-256 of every byte
 on the source snapshot and the committed target disk, on top of the sampled checks. A mismatch fails the disk.
@@ -725,6 +725,38 @@ IAM: `ec2:Describe{Instances,Volumes,InstanceTypes,Snapshots}`, `ec2:CreateSnaps
 on the volume keys for encrypted volumes. **Costs:** AWS bills EBS direct API requests (about one request per
 512 KiB block read) and snapshot storage. A replica's kept base snapshot is incremental.
 
+## Azure source
+
+Endpoint config (`type: azure`): `subscription_id`, then either `auth: client_secret` with `tenant_id`,
+`client_id` and `client_secret` (an Entra ID app registration; the secret is encrypted), or
+`auth: managed_identity` when the worker is itself an Azure VM (optional `managed_identity_client_id` for a
+user-assigned identity). Optional: `cloud` (`public`, `usgov`, `china`), `resource_group` (limit the VM list),
+`snapshot_resource_group` (default: the VM's own group), `allow_per_disk_snapshots`, `read_workers` (default 16)
+and `sas_hours` (default 8). No Azure SDK is needed: Margarita calls the ARM and blob REST APIs directly.
+
+| Step | How |
+|---|---|
+| Inspect | ARM VM (`$expand=instanceView`), each managed disk, NICs and the VM size. Disks are ordered OS disk first, then data disks by LUN. Azure presents disks through Hyper-V `storvsc` (or `nvme` on newer sizes) and NICs through `netvsc`, so OSMorph injects virtio for KVM targets. Generation 2 means UEFI; Trusted Launch secure boot is recorded. |
+| Disk-count gate | `storageProfile` disks vs the subscription's managed disks whose `managedBy` is this VM (catches disks in other resource groups). |
+| Refused | unmanaged (VHD page-blob) disks, ephemeral OS disks, Confidential VMs, `app_consistent` (no guest quiesce through this API), and a **running VM with more than one disk** unless `allow_per_disk_snapshots: true` (see below) |
+| Snapshot | One **incremental** snapshot per managed disk, tagged `vmigrate:run`, all started back to back, then waited until `Succeeded` and 100% copied |
+| Read | `beginGetAccess` gives a read-only SAS URL of the snapshot. Margarita reads it as a page blob: parallel 4 MiB range reads, each checked against its Content-MD5, with throttling and drops retried and the SAS renewed if it runs out. Never-written pages are skipped on a full copy. The SAS stays in memory only (never in state files or logs), and access is ended when the last reader closes. No helper VM, no disk attach. |
+| Cleanup | `endGetAccess`, then delete, only for snapshots tagged `vmigrate:run`. The source disks are never exported, written or detached. |
+| Replicas | Get Page Ranges with `x-ms-previous-snapshot-url` (the previous incremental snapshot of the same disk). Changed and cleared pages are both copied. The previous snapshot set is kept as the diff base and replaced each sync. |
+| Cutover | `powerOff` (guest shutdown; `force_power_off` skips it). The VM is stopped, not deallocated, so its IPs are kept. |
+
+**Consistency.** Azure snapshots each disk separately, so the disks of a running multi-disk VM come from
+slightly different moments. Margarita refuses that unless the VM is stopped or you set
+`allow_per_disk_snapshots: true`. That is acceptable for replica syncs that end in a cutover with
+`shutdown_source`, because the final sync then runs on the stopped VM. Single-disk VMs are always crash-consistent.
+The temporary resource disk (D: on Windows, /mnt on Linux) is scratch storage and is not copied.
+
+Azure role: `Reader` plus `Disk Snapshot Contributor` on the scope covers it. For a custom role, grant
+`Microsoft.Compute/{virtualMachines,disks,locations/vmSizes}/read`, `Microsoft.Network/networkInterfaces/read`,
+`Microsoft.Compute/snapshots/{read,write,delete}`, `Microsoft.Compute/snapshots/{beginGetAccess,endGetAccess}/action`,
+and `Microsoft.Compute/virtualMachines/powerOff/action` only for cutover shutdowns. **Costs:** Azure bills
+incremental snapshot storage (changed pages only) and egress for every byte read out of the region.
+
 ## Support matrix
 
 | Side | Platform | Status |
@@ -737,7 +769,7 @@ on the volume keys for encrypted volumes. **Costs:** AWS bills EBS direct API re
 | source | AWS EC2 (EBS-backed instances) | **implemented**. Tested against a fake EC2/EBS only; not yet run against an AWS account. |
 | source | Physical Linux server (P2V over SSH: cold or live LVM-snapshot) | **implemented**. Tested against a scripted shell and real local files; not yet run on hardware. |
 | source | Any of the above at another site | **implemented** through the export agent (cross-site). |
-| source | Azure | planned (interface-ready) |
+| source | Azure (VMs on managed disks) | **implemented**. Tested against a fake ARM and page blob only; not yet run against an Azure subscription. |
 | target | Virtuozzo VHI | **implemented** (reference) |
 | target | OpenStack, Proxmox VE, Nutanix AHV, VMware vSphere, AWS, Azure | planned |
 

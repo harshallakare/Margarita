@@ -705,7 +705,7 @@ def create_app(services: Services | None = None) -> FastAPI:
                 src.close()
         return await provider_call(f"listing VMs on {e['name']}", go)
 
-    @app.get("/endpoints/{eid}/instances/{vm}", tags=["endpoints"])
+    @app.get("/endpoints/{eid}/instances/{vm:path}", tags=["endpoints"])   # Azure: "<group>/<name>"
     async def inspect_instance(eid: str, vm: str, p: Principal = Depends(viewer)) -> dict[str, Any]:
         """Full IR of one VM plus the disk-count gate result, so the wizard shows the TRUE disk
         count up front (and refuses to continue when enumerations disagree)."""

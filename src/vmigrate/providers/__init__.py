@@ -37,7 +37,8 @@ SOURCES: dict[str, tuple[str | None, str, str]] = {
             "CreateSnapshots (crash-consistent set) + EBS direct APIs; ListChangedBlocks incremental"),
     "physical": ("vmigrate.providers.physical.source:PhysicalSource", "implemented",
                  "P2V Linux over SSH: cold (rescue ISO) or live LVM-snapshot reads; unverified on real hardware"),
-    "azure": (None, "planned", "managed-disk snapshot SAS export, page-range diff"),
+    "azure": ("vmigrate.providers.azure.source:AzureSource", "implemented",
+              "ARM REST: incremental managed-disk snapshots read over SAS; page-range diff incremental"),
 }
 
 TARGETS: dict[str, tuple[str | None, str, str]] = {
@@ -230,6 +231,32 @@ FIELDS: dict[str, list[dict[str, Any]]] = {
         {"name": "ignore_instance_store", "label": "Ignore instance store", "kind": "bool", "default": False,
          "help": "only if instance-store disks hold scratch data: EBS snapshots never include them"},
         {"name": "read_workers", "label": "Parallel block reads per disk", "kind": "int", "default": 16},
+    ],
+    "azure": [
+        {"name": "subscription_id", "label": "Subscription ID", "kind": "text", "required": True},
+        {"name": "auth", "label": "Sign-in", "kind": "select", "options": ["client_secret", "managed_identity"],
+         "default": "client_secret",
+         "help": "client_secret: an Entra ID app registration; managed_identity: the worker is an Azure VM "
+                 "with a managed identity"},
+        {"name": "tenant_id", "label": "Directory (tenant) ID", "kind": "text"},
+        {"name": "client_id", "label": "Application (client) ID", "kind": "text"},
+        {"name": "client_secret", "label": "Client secret", "kind": "password", "secret": True,
+         "help": "the secret's Value (not its ID); secrets expire, renew it in Entra ID"},
+        {"name": "managed_identity_client_id", "label": "User-assigned identity client ID", "kind": "text",
+         "help": "managed_identity only, optional: leave empty for the system-assigned identity"},
+        {"name": "cloud", "label": "Azure cloud", "kind": "select", "options": ["public", "usgov", "china"],
+         "default": "public"},
+        {"name": "resource_group", "label": "Resource group (optional)", "kind": "text",
+         "help": "only list VMs in this resource group; empty = the whole subscription"},
+        {"name": "snapshot_resource_group", "label": "Snapshot resource group (optional)", "kind": "text",
+         "help": "where the temporary snapshots go; empty = the VM's own resource group"},
+        {"name": "allow_per_disk_snapshots", "label": "Allow per-disk snapshots of running VMs", "kind": "bool",
+         "default": False,
+         "help": "Azure snapshots each disk separately; a running VM with several disks is refused unless this "
+                 "is on (or the VM is stopped)"},
+        {"name": "read_workers", "label": "Parallel reads per disk", "kind": "int", "default": 16},
+        {"name": "sas_hours", "label": "Read access lifetime (hours)", "kind": "int", "default": 8,
+         "help": "each snapshot's read-only SAS; renewed automatically if a copy runs longer"},
     ],
     "fake": [
         {"name": "vms", "label": "VMs", "kind": "json", "help": "source side: [{name, os, disks: [{size, boot}]}]"},
