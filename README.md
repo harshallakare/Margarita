@@ -280,7 +280,8 @@ runs only on that pool, in the pool's region. Settings → Worker pools creates 
 shuts the source VM down, then runs a final delta sync and deploys from it in one execution.
 - Shutting down the source happens **only** when `shutdown_source` is true. It is the only source-state change
   Margarita makes. `force_power_off` does a hard power-off instead of a guest shutdown.
-- Implemented for Nutanix, VMware, Hyper-V, Proxmox, OpenStack, AWS, Azure and physical servers.
+- Implemented for every source: Nutanix, VMware, Hyper-V, Proxmox, KVM/libvirt, oVirt/RHV/OLVM, XenServer/XCP-ng,
+  OpenStack, AWS, Azure, Google Cloud, Oracle Cloud and physical servers.
 
 **Full checksum verification.** The `engine.verify_full` option (wizard → Options) adds a SHA-256 of every byte
 on the source snapshot and the committed target disk, on top of the sampled checks. A mismatch fails the disk.
@@ -757,6 +758,100 @@ Azure role: `Reader` plus `Disk Snapshot Contributor` on the scope covers it. Fo
 and `Microsoft.Compute/virtualMachines/powerOff/action` only for cutover shutdowns. **Costs:** Azure bills
 incremental snapshot storage (changed pages only) and egress for every byte read out of the region.
 
+## KVM / libvirt source
+
+Endpoint config (`type: libvirt`): `host`, `ssh_user` (root, or passwordless sudo for `virsh` and `qemu-nbd`),
+`ssh_private_key` (encrypted), `ssh_known_hosts` (pinned host key), optional `uri` (default `qemu:///system`),
+`scratch_dir` and `backup_port`. One endpoint per KVM host. Nothing is installed on the host beyond qemu-nbd
+(package `qemu-utils` / `qemu-img`).
+
+| Step | How |
+|---|---|
+| Inspect | `virsh dumpxml` + `domblkinfo` per disk. Disks keep their XML order; the boot disk is the lowest `<boot order>`. virtio disks map to `virtio-blk`, scsi disks to their controller model (`virtio-scsi`, `lsilogic`, ...). virtio guests need no driver injection on KVM targets. UEFI from `firmware="efi"` or a pflash loader. |
+| Disk-count gate | dumpxml disks vs `virsh domblklist --details` |
+| Refused | pass-through LUNs (`device="lun"`); network/volume disks of a shut-off VM |
+| Shut-off VM | Nothing is created. `qemu-nbd --read-only` opens each disk **with the image lock**, so libvirt cannot start the VM while a disk is read; a VM started between disks is detected and refused. |
+| Running VM | libvirt **pull-mode backup** (`virsh backup-begin`, libvirt >= 7.2 / QEMU >= 4.2): QEMU serves a point-in-time view of every disk over NBD on 127.0.0.1 of the host and SSH forwards it to the worker. Writes the guest makes meanwhile go to scratch files. `app_consistent` freezes the guest filesystems (QEMU guest agent) around `backup-begin`. Unallocated areas are skipped (`base:allocation`). |
+| Replicas | Each backup creates a checkpoint (dirty bitmaps). The next backup is incremental from the newest `vmigrate-*` checkpoint and the changed ranges come from `qemu:dirty-bitmap:backup-<disk>` (NBD block status). The backup job ends after every sync; only the checkpoint is kept, and the older one is deleted. A missing checkpoint falls back to a full backup and a compare sync. |
+| Cleanup | `virsh domjobabort` (libvirt deletes the scratch files) and the migration's checkpoint |
+
+## oVirt / RHV / OLVM source
+
+Endpoint config (`type: ovirt`): engine `url`, `username` (`user@profile`, with the backup role on the VMs),
+`password` (encrypted), `ca_pem` (the engine CA), `verify_tls`, `use_proxy` (read through the engine's ImageIO
+proxy instead of the hosts) and `read_workers`. No SDK and nothing on the hosts: the engine's backup API (4.4+)
+and ImageIO do the work.
+
+| Step | How |
+|---|---|
+| Inspect | VM + disk attachments + disks + NICs (vNIC profile -> network). Bootable disk first. `virtio_scsi` / `virtio` disks need no driver injection on KVM targets. UEFI from `bios.type` (`q35_ovmf`, `q35_secure_boot`). |
+| Disk-count gate | disk attachments vs `/disks?search=vm_names=<name>` |
+| Refused | deactivated attachments, direct LUNs, managed block storage disks |
+| Snapshot | `POST /vms/{id}/backups` for every disk, running or shut down (cold backup needs 4.4.6+). `app_consistent` sends `require_consistency=true` (4.5+), so the backup fails instead of continuing unfrozen. |
+| Read | one ImageIO download transfer per open disk; parallel 8 MiB range reads from the host (port 54322) or the engine proxy (54323); zero extents skipped; the transfer is finalized when the reader closes |
+| Replicas | The backup is incremental from the VM's newest checkpoint and changed ranges come from ImageIO `extents?context=dirty`. Disks need **incremental backup enabled** (qcow2) for this; others use compare mode. If another backup tool made the newest checkpoint, the sync falls back to compare mode (safe). |
+| Cleanup | finalize the backup; checkpoints Margarita created are removed when they are the oldest in the chain (oVirt removes only the oldest) |
+
+## XenServer / XCP-ng source
+
+Endpoint config (`type: xen`): pool master `url` (a member redirects to the master), `username`, `password`
+(encrypted), `ca_pem` (the host certificate), `verify_tls`, `transport` (`auto`, `nbd`, `export`) and
+`enable_cbt`. Uses XAPI JSON-RPC (XenServer 7.3+, XCP-ng 8.x); no XenAPI.py needed.
+
+| Step | How |
+|---|---|
+| Inspect | VM, VBDs (by userdevice; CD drives skipped), VDIs, VIFs and guest metrics. Disks are `xen-blkfront`, NICs `xen-netfront`, so OSMorph injects virtio for KVM targets. UEFI from `HVM_boot_params.firmware`. |
+| Disk-count gate | the VM's VBDs vs the pool's VBD table filtered by the VM |
+| Refused | `app_consistent` (quiesced snapshots were removed in XenServer 8 / XCP-ng 8) |
+| Snapshot | `VM.snapshot` named `vmigrate-<run>`: all disks at one point in time |
+| Read | **NBD** from the host (`VDI.get_nbd_info`): a network with purpose `nbd` serves TLS with the host certificate, which is pinned from the API (NBD STARTTLS); `insecure_nbd` serves plain NBD. Without an NBD network, `auto` streams `export_raw_vdi` instead (sequential; a backwards read restarts the stream). |
+| Replicas | Disks with **CBT** enabled: `VDI.list_changed_blocks(previous snapshot, this one)`, 64 KiB blocks. After a sync the snapshot's data is dropped (`VDI.data_destroy`) and only its CBT metadata is kept as the next base, so a replica holds no snapshot space. `enable_cbt: true` turns CBT on for disks that lack it (a metadata change on the source); other disks use compare mode. |
+| Cleanup | `VDI.destroy` + `VM.destroy`, only for snapshots named `vmigrate-*` |
+
+## Google Cloud source
+
+Endpoint config (`type: gcp`): `project`, `service_account_key` (JSON, encrypted; empty = the worker VM's own
+service account), `worker_instance` / `worker_zone` (default: detected), `temp_disk_type`,
+`allow_per_disk_snapshots` and `ignore_local_ssd`.
+
+Google has no API that reads snapshot blocks over the network, so **the worker must be a Compute Engine VM**
+(in any zone or region of the project; snapshots are global).
+
+| Step | How |
+|---|---|
+| Inspect | aggregated instances + disks + machine type. Disks are `virtio-scsi` (or NVMe), NICs virtio-net or gVNIC: Linux guests on virtio need no driver injection on KVM targets. UEFI for `UEFI_COMPATIBLE` boot disks; secure boot from Shielded VM. VM ids are `<zone>/<name>`. |
+| Disk-count gate | instance disks vs the zone's disks whose `users` include the instance |
+| Refused | local SSDs (unless `ignore_local_ssd`), regional disks, a running VM with more than one disk unless `allow_per_disk_snapshots` |
+| Snapshot | one snapshot per disk, labelled `vmigrate-run`; `app_consistent` sends `guestFlush=true` (VSS on Windows) |
+| Read | temporary disk from the snapshot in the worker's zone, attached **read-only** to the worker as `/dev/disk/by-id/google-<name>` and read `O_RDONLY`; copy and verify share one attachment, which is detached and deleted after the last reader |
+| Replicas | Compute Engine has no changed-block API: compare mode |
+| Cleanup | temporary disks and snapshots, only those labelled `vmigrate-run` |
+
+IAM: `roles/compute.instanceAdmin.v1` on the worker, plus `roles/compute.storageAdmin` and `roles/compute.viewer`
+on the source project (`compute.instances.stop` for cutover).
+
+## Oracle Cloud (OCI) source
+
+Endpoint config (`type: oci`): `region`, `tenancy_ocid`, `user_ocid`, `fingerprint`, `api_key_pem` (encrypted),
+`compartment_ocid`, `worker_instance_ocid` (default: detected) and `allow_per_disk_snapshots`. Requests are
+signed with the API key (OCI HTTP signatures); no OCI SDK needed.
+
+Like Google Cloud, OCI cannot read volume blocks over the network, so **the worker must be an OCI instance in
+the source region**.
+
+| Step | How |
+|---|---|
+| Inspect | instance + boot/block volume attachments + volumes + image + VNICs. Boot volume first. Controllers are recorded as `oci-paravirtualized` / `oci-iscsi` / ..., so OSMorph injects virtio for KVM targets. UEFI from `launchOptions.firmware`. |
+| Disk-count gate | attachments listed by instance vs the compartment-wide attachment list |
+| Refused | `app_consistent` (OCI backups do not quiesce); a running VM with more than one volume unless `allow_per_disk_snapshots` |
+| Snapshot | one FULL boot-volume / volume backup per volume, tagged `vmigrate-run` |
+| Read | the backup is restored to a temporary volume in the worker's availability domain, attached **paravirtualized + read-only** at a consistent device path (`/dev/oracleoci/oraclevdX`) and read `O_RDONLY`; detached and deleted after the last reader |
+| Replicas | no changed-block API: compare mode |
+| Cleanup | temporary volumes and backups, only those tagged `vmigrate-run` |
+
+Volumes the guest attached itself over **iSCSI** (listed in the IR as `extra.oci.iscsi_volumes`) need their
+`iscsiadm` node records and `_netdev` mounts cleaned up in the migrated guest.
+
 ## Support matrix
 
 | Side | Platform | Status |
@@ -770,6 +865,11 @@ incremental snapshot storage (changed pages only) and egress for every byte read
 | source | Physical Linux server (P2V over SSH: cold or live LVM-snapshot) | **implemented**. Tested against a scripted shell and real local files; not yet run on hardware. |
 | source | Any of the above at another site | **implemented** through the export agent (cross-site). |
 | source | Azure (VMs on managed disks) | **implemented**. Tested against a fake ARM and page blob only; not yet run against an Azure subscription. |
+| source | KVM / libvirt | **implemented**. Tested against a fake host shell and NBD server only; not yet run on a KVM host. |
+| source | oVirt / RHV / OLVM (4.4+) | **implemented**. Tested against a fake engine and ImageIO only; not yet run against an engine. |
+| source | XenServer / Citrix Hypervisor / XCP-ng | **implemented**. Tested against a fake XAPI only; not yet run against a pool. |
+| source | Google Cloud Compute Engine | **implemented** (worker must run on GCE). Tested against a fake API only; not yet run in a project. |
+| source | Oracle Cloud Infrastructure | **implemented** (worker must run on OCI). Tested against a fake API only; not yet run in a tenancy. |
 | target | Virtuozzo VHI | **implemented** (reference) |
 | target | OpenStack, Proxmox VE, Nutanix AHV, VMware vSphere, AWS, Azure | planned |
 

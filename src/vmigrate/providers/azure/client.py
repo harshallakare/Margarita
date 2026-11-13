@@ -36,7 +36,7 @@ from typing import Any
 
 from ...core import cancel
 from ...core.errors import ConfigError, ProviderError, SafetyGateError, TransientProviderError
-from .http import Http, default_http
+from ..common.http import Http, default_http
 
 TAG = "vmigrate:run"
 COMPUTE_API = "2024-07-01"

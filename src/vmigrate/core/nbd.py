@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import socket
 import struct
+from typing import Any
 
 from .interfaces import DiskReader
+from .ranges import ByteRange, normalize
 
 NBDMAGIC = b"NBDMAGIC"
 IHAVEOPT = 0x49484156454F5054
@@ -30,6 +32,7 @@ SIMPLE_REPLY_MAGIC = 0x67446698
 FLAG_FIXED_NEWSTYLE = 1 << 0
 FLAG_NO_ZEROES = 1 << 1
 OPT_GO = 7
+OPT_STARTTLS = 5
 REP_ACK = 1
 REP_INFO = 3
 REP_ERR_BIT = 1 << 31
@@ -55,10 +58,15 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 class NbdReader(DiskReader):
-    def __init__(self, sock: socket.socket, export: str = "", *, max_request: int = 8 << 20):
+    """`tls`: an ssl.SSLContext (+ `server_hostname`) upgrades the connection with NBD_OPT_STARTTLS
+    before the export is opened (XenServer / XCP-ng "nbd" networks require it)."""
+
+    def __init__(self, sock: socket.socket, export: str = "", *, max_request: int = 8 << 20, tls: Any = None,
+                 server_hostname: str | None = None):
         self.sock = sock
         self.max_request = max_request
         self._handle = 0
+        self._tls, self._sni = tls, server_hostname
         self._size = self._handshake(export)
 
     @classmethod
@@ -85,6 +93,13 @@ class NbdReader(DiskReader):
         if not hflags & FLAG_FIXED_NEWSTYLE:
             raise NbdError("server does not support fixed newstyle negotiation")
         s.sendall(struct.pack(">I", FLAG_FIXED_NEWSTYLE | (hflags & FLAG_NO_ZEROES)))
+        if self._tls is not None:
+            s.sendall(struct.pack(">QII", IHAVEOPT, OPT_STARTTLS, 0))
+            magic, opt, rtype, rlen = struct.unpack(">QIII", _recv_exact(s, 20))
+            payload = _recv_exact(s, rlen) if rlen else b""
+            if magic != OPT_REPLY_MAGIC or opt != OPT_STARTTLS or rtype != REP_ACK:
+                raise NbdError(f"server refused STARTTLS (reply {rtype:#x} {payload[4:]!r})")
+            s = self.sock = self._tls.wrap_socket(s, server_hostname=self._sni)
         name = export.encode()
         data = struct.pack(">I", len(name)) + name + struct.pack(">H", 0)
         s.sendall(struct.pack(">QII", IHAVEOPT, OPT_GO, len(data)) + data)
@@ -139,3 +154,131 @@ class NbdReader(DiskReader):
             pass
         finally:
             self.sock.close()
+
+
+# ---------------------------------------------------------------------- block status (extents)
+OPT_STRUCTURED_REPLY = 8
+OPT_SET_META_CONTEXT = 10
+REP_META_CONTEXT = 4
+CMD_BLOCK_STATUS = 7
+STRUCTURED_REPLY_MAGIC = 0x668E33EF
+CHUNK_BLOCK_STATUS = 5
+STATE_HOLE = 1                  # base:allocation: bit 0 = hole (not allocated)
+STATE_DIRTY = 1                 # qemu:dirty-bitmap:*: bit 0 = dirty (changed since the checkpoint)
+
+
+class NbdStatus:
+    """Second, metadata-only connection to an export: NBD_CMD_BLOCK_STATUS for one meta context,
+    e.g. "base:allocation" (which ranges hold data) or "qemu:dirty-bitmap:backup-vda" (which ranges
+    changed since a libvirt checkpoint). Reads stay on NbdReader.
+
+    Usage:
+        with NbdStatus.connect_unix(sock, "vda", "qemu:dirty-bitmap:backup-vda") as s:
+            dirty = s.ranges(lambda flags: flags & STATE_DIRTY)     # [ByteRange]
+    """
+
+    def __init__(self, sock: socket.socket, export: str, context: str):
+        self.sock, self.context = sock, context
+        self._handle = 0
+        self._ctx_id, self._size = self._handshake(export, context)
+
+    @classmethod
+    def connect_unix(cls, path: str, export: str, context: str, timeout: float = 300.0) -> NbdStatus:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(path)
+        return cls(s, export, context)
+
+    @classmethod
+    def connect_tcp(cls, host: str, port: int, export: str, context: str, timeout: float = 300.0) -> NbdStatus:
+        return cls(socket.create_connection((host, port), timeout=timeout), export, context)
+
+    def _opt(self, opt: int, data: bytes) -> list[tuple[int, bytes]]:
+        self.sock.sendall(struct.pack(">QII", IHAVEOPT, opt, len(data)) + data)
+        out = []
+        while True:
+            magic, o, rtype, rlen = struct.unpack(">QIII", _recv_exact(self.sock, 20))
+            payload = _recv_exact(self.sock, rlen) if rlen else b""
+            if magic != OPT_REPLY_MAGIC or o != opt:
+                raise NbdError(f"unexpected option reply (magic={magic:#x}, opt={o})")
+            if rtype & REP_ERR_BIT:
+                raise NbdError(f"server refused option {opt}: error {rtype & ~REP_ERR_BIT} {payload[4:]!r}")
+            if rtype == REP_ACK:
+                return out
+            out.append((rtype, payload))
+
+    def _handshake(self, export: str, context: str) -> tuple[int, int]:
+        s = self.sock
+        if _recv_exact(s, 8) != NBDMAGIC or struct.unpack(">Q", _recv_exact(s, 8))[0] != IHAVEOPT:
+            raise NbdError("not a newstyle NBD server")
+        (hflags,) = struct.unpack(">H", _recv_exact(s, 2))
+        s.sendall(struct.pack(">I", FLAG_FIXED_NEWSTYLE | (hflags & FLAG_NO_ZEROES)))
+        self._opt(OPT_STRUCTURED_REPLY, b"")
+        name, q = export.encode(), context.encode()
+        ctx = None
+        for rtype, payload in self._opt(OPT_SET_META_CONTEXT, struct.pack(">I", len(name)) + name +
+                                        struct.pack(">II", 1, len(q)) + q):
+            if rtype == REP_META_CONTEXT and payload[4:] == q:
+                ctx = struct.unpack(">I", payload[:4])[0]
+        if ctx is None:
+            raise NbdError(f"export {export!r} does not offer meta context {context!r}")
+        size = None
+        for rtype, payload in self._opt(OPT_GO, struct.pack(">I", len(name)) + name + struct.pack(">H", 0)):
+            if rtype == REP_INFO and len(payload) >= 12 and struct.unpack(">H", payload[:2])[0] == INFO_EXPORT:
+                size = struct.unpack(">Q", payload[2:10])[0]
+        if size is None:
+            raise NbdError("server did not report the export size")
+        return ctx, size
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def extents(self, offset: int, length: int) -> list[tuple[int, int, int]]:
+        """[(offset, length, flags)] covering offset..offset+length (servers may answer in parts)."""
+        out: list[tuple[int, int, int]] = []
+        pos, end = offset, min(offset + length, self._size)
+        while pos < end:
+            self._handle += 1
+            h = self._handle
+            self.sock.sendall(struct.pack(">IHHQQI", REQUEST_MAGIC, 0, CMD_BLOCK_STATUS, h, pos, min(end - pos, 1 << 30)))
+            got = 0
+            while True:
+                magic, flags, ctype, rh, ln = struct.unpack(">IHHQI", _recv_exact(self.sock, 20))
+                payload = _recv_exact(self.sock, ln) if ln else b""
+                if magic != STRUCTURED_REPLY_MAGIC or rh != h:
+                    raise NbdError(f"bad structured reply (magic={magic:#x}, handle={rh} != {h})")
+                if ctype & 0x8000:
+                    err = struct.unpack(">I", payload[:4])[0] if len(payload) >= 4 else -1
+                    raise NbdError(f"block status error {err} at {pos}: {payload[6:]!r}")
+                if ctype == CHUNK_BLOCK_STATUS and struct.unpack(">I", payload[:4])[0] == self._ctx_id:
+                    for i in range(4, len(payload) - 7, 8):
+                        n, st = struct.unpack(">II", payload[i:i + 8])
+                        n = min(n, end - (pos + got))
+                        if n > 0:
+                            out.append((pos + got, n, st))
+                            got += n
+                if flags & 1:
+                    break
+            if got == 0:
+                raise NbdError(f"block status made no progress at {pos}")
+            pos += got
+        return out
+
+    def ranges(self, want: Any) -> list[ByteRange]:
+        """Merged ranges whose flags satisfy `want(flags)`."""
+        return normalize(ByteRange(o, n) for o, n, f in self.extents(0, self._size) if want(f))
+
+    def close(self) -> None:
+        try:
+            self.sock.sendall(struct.pack(">IHHQQI", REQUEST_MAGIC, 0, CMD_DISC, 0, 0, 0))
+        except OSError:
+            pass
+        finally:
+            self.sock.close()
+
+    def __enter__(self) -> NbdStatus:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
