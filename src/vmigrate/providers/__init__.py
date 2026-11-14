@@ -66,7 +66,7 @@ TARGETS: dict[str, tuple[str | None, str, str]] = {
     "aws": ("vmigrate.providers.aws.target:AwsTarget", "implemented",
             "EBS direct APIs write snapshots (child snapshots for replicas) -> AMI -> instance; no helper"),
     "azure": ("vmigrate.providers.azure.target:AzureTarget", "implemented",
-              "managed disks uploaded (Put Page + VHD footer) -> VM with NICs; migrations only (no replicas)"),
+              "helper VM writes managed disks (replicas, restore points, OSMorph) or direct upload (migrations)"),
 }
 
 
@@ -427,6 +427,21 @@ TARGET_FIELDS: dict[str, list[dict[str, Any]]] = {
         {"name": "nsg_id", "label": "Network security group", "kind": "text", "help": _T + "optional resource ID"},
         {"name": "vm_size", "label": "VM size", "kind": "text",
          "help": _T + "optional: else the smallest Standard_D*s_v5 with enough vCPU / RAM"},
+        {"name": "write_mode", "label": "Disk write mode", "kind": "select", "default": "auto",
+         "options": ["auto", "helper_vm", "upload"],
+         "help": _T + "helper_vm: a temporary Linux VM in Azure writes the disks (replicas, restore points and "
+                      "OSMorph work; the worker needs SSH to it); upload: direct upload over HTTPS (migrations only, "
+                      "no OSMorph); auto: helper_vm when a helper subnet is set"},
+        {"name": "helper_subnet", "label": "Helper VM subnet", "kind": "text", "resource": "networks",
+         "help": _T + "subnet resource ID for the helper VM; reachable from the worker on TCP 22"},
+        {"name": "helper_public_ip", "label": "Helper public IP", "kind": "bool", "default": False,
+         "help": _T + "give the helper a public IP (when the worker cannot reach the subnet privately)"},
+        {"name": "helper_nsg_id", "label": "Helper NSG", "kind": "text",
+         "help": _T + "optional network security group allowing TCP 22 from the worker"},
+        {"name": "helper_size", "label": "Helper VM size", "kind": "text", "default": "Standard_D4s_v5",
+         "help": _T + "must attach as many data disks as the largest VM has disks (D4s_v5: 8, D8s_v5: 16)"},
+        {"name": "staging_dir", "label": "Work directory", "kind": "text", "default": "/var/lib/vmigrate/staging",
+         "help": _T + "holds the helper VM's SSH keys"},
         {"name": "disk_sku", "label": "Disk SKU", "kind": "select", "default": "Premium_LRS",
          "options": ["Premium_LRS", "StandardSSD_LRS", "Standard_LRS", "Premium_ZRS", "StandardSSD_ZRS"],
          "help": _T + "managed disk type"},

@@ -42,6 +42,7 @@ PROVIDER_NEEDS: dict[tuple[str, str], set[str]] = {
     ("proxmox", "target"): {"tool:ssh"},                    # NBD agent on the target node over ssh
     ("nutanix", "target"): {"tool:iscsiadm", "root"},       # volume-group LUNs written over iSCSI
     ("vmware", "target"): {"tool:nbdkit"},                  # nbdkit-vddk in write mode (+ VDDK in vddk_libdir)
+    ("azure", "target"): {"tool:ssh"},                      # helper_vm mode (harmless for upload mode)
 }
 
 

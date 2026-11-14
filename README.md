@@ -447,7 +447,8 @@ has run against a real platform yet**; the tests drive each one end to end again
 | Nutanix AHV | volume group per disk, written over iSCSI | yes (deploy = instant clone) | no | yes (KVM) | power state / grace |
 | VMware vSphere | nbdkit-vddk in write mode into a holder VM's thin disks | yes | no | yes (VMware strategies) | VMware Tools / grace |
 | AWS EC2 | EBS direct APIs into a snapshot (no helper instance) | yes (child snapshots) | yes (EBS snapshots) | prerequisites only | EC2 status checks |
-| Azure | managed-disk upload (Put Page + VHD footer) | **no** (see below) | no | prerequisites only | VM agent / serial log |
+| Azure (`helper_vm`) | helper VM in Azure (NBD over SSH), the approach Coriolis documents | yes | yes (incremental snapshots) | yes (Azure strategies) | VM agent / serial log |
+| Azure (`upload`) | managed-disk upload (Put Page + VHD footer) | no | no | prerequisites only | VM agent / serial log |
 
 **OpenStack.** The VHI target without the vStorage path. Set `helper_image` (python3 + cloud-init) and
 `helper_network` (reachable from the worker on TCP 22). Boot volumes get `hw_disk_bus=scsi` and
@@ -492,14 +493,33 @@ has run against a real platform yet**; the tests drive each one end to end again
   snapshots. An interrupted upload restarts that disk from the beginning (a pending EBS snapshot can't be
   resumed).
 
-**Azure.**
-- **Writing.** Disks are uploaded into managed disks created for upload (write SAS, Put Page of up to 4 MiB,
-  fixed-VHD footer). The boot disk gets `osType` and Gen1/Gen2 at creation. The VM attaches them, with one NIC
-  per source NIC in the mapped subnets and boot diagnostics on.
-- **No replicas.** Azure accepts uploads only into a disk that was never finalised, so a replica can't be
-  resynced in place. Use Azure for migrations, and AWS or a KVM target for DR replicas.
+**Azure.** Two write modes. `auto` (the default) picks `helper_vm` when `helper_subnet` is set, otherwise `upload`.
 
-**Cloud OSMorph (AWS, Azure).** The disks are never block-accessible to the worker, so the guest can't be
+- **`helper_vm`** follows the design Coriolis documents for Azure as a destination:
+  - **Writing.** A temporary Ubuntu helper VM in `helper_subnet` gets empty managed disks attached as data disks.
+    They're written over SSH by the same NBD agent as on VHI. The host key is pinned via cloud-init.
+  - **Replicas.** The same disks are rewritten on every sync. Restore points are Azure incremental snapshots.
+  - **Deploy and migration.** A new disk is created from a snapshot; that's where the boot disk gets `osType`
+    and Gen1/Gen2. A migration then deletes the disks it wrote.
+  - **OSMorph.** It runs from the worker over NBD:
+    - **Linux:** `hv_vmbus`, `hv_storvsc`, `hv_netvsc` added to every initramfs, the Azure Linux agent
+      installed at first boot. Hyper-V tools and the agent are kept, VMware tools removed.
+    - **Windows:** `storvsc` and `vmbus` made boot-start.
+
+    Unlike Coriolis, no Windows worker is needed.
+  - **Needs.** SSH from the worker to the helper, either through VPN, ExpressRoute or peering, or with
+    `helper_public_ip: true`. Choose a `helper_size` that can attach all of the VM's disks (D4s_v5: 8,
+    D8s_v5: 16).
+- **`upload`** needs only HTTPS to Azure:
+  - **Writing.** Disks are uploaded into managed disks created for upload (write SAS, Put Page of up to 4 MiB,
+    fixed-VHD footer).
+  - **Limits.** Migrations only: an uploaded disk is final, so no replicas. No OSMorph, so the guest must
+    already be prepared.
+
+Both modes create the VM with one NIC per source NIC in the mapped subnets, with boot diagnostics on. Like
+Coriolis, give the guest DHCP networking: Azure assigns MACs and addresses itself.
+
+**Cloud OSMorph (AWS, Azure `upload`).** The disks are never block-accessible to the worker, so the guest can't be
 changed. The run therefore stops at **preflight, before any upload**, until you prepare the source and set
 `osmorph.cloud_drivers_ready: true`:
 - **Linux to AWS:** `nvme` + `ena` in every initramfs.
@@ -1014,7 +1034,7 @@ Volumes the guest attached itself over **iSCSI** (listed in the IR as `extra.oci
 | target | Nutanix AHV (volume groups over iSCSI, VM cloned from them) | **implemented** (fakes only) |
 | target | VMware vSphere (holder VM, nbdkit-vddk writes) | **implemented** (fakes only) |
 | target | AWS EC2 (EBS direct snapshot writes -> AMI -> instance) | **implemented** (fakes only) |
-| target | Azure (managed disk upload -> VM; migrations only) | **implemented** (fakes only) |
+| target | Azure (helper VM: replicas + restore points + OSMorph; or direct upload for migrations) | **implemented** (fakes only) |
 
 | OSMorph | KVM family | VMware | AWS | Azure |
 |---|---|---|---|---|

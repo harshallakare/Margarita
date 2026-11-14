@@ -1,5 +1,10 @@
-"""Purpose: Azure TargetProvider (migrations): each disk is uploaded into a new managed disk (createOption Upload,
-write SAS, Put Page, VHD footer), then a VM is created that attaches them, with NICs in the mapped subnets.
+"""Purpose: Azure TargetProvider, two write modes:
+  helper_vm (Coriolis' documented approach): empty managed disks are attached to a temporary Linux helper VM in
+            Azure and written over SSH (NBD agent); replicas (rewritten in place), restore points (incremental
+            snapshots) and OSMorph (over NBD from this worker) all work. Needs SSH from the worker to the helper.
+  upload    : each disk is uploaded into a new managed disk (createOption Upload, write SAS, Put Page, VHD footer).
+            HTTPS to Azure only; migrations only (an uploaded disk is final) and no OSMorph.
+  auto (default): helper_vm when helper_subnet is set, else upload.
 
 Usage (endpoint config; the same endpoint can be a source too. client_secret is a credential):
     type: azure
@@ -12,8 +17,23 @@ Usage (endpoint config; the same endpoint can be a source too. client_secret is 
     vm_size: null                               # else the smallest Standard_D*s_v5 with enough vCPU / RAM
     disk_sku: Premium_LRS                       # Premium_LRS | StandardSSD_LRS | Standard_LRS | PremiumV2 is not uploadable
     sas_hours: 24
+    write_mode: auto                            # auto | helper_vm | upload
+    helper_subnet: /subscriptions/.../subnets/migration   # helper_vm: subnet for the helper VM
+    helper_public_ip: false                     # helper_vm: give the helper a public IP (else its private IP)
+    helper_nsg_id: null                         # helper_vm: NSG allowing TCP 22 from the worker
+    helper_size: Standard_D4s_v5                # helper_vm: 8 data disks; pick a size that fits the VM's disk count
+    helper_image: {publisher: Canonical, offer: ubuntu-24_04-lts, sku: server, version: latest}   # or an image ID
+    staging_dir: /var/lib/vmigrate/staging      # helper_vm: holds the helper's SSH keys
 
-How it works:
+How it works (helper_vm):
+  disk     : PUT Microsoft.Compute/disks/vmigrate-<name> {createOption: Empty}; attached to the helper at the next
+             free LUN and written over SSH (zero chunks skipped: an empty managed disk reads as zeros)
+  replica  : the same disks are rewritten in place on later syncs; restore points are incremental snapshots
+  deploy / migration: every disk becomes a NEW disk created from a snapshot (the boot disk gets osType and
+             Gen1/Gen2 there); OSMorph runs on those over NBD while they are attached to the helper; the helper
+             releases them and the VM attaches them. A migration then deletes its written disks.
+
+How it works (upload):
   disk     : PUT Microsoft.Compute/disks/vmigrate-<name> {createOption: Upload, uploadSizeBytes: size + 512}; the
              boot disk gets osType and hyperVGeneration (V2 for UEFI guests) at creation
   write    : beginGetAccess Write -> Put Page (<= 4 MiB, parallel; zero chunks skipped) -> VHD footer ->
@@ -21,16 +41,18 @@ How it works:
   verify   : read back through a short-lived read SAS, revoked before the VM attaches the disk
   VM       : one NIC per source NIC in the mapped subnet, PUT virtualMachines with the OS disk and data disks
              attached (createOption Attach, LUN = source order), boot diagnostics on; the VM starts
-  replica  : not supported: Azure accepts uploads only into a disk that was never finalised, so a replica
-             cannot be resynced in place (use a migration, or an AWS/KVM target for DR replicas)
-  OSMorph  : the disks are not block-accessible: the guest must already have the Hyper-V drivers and agent;
-             see osmorph/cloud.py (checked at preflight, before any upload)
+  replica  : not supported in upload mode (Azure accepts uploads only into a disk that was never finalised)
+  OSMorph  : not possible in upload mode (the disks are never block-accessible): the guest must already have the
+             Hyper-V drivers and agent; see osmorph/cloud.py (checked at preflight, before any upload)
 Safety: only resources tagged vmigrate:managed=true are deleted. Tested against a fake ARM only.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -41,11 +63,14 @@ from ...core.context import RunContext
 from ...core.errors import ConfigError, ProviderError, SafetyGateError
 from ...core.interfaces import BootCheck, DiskHints, DiskReader, DiskWriter, TargetDiskRef, TargetProvider, VmRef
 from ...ir import DiskBus, VmSpec
+from ..vhi.nbd import NbdClient, NbdDiskReader, NbdDiskWriter, UnixBridge, agent_command
 from .blob import SasSnapshotReader
 from .client import COMPUTE_API, DISK_API, NETWORK_API
+from .helper import AzureHelper
 from .upload import PageBlobWriter, put_footer
 
 MIB = 1 << 20
+GIB = 1 << 30
 MANAGED = "vmigrate:managed"
 SIZE_RE = re.compile(r"^Standard_D(\d+)s_v5$")
 FAIL = ("Kernel panic", "dracut-initqueue timeout", "Entering emergency mode", "VFS: Unable to mount root",
@@ -96,6 +121,66 @@ class AzureTarget(TargetProvider):
         self._client, self._http = client, http
         self._open: dict[str, tuple[str, PageBlobWriter]] = {}
         self.poll = float(config.get("poll_interval", 10))
+        self.write_mode_cfg = str(config.get("write_mode", "auto") or "auto")
+        if self.write_mode_cfg not in ("auto", "helper_vm", "upload"):
+            raise ConfigError("azure target: write_mode must be auto, helper_vm or upload")
+        self._helper: AzureHelper | None = None
+        self._helper_kw: dict[str, Any] = {}           # tests inject transport_factory / keygen
+        self._bridges: dict[str, UnixBridge] = {}
+        self._sockdir: str | None = None
+
+    @property
+    def write_mode(self) -> str:
+        if self.write_mode_cfg != "auto":
+            return self.write_mode_cfg
+        return "helper_vm" if self.config.get("helper_subnet") else "upload"
+
+    @property
+    def helper(self) -> AzureHelper:
+        if self._helper is None:
+            self._helper = AzureHelper(self.client, self.config, self.ctx,
+                                       Path(self.config.get("staging_dir", "/var/lib/vmigrate/staging")),
+                                       rg_path=self.rg, location=self.location, poll=self.poll, **self._helper_kw)
+        return self._helper
+
+    def _agent(self, disk: TargetDiskRef, *, writable: bool) -> NbdClient:
+        dev = self.helper.attach(disk.id)
+        return NbdClient.over_process(self.helper.transport.popen(agent_command(dev, writable=writable)))
+
+    def _close_bridges(self) -> None:
+        for b in self._bridges.values():
+            b.close()
+        self._bridges.clear()
+        if self._sockdir:
+            shutil.rmtree(self._sockdir, ignore_errors=True)
+            self._sockdir = None
+
+    def _release_helper_disks(self) -> None:
+        self._close_bridges()
+        if self._helper is not None:
+            self._helper.detach_all()
+
+    def prepare_helper(self) -> str | None:
+        if self.write_mode != "helper_vm":
+            return None
+        self.helper.ensure()
+        return f"helper VM {self.helper.name} ready at {self.helper.host}"
+
+    def remove_helper(self) -> str | None:
+        if self._helper is None or self._helper.transport is None:
+            return None
+        name = self._helper.name
+        self.close()
+        return f"helper VM {name} removed"
+
+    def close(self) -> None:
+        if self._helper is None:
+            return
+        try:
+            self._release_helper_disks()
+        finally:
+            self._helper.destroy()
+            self._helper = None
 
     @property
     def client(self) -> Any:
@@ -164,7 +249,10 @@ class AzureTarget(TargetProvider):
         if spec is None or p:
             return p
         from ...osmorph.cloud import cloud_gate
-        p += cloud_gate(spec, "azure")
+        if self.write_mode == "helper_vm":
+            p += self.helper.problems()          # OSMorph edits the guest over the helper: no prerequisite gate
+        else:
+            p += cloud_gate(spec, "azure")
         o = self._opts(spec)
         for nic in spec.nics or []:
             sn = (o.get("network_map") or {}).get(nic.network) or o.get("default_subnet")
@@ -200,14 +288,25 @@ class AzureTarget(TargetProvider):
     def create_disk(self, name: str, size_bytes: int, hints: DiskHints) -> TargetDiskRef:
         if hints.shared:
             raise ConfigError("azure target: shared cluster disks are not supported")
-        size = -(-size_bytes // MIB) * MIB
         sku = hints.storage_pool or str(self.config.get("disk_sku", "Premium_LRS"))
-        body = disk_body(self.location, size, sku, hints, name)
         path = self._disk_path(name)
+        boot = {"is_boot": hints.is_boot, "firmware": hints.firmware, "os_family": hints.os_family}
+        if self.write_mode == "helper_vm":
+            gib = max(1, -(-size_bytes // GIB))
+            body = {"location": self.location, "sku": {"name": sku},
+                    "properties": {"creationData": {"createOption": "Empty"}, "diskSizeGB": gib},
+                    "tags": {MANAGED: "true", "vmigrate:disk": name[:256]}}
+            self.ctx.require_execute("azure create empty disk", disk=disk_name(name), size_gib=gib, sku=sku)
+            d = self._put(path, body, DISK_API, f"create disk {disk_name(name)}")
+            return TargetDiskRef(id=str(d.get("id") or path), name=name, size_bytes=gib * GIB,
+                                 data={"path": path, "mode": "helper_vm", "sku": sku, **boot})
+        size = -(-size_bytes // MIB) * MIB
+        body = disk_body(self.location, size, sku, hints, name)
         self.ctx.require_execute("azure create upload disk", disk=disk_name(name), size_bytes=size, sku=sku)
         d = self._put(path, body, DISK_API, f"create disk {disk_name(name)}")
         return TargetDiskRef(id=str(d.get("id") or path), name=name, size_bytes=size,
-                             data={"path": path, "body": body, "os_type": body["properties"].get("osType")})
+                             data={"path": path, "body": body, "os_type": body["properties"].get("osType"),
+                                   "mode": "upload", **boot})
 
     def find_disk(self, name: str) -> TargetDiskRef | None:
         d = self._ours(self._disk_path(name), DISK_API)
@@ -215,8 +314,11 @@ class AzureTarget(TargetProvider):
             return None
         size = int((d.get("properties") or {}).get("diskSizeBytes") or
                    ((d.get("properties") or {}).get("creationData") or {}).get("uploadSizeBytes", 512) - 512)
+        mode = "upload" if ((d.get("properties") or {}).get("creationData") or {}).get("createOption") == "Upload" \
+            else "helper_vm"
         return TargetDiskRef(id=str(d["id"]), name=name, size_bytes=size,
-                             data={"path": self._disk_path(name), "os_type": (d.get("properties") or {}).get("osType")})
+                             data={"path": self._disk_path(name), "os_type": (d.get("properties") or {}).get("osType"),
+                                   "mode": mode})
 
     def _grant(self, path: str, access: str) -> str:
         hours = float(self.config.get("sas_hours", 24))
@@ -238,6 +340,9 @@ class AzureTarget(TargetProvider):
         return str((d.get("properties") or {}).get("diskState") or "")
 
     def open_disk_writer(self, disk: TargetDiskRef, *, resume: bool = False, incremental: bool = False) -> DiskWriter:
+        if disk.data.get("mode") == "helper_vm":
+            self.ctx.require_execute("azure write disk through helper VM", disk=disk.name, incremental=incremental)
+            return NbdDiskWriter(self._agent(disk, writable=True), disk.size_bytes, prezeroed=not incremental)
         if incremental:
             raise ProviderError("azure: an uploaded managed disk cannot be resynced; replicas are not supported")
         path = disk.data["path"]
@@ -259,6 +364,8 @@ class AzureTarget(TargetProvider):
         return w
 
     def commit_disk(self, disk: TargetDiskRef, writer_staged: Path | None) -> None:
+        if disk.data.get("mode") == "helper_vm":
+            return                                   # the writer flushed straight onto the attached disk
         if disk.id not in self._open:
             raise ProviderError(f"azure: {disk.name}: nothing was uploaded in this run")
         sas, w = self._open.pop(disk.id)
@@ -271,15 +378,76 @@ class AzureTarget(TargetProvider):
     def open_disk_reader(self, disk: TargetDiskRef) -> DiskReader | None:
         if not self.config.get("verify_after_commit", True):
             return None
+        if disk.data.get("mode") == "helper_vm":
+            return NbdDiskReader(self._agent(disk, writable=False), disk.size_bytes)
         path = disk.data["path"]
         return SasSnapshotReader(lambda renew: self._grant(path, "Read"), disk.size_bytes, http=self.http,
                                  sleep=self._sleep, on_close=lambda: self._revoke(path))
 
     def morph_image(self, disk: TargetDiskRef) -> tuple[Path, str] | None:
-        return None
+        if disk.data.get("mode") != "helper_vm":
+            return None
+        if disk.id not in self._bridges:
+            dev = self.helper.attach(disk.id)
+            t = self.helper.transport
+            if self._sockdir is None:
+                self._sockdir = tempfile.mkdtemp(prefix="vmaz-", dir="/tmp" if os.path.isdir("/tmp") else None)
+            self._bridges[disk.id] = UnixBridge(Path(self._sockdir) / f"{len(self._bridges)}.sock",
+                                                lambda: t.popen(agent_command(dev, writable=True)))
+        return (self._bridges[disk.id].uri, "raw")  # type: ignore[return-value]
 
+    def morph_options(self) -> dict[str, Any]:
+        return {"azure_disks_editable": self.write_mode == "helper_vm"}
+
+    # ------------------------------------------------------------------ replica + restore points (helper_vm)
     def supports_replica(self) -> bool:
-        return False
+        return self.write_mode == "helper_vm"
+
+    def supports_restore_points(self) -> tuple[bool, str]:
+        if self.write_mode == "helper_vm":
+            return True, ""
+        return False, "azure: restore points need write_mode helper_vm"
+
+    def _snapshot(self, disk: TargetDiskRef, name: str, *, rp: str | None = None) -> str:
+        path = f"{self.rg}/providers/Microsoft.Compute/snapshots/{disk_name(name)[:80]}"
+        tags = {MANAGED: "true", "vmigrate:disk": disk.name[:256]}
+        if rp:
+            tags["vmigrate:rp"] = rp[:256]
+        self.ctx.require_execute("azure incremental snapshot", disk=disk.name, snapshot=path.rsplit("/", 1)[-1])
+        self._put(path, {"location": self.location, "tags": tags,
+                         "properties": {"creationData": {"createOption": "Copy", "sourceResourceId": disk.id},
+                                        "incremental": True}}, DISK_API, "create snapshot")
+        return str(self.client.wait_snapshot(path).get("id") or path)
+
+    def snapshot_disk(self, disk: TargetDiskRef, name: str) -> str:
+        return self._snapshot(disk, f"{disk.name}-{name}", rp=name)
+
+    def delete_disk_snapshot(self, disk: TargetDiskRef, snapshot_id: str) -> None:
+        if self._ours(snapshot_id, DISK_API) is not None:
+            self._delete(snapshot_id, DISK_API, "delete snapshot")
+
+    def clone_disk(self, disk: TargetDiskRef, name: str, restore_point: str | None = None) -> TargetDiskRef:
+        """A NEW disk from a snapshot of `disk` (a restore point's, or a fresh one). The boot disk gets its
+        osType and Gen1/Gen2 here, which an empty disk cannot carry."""
+        if disk.data.get("mode") != "helper_vm":
+            raise ProviderError("azure: deploy needs write_mode helper_vm (upload mode has no replicas)")
+        self.helper.detach(disk.id)
+        temp = restore_point is None
+        snap = restore_point or self._snapshot(disk, f"{name}-src")
+        path = self._disk_path(name)
+        props: dict[str, Any] = {"creationData": {"createOption": "Copy", "sourceResourceId": snap}}
+        if disk.data.get("is_boot"):
+            props["osType"] = "Windows" if disk.data.get("os_family") == "windows" else "Linux"
+            props["hyperVGeneration"] = "V2" if disk.data.get("firmware") == "uefi" else "V1"
+        self.ctx.require_execute("azure create disk from snapshot", disk=disk_name(name), source=snap.rsplit("/", 1)[-1])
+        d = self._put(path, {"location": self.location, "sku": {"name": disk.data.get("sku") or
+                                                                  self.config.get("disk_sku", "Premium_LRS")},
+                             "properties": props, "tags": {MANAGED: "true", "vmigrate:disk": name[:256]}},
+                      DISK_API, f"create disk {disk_name(name)}")
+        if temp:
+            self._delete(snap, DISK_API, "delete temporary snapshot")
+        return TargetDiskRef(id=str(d.get("id") or path), name=name, size_bytes=disk.size_bytes,
+                             data={**disk.data, "path": path, "clone": True, "os_type": props.get("osType")})
 
     def delete_disk(self, disk: TargetDiskRef) -> None:
         path = disk.data["path"]
@@ -287,6 +455,8 @@ class AzureTarget(TargetProvider):
         if d is None:
             return
         self.ctx.require_execute("azure delete disk", disk=path.rsplit("/", 1)[-1])
+        if self._helper is not None:
+            self._helper.detach(disk.id)
         if (d.get("properties") or {}).get("diskState") in ("ActiveUpload", "ActiveSAS"):
             self._revoke(path)
         self._delete(path, DISK_API, "delete disk")
@@ -302,6 +472,20 @@ class AzureTarget(TargetProvider):
         return f"{self.rg}/providers/Microsoft.Network/networkInterfaces/{vm}-nic{i}"
 
     def create_vm(self, spec: VmSpec, boot_disk: TargetDiskRef, data_disks: list[TargetDiskRef]) -> VmRef:
+        written: list[TargetDiskRef] = []
+        boot_of: str | None = None
+        if boot_disk.data.get("mode") == "helper_vm" and not boot_disk.data.get("clone"):
+            # migration: the written boot disk has no osType / generation; give the VM a copy that has them
+            written, boot_of = [boot_disk], boot_disk.id
+            boot_disk = self.clone_disk(boot_disk, f"{boot_disk.name}-os")
+        self._release_helper_disks()             # the helper lets go of every disk before the VM attaches them
+        vm = self._create_vm(spec, boot_disk, data_disks, boot_of=boot_of)
+        for d in written:
+            self.delete_disk(d)                  # the VM has its own copy now
+        return vm
+
+    def _create_vm(self, spec: VmSpec, boot_disk: TargetDiskRef, data_disks: list[TargetDiskRef], *,
+                   boot_of: str | None = None) -> VmRef:
         o = self._opts(spec)
         if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$", spec.name):
             raise ConfigError(f"azure: {spec.name!r} is not a valid VM name; set target_name")
@@ -325,6 +509,8 @@ class AzureTarget(TargetProvider):
                              "/vmSizes", COMPUTE_API), spec.cpu.total, spec.memory_bytes >> 20)
         os_type = boot_disk.data.get("os_type") or "Linux"
         body = vm_body(spec, self.location, size, boot_disk.id, [d.id for d in data_disks], nics, os_type)
+        if boot_of:                               # the engine knows the boot disk by the disk it wrote
+            body["tags"]["vmigrate:boot-of"] = boot_of[:256]
         self.ctx.require_execute("azure create VM", name=spec.name, size=size, disks=1 + len(data_disks))
         vm = self._put(self._vm_path(spec.name), body, COMPUTE_API, f"create VM {spec.name}")
         return VmRef(str(vm.get("id") or self._vm_path(spec.name)), spec.name, self.name)
@@ -341,6 +527,7 @@ class AzureTarget(TargetProvider):
         sp = (v.get("properties") or {}).get("storageProfile") or {}
         os_id = ((sp.get("osDisk") or {}).get("managedDisk") or {}).get("id")
         data = sorted(sp.get("dataDisks") or [], key=lambda d: d.get("lun", 0))
+        os_id = (v.get("tags") or {}).get("vmigrate:boot-of") or os_id
         return [x for x in [os_id, *[(d.get("managedDisk") or {}).get("id") for d in data]] if x]
 
     def check_boot(self, vm: VmRef, timeout: float = 900, *, guest_os: str | None = None,
@@ -388,6 +575,10 @@ class AzureTarget(TargetProvider):
     # ------------------------------------------------------------------ cleanup
     def cleanup_on_failure(self, created: Mapping[str, Any]) -> None:
         self.ctx.require_execute("azure cleanup created resources")
+        try:
+            self.close()                          # the helper first: its attachments block disk deletion
+        except Exception as e:  # noqa: BLE001 - keep cleaning; report
+            self.ctx.logger.warning("azure: helper cleanup: %s", e)
         for _, w in list(self._open.values()):
             try:
                 w.close()
