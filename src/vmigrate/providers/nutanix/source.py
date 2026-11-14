@@ -530,17 +530,28 @@ class NutanixSource(SourceProvider):
             return None
         cur = {"recovery_point": d["recovery_point"], "vm_recovery_point": d["vm_recovery_point"],
                "disk_recovery_point": drp}
+        size = disk.size_bytes
+        self.ctx.logger.info("disk %s: asking Prism which regions are written (allocation map)", disk.address)
+
+        def progress(covered: int, n: int) -> None:
+            self.ctx.logger.info("disk %s: allocation map %d%% (%d GiB of %d GiB scanned, %d regions)", disk.address,
+                                 covered * 100 // max(size, 1), covered >> 30, size >> 30, n)
         try:
-            regs = self.v4.changed_regions(cur, None, disk.size_bytes)
+            regs, covered = self.v4.allocated_regions(
+                cur, size, block_bytes=int(self.config.get("crt_block_bytes", 1 << 20)) or None,
+                budget_s=float(self.config.get("crt_allocation_budget_s", 600)), progress=progress)
         except Exception as e:  # noqa: BLE001 - the copy still works, just reads the whole disk
             self.ctx.logger.warning("disk %s: allocation map not available (%s); reading the whole disk",
                                     disk.address, e)
             return None
-        out = normalize([ByteRange(o, min(n, disk.size_bytes - o)) for o, n, t in regs
-                         if n > 0 and o < disk.size_bytes and t != "ZEROED"])
+        out = [ByteRange(o, min(n, size - o)) for o, n, t in regs if n > 0 and o < min(covered, size) and t != "ZEROED"]
+        if covered < size:                     # map stopped early: everything not scanned is read
+            out.append(ByteRange(covered, size - covered))
+        out = normalize(out)
         used = sum(r.length for r in out)
-        self.ctx.logger.info("disk %s: %d GiB of %d GiB written (allocation map); only that is read",
-                             disk.address, used >> 30, disk.size_bytes >> 30)
+        tail = "" if covered >= size else f", including {(size - covered) >> 30} GiB not scanned in time"
+        self.ctx.logger.info("disk %s: reading %d GiB of %d GiB (allocation map%s)", disk.address,
+                             used >> 30, size >> 30, tail)
         return out
 
     # ------------------------------------------------------------------ CRT (replica change tracking)
