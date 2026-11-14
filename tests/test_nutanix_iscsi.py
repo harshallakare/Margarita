@@ -600,3 +600,30 @@ def test_v4_cleanup_is_safe_to_repeat_when_objects_are_already_gone():
     s2 = Session({("GET", f"{v4.RECOVERY_POINTS}/rp-x"): Resp(403, {"error": "forbidden"})})
     with pytest.raises(ProviderError, match="HTTP 403"):
         v4.PrismV4(s2, "https://pc:9440").delete_recovery_point("rp-x")
+
+
+def test_full_copy_reads_only_allocated_regions(tmp_path):
+    """CRT with no reference = the disk's written regions: a full copy skips everything else."""
+    class AllocV4(CrtV4):
+        def changed_regions(self, cur, ref, size):
+            assert ref is None
+            self.log.append(f"alloc:{cur['disk_recovery_point']}")
+            if self.fail:
+                raise ProviderError(self.fail)
+            return [(1 << 20, 4096, "REGULAR"), (0, 8192, "ZEROED"), (2 << 20, 1 << 20, "REGULAR")]
+    fv4 = AllocV4()
+    ctx, src, tgt, e = make(tmp_path, fv4, disks=2)
+    snap = _snap(src, "run1")
+    d0 = src.inspect_vm(src.find_vm("RIS-Sainath")).disks[0]
+    with src.open_disk(snap, d0) as r:
+        got = r.allocated_ranges()
+    assert [(x.offset, x.length) for x in got] == [(1 << 20, 4096), (2 << 20, 1 << 20)]   # ZEROED dropped
+    fv4.fail = "HTTP 500"
+    with src.open_disk(snap, d0) as r:
+        assert r.allocated_ranges() is None                       # falls back to reading everything
+    src.close()
+    off = make(tmp_path / "off", AllocV4(), disks=1, crt_allocation=False)[1]
+    s = _snap(off, "run2")
+    with off.open_disk(s, off.inspect_vm(off.find_vm("RIS-Sainath")).disks[0]) as r:
+        assert r.allocated_ranges() is None
+    off.close()

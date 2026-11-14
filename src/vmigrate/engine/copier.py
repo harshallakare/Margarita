@@ -5,9 +5,11 @@ Usage:
     stats = copy_disk(reader, writer, chunk_size=64 << 20, start_offset=state.bytes_copied,
                       on_checkpoint=lambda off: state.save_watermark(off))
 
-Pipelined: a reader thread prefetches the next `prefetch` chunks while the current one is checked and
-written, so source reads and target writes overlap (they used to alternate; seen live: ~110 MB/s on
-real data over a 10G link). Order of writes, checkpoints and progress is unchanged.
+Pipelined: a reader thread prefetches the next `prefetch` chunks while the current one is written, and the
+zero check + per-block SHA-256 of each chunk run on a small thread pool as soon as it is read, so the copy
+thread only hands chunks to the writer (seen live: send -> checksum -> copy in sequence held one disk near
+125 MB/s with the network, SSH and the helper all partly idle). Order of writes, checkpoints and progress is
+unchanged.
 
 Compare mode (replica sync without source change tracking):
   * `hashes` with stored checksums (BlockHashes.has_base) — each 1 MiB block of the source is hashed
@@ -28,7 +30,9 @@ import hashlib
 import queue
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 from ..core.interfaces import DiskReader, DiskWriter
@@ -168,6 +172,24 @@ class RateMeter:
 _END = object()
 
 
+@dataclass
+class Analysis:
+    zero: bool
+    digests: list[bytes] | None       # SHA-256 per hash block, when checksums are kept
+
+
+def analyze(buf: bytes, block: int | None) -> Analysis:
+    """Zero check + per-block digests of one chunk (hashlib releases the GIL: runs beside the copy)."""
+    zero = _is_zero(buf)
+    if block is None:
+        return Analysis(zero, None)
+    view = memoryview(buf)
+    n = len(buf)
+    if zero:
+        return Analysis(True, [_zero_digest(min(block, n - o)) for o in range(0, n, block)])
+    return Analysis(False, [hashlib.sha256(view[o:o + block]).digest() for o in range(0, n, block)])
+
+
 def _prefetch(reader: DiskReader, pieces: list[ByteRange], depth: int,
               stop: threading.Event) -> Iterator[tuple[ByteRange, bytes]]:
     """Yield (piece, data) in order while a background thread reads ahead `depth` chunks."""
@@ -244,72 +266,97 @@ def copy_disk(
     since_ckpt = 0
     high = start_offset
     stop = threading.Event()
-    for p, buf in _prefetch(reader, pieces, prefetch, stop):
-        if cancel is not None and cancel.is_set():
-            stop.set()
-            raise CopyCancelled()
-        if len(buf) != p.length:
-            raise IOError(f"short read at {p.offset}: wanted {p.length}, got {len(buf)}")
-        stats.bytes_read += p.length
-        if by_hash:
-            # compare against the checksums recorded when each block was last written
-            for o in range(0, p.length, hashes.block):  # type: ignore[union-attr]
-                nb = buf[o:o + hashes.block]  # type: ignore[union-attr]
-                i = (p.offset + o) // hashes.block  # type: ignore[union-attr]
-                dg = hashlib.sha256(nb).digest()
-                known = hashes.get(i)  # type: ignore[union-attr]
-                if known is None and compare is not None:     # checksum unknown: read this block back
-                    old = compare.read(p.offset + o, len(nb))
-                    for so in range(0, len(nb), compare_block):   # write only the sub-blocks that differ
-                        sb = nb[so:so + compare_block]
-                        if old[so:so + compare_block] == sb:
-                            stats.bytes_unchanged += len(sb)
-                        else:
-                            writer.write(p.offset + o + so, sb)
-                            stats.bytes_written += len(sb)
-                    hashes.set(i, dg)  # type: ignore[union-attr]
-                    continue
-                if known == dg:
-                    stats.bytes_unchanged += len(nb)
-                    hashes.set(i, dg)  # type: ignore[union-attr]
-                else:
-                    writer.write(p.offset + o, nb)
-                    stats.bytes_written += len(nb)
-                    hashes.set(i, dg)  # type: ignore[union-attr]
-        else:
-            if compare is not None:
-                old = compare.read(p.offset, p.length)
-                if old == buf:
-                    stats.bytes_unchanged += p.length
-                else:  # write only the sub-blocks that differ
-                    for o in range(0, p.length, compare_block):
-                        nb = buf[o:o + compare_block]
-                        if old[o:o + compare_block] == nb:
-                            stats.bytes_unchanged += len(nb)
-                        else:
-                            writer.write(p.offset + o, nb)
-                            stats.bytes_written += len(nb)
-            elif writer.prezeroed and _is_zero(buf):
-                stats.bytes_zero_skipped += p.length
-            else:
-                writer.write(p.offset, buf)
-                stats.bytes_written += p.length
-            if hashes is not None:        # record what the replica now holds, block by block
-                zero = _is_zero(buf)
-                for o in range(0, p.length, hashes.block):
-                    nb_len = min(hashes.block, p.length - o)
-                    dg = _zero_digest(nb_len) if zero else hashlib.sha256(buf[o:o + hashes.block]).digest()
-                    hashes.set((p.offset + o) // hashes.block, dg)
-        high = p.end
-        since_ckpt += p.length
-        if on_progress:
-            on_progress(high, size)
-        if on_checkpoint and since_ckpt >= checkpoint_every:
-            writer.flush()
-            on_checkpoint(high)
-            since_ckpt = 0
+    hblock = hashes.block if hashes is not None else None
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="disk-hash")
+    ahead: deque[tuple[ByteRange, bytes, Future]] = deque()
+
+    def chunks() -> Iterator[tuple[ByteRange, bytes, Analysis]]:
+        """Chunks in order with their analysis; the next chunk's analysis runs while this one is written."""
+        src = _prefetch(reader, pieces, prefetch, stop)
+        for p, buf in src:
+            ahead.append((p, buf, pool.submit(analyze, buf, hblock)))
+            if len(ahead) > 1:                 # chunk N is written while chunk N+1 is analysed
+                q, b, f = ahead.popleft()
+                yield q, b, f.result()
+        while ahead:
+            q, b, f = ahead.popleft()
+            yield q, b, f.result()
+
+    try:
+        for p, buf, an in chunks():
+            if cancel is not None and cancel.is_set():
+                stop.set()
+                raise CopyCancelled()
+            if len(buf) != p.length:
+                raise IOError(f"short read at {p.offset}: wanted {p.length}, got {len(buf)}")
+            high, since_ckpt = _apply(p, buf, an, stats=stats, writer=writer, hashes=hashes, by_hash=by_hash,
+                                      compare=compare, compare_block=compare_block, since_ckpt=since_ckpt)
+            if on_progress:
+                on_progress(high, size)
+            if on_checkpoint and since_ckpt >= checkpoint_every:
+                writer.flush()
+                on_checkpoint(high)
+                since_ckpt = 0
+    finally:
+        stop.set()
+        pool.shutdown(wait=True, cancel_futures=True)
     writer.flush()
     if on_checkpoint:
         on_checkpoint(size)
     stats.seconds = time.monotonic() - t0
     return stats
+
+
+def _apply(p: ByteRange, buf: bytes, an: Analysis, *, stats: CopyStats, writer: DiskWriter,
+           hashes: BlockHashes | None, by_hash: bool, compare: DiskReader | None, compare_block: int,
+           since_ckpt: int) -> tuple[int, int]:
+    """Write one chunk (or only what differs) and record its checksums. Returns (high watermark, bytes since
+    the last checkpoint)."""
+    stats.bytes_read += p.length
+    if by_hash:
+        # compare against the checksums recorded when each block was last written
+        for k, o in enumerate(range(0, p.length, hashes.block)):  # type: ignore[union-attr]
+            nb = buf[o:o + hashes.block]  # type: ignore[union-attr]
+            i = (p.offset + o) // hashes.block  # type: ignore[union-attr]
+            dg = an.digests[k]  # type: ignore[index]
+            known = hashes.get(i)  # type: ignore[union-attr]
+            if known is None and compare is not None:     # checksum unknown: read this block back
+                old = compare.read(p.offset + o, len(nb))
+                for so in range(0, len(nb), compare_block):   # write only the sub-blocks that differ
+                    sb = nb[so:so + compare_block]
+                    if old[so:so + compare_block] == sb:
+                        stats.bytes_unchanged += len(sb)
+                    else:
+                        writer.write(p.offset + o + so, sb)
+                        stats.bytes_written += len(sb)
+                hashes.set(i, dg)  # type: ignore[union-attr]
+                continue
+            if known == dg:
+                stats.bytes_unchanged += len(nb)
+                hashes.set(i, dg)  # type: ignore[union-attr]
+            else:
+                writer.write(p.offset + o, nb)
+                stats.bytes_written += len(nb)
+                hashes.set(i, dg)  # type: ignore[union-attr]
+    else:
+        if compare is not None:
+            old = compare.read(p.offset, p.length)
+            if old == buf:
+                stats.bytes_unchanged += p.length
+            else:  # write only the sub-blocks that differ
+                for o in range(0, p.length, compare_block):
+                    nb = buf[o:o + compare_block]
+                    if old[o:o + compare_block] == nb:
+                        stats.bytes_unchanged += len(nb)
+                    else:
+                        writer.write(p.offset + o, nb)
+                        stats.bytes_written += len(nb)
+        elif writer.prezeroed and an.zero:
+            stats.bytes_zero_skipped += p.length
+        else:
+            writer.write(p.offset, buf)
+            stats.bytes_written += p.length
+        if hashes is not None:        # record what the replica now holds, block by block
+            for k, o in enumerate(range(0, p.length, hashes.block)):
+                hashes.set((p.offset + o) // hashes.block, an.digests[k])  # type: ignore[index]
+    return p.end, since_ckpt + p.length

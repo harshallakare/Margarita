@@ -72,6 +72,17 @@ from .nfs import NfsMounter
 from .v4 import PrismV4
 from .mapping import disks_v2, disks_v3, to_vmspec
 
+class LunReader(RawFileReader):
+    """An iSCSI LUN of the recovery point; knows which regions the guest wrote (via `allocated`)."""
+
+    def __init__(self, path: str, size: int, allocated: Any):
+        super().__init__(path, size=size)
+        self._allocated = allocated
+
+    def allocated_ranges(self) -> list[ByteRange] | None:
+        return self._allocated()
+
+
 PAGE = 250
 V2_DISK_PARAMS = {"include_vm_disk_config": "true", "include_vm_nic_config": "true"}
 
@@ -496,7 +507,7 @@ class NutanixSource(SourceProvider):
             size = self._size_of(path)
             if size < disk.size_bytes:
                 raise SafetyGateError(f"{path}: {size} bytes < disk {disk.address} {disk.size_bytes}")
-            return RawFileReader(path, size=disk.size_bytes)
+            return LunReader(path, size=disk.size_bytes, allocated=lambda: self._allocated(snapshot, disk))
         paths = snapshot.data.get("disk_paths") or {}
         ndfs = paths.get(disk.id)
         if not ndfs:
@@ -507,6 +518,30 @@ class NutanixSource(SourceProvider):
         if not local.exists():
             raise ProviderError(f"snapshot disk file not visible over NFS: {local}")
         return RawFileReader(local, size=disk.size_bytes)
+
+    def _allocated(self, snapshot: SnapshotRef, disk: DiskSpec) -> list[ByteRange] | None:
+        """Written regions of a disk in the recovery point (CRT with no reference), so a FULL copy reads only
+        data the guest wrote instead of the whole disk (seen live: 10 TiB disks read in full at ~125 MB/s,
+        ~23 h each, however little they held). None (= read everything) when CRT is off or fails."""
+        d = snapshot.data
+        drp = (d.get("disk_rps") or {}).get(disk.id)
+        if not (self.supports_cbt() and self.config.get("crt_allocation", True) and drp and d.get("recovery_point")
+                and d.get("vm_recovery_point")):
+            return None
+        cur = {"recovery_point": d["recovery_point"], "vm_recovery_point": d["vm_recovery_point"],
+               "disk_recovery_point": drp}
+        try:
+            regs = self.v4.changed_regions(cur, None, disk.size_bytes)
+        except Exception as e:  # noqa: BLE001 - the copy still works, just reads the whole disk
+            self.ctx.logger.warning("disk %s: allocation map not available (%s); reading the whole disk",
+                                    disk.address, e)
+            return None
+        out = normalize([ByteRange(o, min(n, disk.size_bytes - o)) for o, n, t in regs
+                         if n > 0 and o < disk.size_bytes and t != "ZEROED"])
+        used = sum(r.length for r in out)
+        self.ctx.logger.info("disk %s: %d GiB of %d GiB written (allocation map); only that is read",
+                             disk.address, used >> 30, disk.size_bytes >> 30)
+        return out
 
     # ------------------------------------------------------------------ CRT (replica change tracking)
     def supports_cbt(self) -> bool:
