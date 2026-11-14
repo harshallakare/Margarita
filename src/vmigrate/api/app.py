@@ -238,6 +238,50 @@ def create_app(services: Services | None = None) -> FastAPI:
             raise HTTPException(409, "user exists")
         return {"id": repo.create_user(body.username, hash_password(body.password), body.role, body.project)}
 
+    @app.post("/auth/password", tags=["auth"])
+    def change_password(body: m.PasswordChange, cred: HTTPAuthorizationCredentials | None = Depends(bearer),
+                        p: Principal = Depends(principal)) -> dict[str, Any]:
+        """Change your own password. Your other sessions are signed out; this one stays."""
+        u = repo.get_user(p.user_id)
+        if u is None or not verify_password(body.current_password, u["password_hash"]):
+            raise HTTPException(403, "current password is wrong")
+        if body.new_password == body.current_password:
+            raise HTTPException(422, "the new password must differ from the current one")
+        repo.set_password(p.user_id, hash_password(body.new_password))
+        n = repo.revoke_user_tokens(p.user_id, keep_hash=token_hash(cred.credentials) if cred else None)
+        return {"ok": True, "other_sessions_signed_out": n}
+
+    def user_or_404(uid: str) -> dict[str, Any]:
+        u = repo.get_user(uid)
+        if u is None:
+            raise HTTPException(404, "user not found")
+        return u
+
+    @app.put("/users/{uid}/password", tags=["auth"])
+    def set_user_password(uid: str, body: m.PasswordSet, cred: HTTPAuthorizationCredentials | None = Depends(bearer),
+                          p: Principal = Depends(admin)) -> dict[str, Any]:
+        """Admin: set another user's password (e.g. they forgot it)."""
+        user_or_404(uid)
+        repo.set_password(uid, hash_password(body.new_password))
+        keep = token_hash(cred.credentials) if cred and uid == p.user_id else None
+        n = repo.revoke_user_tokens(uid, keep_hash=keep) if body.sign_out else 0
+        return {"ok": True, "sessions_signed_out": n}
+
+    @app.patch("/users/{uid}", tags=["auth"])
+    def update_user(uid: str, body: m.UserUpdate, p: Principal = Depends(admin)) -> dict[str, Any]:
+        u = user_or_404(uid)
+        losing_admin = u["role"] == "admin" and not u["disabled"] and (
+            (body.role is not None and body.role != "admin") or body.disabled is True)
+        if losing_admin and repo.count_admins() <= 1:
+            raise HTTPException(409, "this is the last enabled admin; add another admin first")
+        if uid == p.user_id and body.disabled:
+            raise HTTPException(409, "you cannot disable your own account")
+        repo.update_user(uid, role=body.role, disabled=body.disabled)
+        if body.disabled:
+            repo.revoke_user_tokens(uid)
+        out = user_or_404(uid)
+        return {k: v for k, v in out.items() if k != "password_hash"}
+
     # ------------------------------------------------------------------ meta
     @app.get("/health", tags=["meta"])
     def health() -> dict[str, Any]:
@@ -254,6 +298,68 @@ def create_app(services: Services | None = None) -> FastAPI:
     def workers(_: Principal = Depends(viewer)) -> list[dict[str, Any]]:
         now = time.time()
         return [{**w, "alive": now - w["heartbeat_at"] < 3 * svc.settings.lease_seconds} for w in repo.list_workers()]
+
+    from ..worker import autoscale as _as
+
+    @app.get("/workers/settings", tags=["meta"])
+    def worker_settings(_: Principal = Depends(viewer)) -> dict[str, Any]:
+        """Autoscaling settings: built-in values, the stored defaults, per-host overrides, and what each
+        live supervisor host actually uses."""
+        defaults = repo.get_setting(_as.KEY_DEFAULTS) or {}
+        hosts = {k[len(_as.KEY_HOST):]: v for k, v in repo.settings_with_prefix(_as.KEY_HOST).items()}
+        alive_after = time.time() - 3 * svc.settings.lease_seconds
+        sup = {w["hostname"]: (w.get("info") or {}) for w in repo.list_workers()
+               if (w.get("info") or {}).get("role") == "supervisor" and w["heartbeat_at"] >= alive_after}
+        eff = {h: _as.effective(defaults, hosts.get(h), cpu_count=i.get("cpu_count")) for h, i in sup.items()}
+        return {"builtin": _as.DEFAULTS, "limits": _as.LIMITS, "defaults": defaults, "hosts": hosts, "effective": eff}
+
+    def _worker_values(body: m.WorkerSettings) -> dict[str, Any]:
+        try:
+            return {k: v for k, v in _as.validate(body.model_dump()).items() if v is not None}
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+
+    @app.put("/workers/settings/defaults", tags=["meta"])
+    def put_worker_defaults(body: m.WorkerSettings, p: Principal = Depends(admin)) -> dict[str, Any]:
+        vals = _worker_values(body)
+        repo.set_setting(_as.KEY_DEFAULTS, vals, p.username)
+        return vals
+
+    @app.put("/workers/settings/hosts/{host}", tags=["meta"])
+    def put_worker_host(host: str, body: m.WorkerSettings, p: Principal = Depends(admin)) -> dict[str, Any]:
+        vals = _worker_values(body)
+        d = repo.get_setting(_as.KEY_DEFAULTS) or {}
+        thr = vals.get("max_slots", d.get("max_slots"))
+        cpus = next(((w.get("info") or {}).get("cpu_count") for w in repo.list_workers()
+                     if w["hostname"] == host and (w.get("info") or {}).get("role") == "supervisor"), None)
+        thr = thr if thr is not None else _as.auto_max(cpus)
+        if vals.get("manual_slots", 0) > thr:
+            raise HTTPException(422, f"manual workers ({vals['manual_slots']}) cannot exceed the threshold ({thr}); "
+                                     "raise the threshold (maximum jobs) first")
+        if vals.get("min_slots", 0) > thr:
+            raise HTTPException(422, "min_slots must be <= max_slots")
+        repo.set_setting(_as.KEY_HOST + host, vals, p.username)
+        return vals
+
+    @app.delete("/workers/settings/hosts/{host}", status_code=204, tags=["meta"])
+    def reset_worker_host(host: str, _: Principal = Depends(admin)) -> None:
+        repo.delete_setting(_as.KEY_HOST + host)
+
+    @app.post("/workers/enroll-token", tags=["meta"])
+    def worker_enroll_token(body: m.EnrollTokenRequest | None = None, p: Principal = Depends(admin)) -> dict[str, Any]:
+        """Single-use token for adding a worker host (no pool)."""
+        tok, exp = repo.create_enroll_token(None, (body or m.EnrollTokenRequest()).ttl_minutes * 60, p.user_id)
+        return {"token": tok, "expires_at": exp}
+
+    @app.delete("/workers/{wid}", status_code=204, tags=["meta"])
+    def remove_worker(wid: str, _: Principal = Depends(admin)) -> None:
+        """Remove a stale worker entry. A live worker cannot be removed here: pause it, then stop its service."""
+        w = repo.get_worker(wid)
+        if w is None:
+            raise HTTPException(404, "worker not found")
+        if time.time() - w["heartbeat_at"] < 3 * svc.settings.lease_seconds:
+            raise HTTPException(409, "worker is alive; pause it (Settings -> Workers) and stop its service first")
+        repo.remove_worker(wid)
 
     # ------------------------------------------------------------------ pools
     from ..platform import pools as _pools

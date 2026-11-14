@@ -162,6 +162,7 @@ export async function download(path: string, filename: string): Promise<void> {
 export const api = {
   get: <T,>(p: string) => req<T>("GET", p),
   post: <T,>(p: string, b?: unknown) => req<T>("POST", p, b ?? {}),
+  put: <T,>(p: string, b: unknown) => req<T>("PUT", p, b),
   patch: <T,>(p: string, b: unknown) => req<T>("PATCH", p, b),
   del: (p: string) => req<void>("DELETE", p),
 };

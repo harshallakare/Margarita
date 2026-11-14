@@ -30,7 +30,13 @@ COLLECTIONS = {"users": "user", "endpoints": "endpoint", "migrations": "migratio
                "workers": "worker", "secrets": "secret", "audit": "audit", "alerts": "alert",
                "notification-channels": "notification_channel"}
 SPECIAL = {("POST", "/auth/token"): ("auth.login", "user"), ("POST", "/auth/logout"): ("auth.logout", "user"),
-           ("POST", "/enroll"): ("worker.enroll", "worker")}
+           ("POST", "/enroll"): ("worker.enroll", "worker"),
+           ("POST", "/auth/password"): ("auth.password_change", "user"),
+           ("PUT", "/users/{uid}/password"): ("user.password_reset", "user"),
+           ("POST", "/workers/enroll-token"): ("worker.enroll_token", "worker"),
+           ("PUT", "/workers/settings/defaults"): ("worker.settings_update", "worker"),
+           ("PUT", "/workers/settings/hosts/{host}"): ("worker.settings_update", "worker"),
+           ("DELETE", "/workers/settings/hosts/{host}"): ("worker.settings_reset", "worker")}
 VERB = {"POST": "create", "PUT": "update", "PATCH": "update", "DELETE": "delete", "GET": "read"}
 
 

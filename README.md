@@ -375,6 +375,64 @@ attached. A dry-run never creates a helper.
 Not yet verified on a real VHI cluster: the virtio serial lookup inside the helper, cloud-init host key
 injection on your image, and throughput over SSH (expect lower speeds than `vstorage` mode).
 
+## Workers: autoscaling, pools and accounts
+
+**Autoscaling workers.** `vmigrate-platform worker` (the `margarita-worker` service) is a supervisor. It runs no
+job itself. It starts one process per job (`worker --once`) while there is queued work this host can run:
+
+- **minimum jobs**: always allowed at once, whatever the load;
+- **maximum jobs**: never more at once (default automatic: half the CPUs, 1–4);
+- between the two, one more job starts only when CPU is below the limit (80%), at least 15% of RAM is free and the
+  staging disk has 20 GiB free, and at least 30 s after the previous start, so its load shows first.
+
+**Auto or manual, per host or as the default.**
+- In **auto** mode (the default), the supervisor follows the rules above.
+- In **manual** mode, the admin sets the number of workers with **−/+** on the host's row. Exactly that many
+  jobs may run at once, with no CPU, memory or staging checks. **+** stops at the **threshold** (maximum jobs),
+  which is the same limit auto mode uses; raise it in the host's Settings. **−** never stops a running job: the
+  host just starts fewer new ones. A worker is a slot, not an idle process: it starts a process when a job is
+  queued.
+
+Each job gets its own Python process, so jobs on one host no longer share one interpreter lock. A crashed job
+takes down only its own process; its lease expires and the conductor re-queues it, as before.
+
+Settings → **Workers** shows each host with its job processes, live CPU, RAM and staging space, and why the next
+job does or does not start. Admins can:
+- edit the defaults (**Defaults**), or one host's mode and limits (**Settings** on its row);
+- in manual mode, add or remove workers with **−/+**, up to the threshold;
+- **Pause** a host before maintenance: running jobs finish and no new ones start;
+- **Add host**: create a single-use join token for a new machine;
+- **Remove** an entry that stopped reporting.
+
+API: `GET /workers`, `GET /workers/settings`, `PUT /workers/settings/defaults`, `PUT|DELETE
+/workers/settings/hosts/{host}`, `POST /workers/enroll-token`, `DELETE /workers/{id}` (stale entries only).
+`vmigrate-platform worker --single` keeps the old behaviour: one long-running worker, one job at a time.
+
+**Worker pools vs autoscaling.**
+- Autoscaling decides how many jobs **one host** runs.
+- A pool decides **which hosts** may run a job. Use one pool per site, network or storage access (for example
+  hosts that can reach a DMZ, or VHI nodes with vStorage). A migration or endpoint pinned to a pool runs only on
+  its hosts.
+- A pool can also **start worker VMs** on VHI/OpenStack by itself, to keep a minimum number of hosts.
+
+**Passwords.**
+- Settings → **Your account** → **Change password** (`POST /auth/password`). It needs the current password and
+  signs out your other sessions.
+- Admins can set another user's password, change their role, or disable them: Settings → Users → **Edit**
+  (`PUT /users/{id}/password`, `PATCH /users/{id}`). The last enabled admin cannot be demoted or disabled.
+- Forgotten admin password, on the server:
+
+  ```bash
+  sudo bash /opt/margarita/app/scripts/reset-admin-password.sh               # user admin; prompts twice
+  sudo bash /opt/margarita/app/scripts/reset-admin-password.sh admin --generate   # random password, printed once
+  ```
+
+  It runs `vmigrate-platform reset-password`. The account is re-enabled, all its sessions are signed out, and the
+  reset is recorded in the audit trail as `system:cli`.
+
+The supervisor was tested with unit tests and in the local demo, on a Mac without `/proc`. CPU and memory sampling
+from `/proc` is unit-tested only. It has not run on the template server yet.
+
 ## Alert notifications (email)
 
 Settings → Alert notifications → **Add email**. Pick your provider; Margarita fills in the server, port and
@@ -892,6 +950,7 @@ place, plus range math in `src/vmigrate/core/ranges.py`. Orchestration of delta 
 | Nutanix change tracking (CRT) for replicas | **done** (iSCSI transport; fakes only, not yet run on a live Prism Central) |
 | Web UI: endpoints, wizard, live progress, reports, settings | **done** |
 | Worker routing (regions, capabilities), worker pools, enrollment tokens, auto-provisioned minions (VHI/OpenStack) | **done** (fakes only) |
+| Autoscaling worker supervisor (one process per job, CPU/RAM/staging gates, pause/drain), password change + reset script | **done** (fakes + local demo) |
 | Cross-site export agent, replica cutover, full checksum verification, shared-disk clusters | **done** (fakes only) |
 | OIDC/Keystone identity, metrics | planned |
 | RabbitMQ/Redis queue backend | optional; the DB queue sits behind the same claim/renew calls |
