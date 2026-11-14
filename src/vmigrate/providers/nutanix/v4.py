@@ -108,8 +108,10 @@ def discover_body(cur: dict[str, str], ref: dict[str, str] | None) -> dict[str, 
     return {"operation": "COMPUTE_CHANGED_REGIONS", "spec": spec}
 
 
-def compute_body(offset: int, ref: dict[str, str] | None) -> dict[str, Any]:
+def compute_body(offset: int, ref: dict[str, str] | None, block_bytes: int | None = None) -> dict[str, Any]:
     b: dict[str, Any] = {"$objectType": OT + "VmRecoveryPointChangedRegionsComputeSpec", "offset": offset}
+    if block_bytes:                       # coarser regions = far fewer pages (dropped if the cluster rejects it)
+        b["blockSizeByte"] = int(block_bytes)
     if ref:
         b.update(referenceRecoveryPointExtId=ref["recovery_point"],
                  referenceVmRecoveryPointExtId=ref["vm_recovery_point"],
@@ -123,6 +125,28 @@ def _extra(meta: Any, name: str) -> str | None:
             v = kv.get("value")
             return str(v.get("value") if isinstance(v, dict) else v)
     return None
+
+
+class FairLock:
+    """First come, first served: disks waiting for a CRT request slot get it in arrival order, so one disk
+    cannot re-take the lock page after page while another waits (threading.Lock is not fair)."""
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._queue: list[object] = []
+
+    def __enter__(self) -> FairLock:
+        me = object()
+        with self._cv:
+            self._queue.append(me)
+            while self._queue[0] is not me:
+                self._cv.wait()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        with self._cv:
+            self._queue.pop(0)
+            self._cv.notify_all()
 
 
 class JwtOnly:
@@ -154,11 +178,15 @@ def _route_missing(r: Any) -> bool:
 
 class PrismV4:
     def __init__(self, session: Any, pc_url: str, *, timeout: float = 60, task_timeout: float = 3600,
-                 poll: float = 2, sleep: Any = cancel.sleep, crt_version: str = "v4.0", crt_retries: int = 10):
+                 poll: float = 2, sleep: Any = cancel.sleep, crt_version: str = "v4.0", crt_retries: int = 10,
+                 crt_min_interval: float = 0.2):
         self.crt_version = crt_version
         self._compute_ver: str | None = None    # API version the cluster answered compute-changed-regions on
-        self._crt_lock = threading.Lock()        # one CRT query at a time: the cluster rate-limits them
+        self._crt_lock = FairLock()              # one CRT request at a time, disks in turn: the cluster rate-limits
         self.crt_retries = crt_retries
+        self.crt_min_interval = crt_min_interval
+        self._next_crt = 0.0
+        self._block_ok: bool | None = None       # does this cluster accept blockSizeByte? (None: not tried yet)
         self.s, self.base = session, pc_url.rstrip("/")
         self.timeout, self.task_timeout, self.poll, self.sleep = timeout, task_timeout, poll, sleep
 
@@ -333,11 +361,34 @@ class PrismV4:
     def changed_regions(self, cur: dict[str, str], ref: dict[str, str] | None, size: int,
                         *, max_pages: int = 100000) -> list[tuple[int, int, str]]:
         """All regions of `cur` that differ from `ref` (None: everything allocated), as
-        (offset, length, REGULAR|ZEROED). Pages with nextOffset; re-discovers when the JWT expires.
-        One disk at a time per client, and HTTP 429 / 5xx are retried with backoff: seen live, six disks
-        starting together hit PLAT-10003 RATE_LIMIT_EXCEEDED and every one fell back to a full read."""
-        with self._crt_lock:
-            return self._changed_regions(cur, ref, size, max_pages=max_pages)
+        (offset, length, REGULAR|ZEROED). Pages with nextOffset; re-discovers when the JWT expires."""
+        out: list[tuple[int, int, str]] = []
+        for regs, _ in self._pages(cur, ref, size, max_pages=max_pages):
+            out += regs
+        return out
+
+    def allocated_regions(self, cur: dict[str, str], size: int, *, block_bytes: int | None = 1 << 20,
+                          budget_s: float = 600, progress: Any = None,
+                          clock: Any = time.monotonic) -> tuple[list[tuple[int, int, str]], int]:
+        """Written regions of a disk recovery point (no reference) and how far they are known: (regions,
+        covered_to). Stops after `budget_s` so a very fragmented disk never holds its copy back for long (seen
+        live: a 10 TiB disk paged for many minutes while four disks waited); everything from covered_to on must
+        then be read. progress(covered, regions) is called about every 30 s."""
+        out: list[tuple[int, int, str]] = []
+        t0 = last = clock()
+        covered = 0
+        for regs, nxt in self._pages(cur, None, size, block_bytes=block_bytes):
+            out += regs
+            covered = size if nxt is None else nxt
+            now = clock()
+            if progress and now - last >= 30:
+                last = now
+                progress(covered, len(out))
+            if nxt is not None and now - t0 >= budget_s:
+                log.info("allocation map for %s: stopped after %.0fs at %d of %d bytes; the rest is read in full",
+                         cur["disk_recovery_point"], now - t0, covered, size)
+                break
+        return out, covered
 
     def _backoff(self, attempt: int, retry_after: Any, what: str) -> None:
         if attempt >= self.crt_retries:
@@ -353,13 +404,26 @@ class PrismV4:
     def _discover_retry(self, cur: dict[str, str], ref: dict[str, str] | None) -> tuple[str, str]:
         for attempt in range(self.crt_retries + 1):
             try:
-                return self._discover(cur, ref)
+                with self._crt_lock:
+                    self._pace()
+                    return self._discover(cur, ref)
             except TransientProviderError as e:
                 self._backoff(attempt, None, f"CRT discover-cluster ({e})")
         raise AssertionError("unreachable")
 
-    def _changed_regions(self, cur: dict[str, str], ref: dict[str, str] | None, size: int,
-                         *, max_pages: int) -> list[tuple[int, int, str]]:
+    def _pace(self) -> None:
+        """Called with the lock held: at most one CRT request every crt_min_interval seconds, across all disks
+        of this client (seen live: six disks paging at full speed -> HTTP 429 PLAT-10003)."""
+        wait = self._next_crt - time.monotonic()
+        if wait > 0:
+            self.sleep(wait)
+        self._next_crt = time.monotonic() + self.crt_min_interval
+
+    def _pages(self, cur: dict[str, str], ref: dict[str, str] | None, size: int, *, max_pages: int = 100000,
+               block_bytes: int | None = None) -> Any:
+        """Yield (regions of one page, next offset or None at the end). Each HTTP request takes the client's
+        lock, so disks interleave page by page (one disk never waits for another's whole map), 429 / 5xx are
+        retried with backoff, and a rejected blockSizeByte is dropped once for good."""
         ip, jwt = self._discover_retry(cur, ref)
         # Seen live: the cluster answered compute-changed-regions under v4.0 with a bare web-server 404
         # ("The requested URL was not found on the server"); the Nutanix SDK uses v4.4. Try versions until
@@ -373,14 +437,16 @@ class PrismV4:
                     "/$actions/compute-changed-regions")
         vi = 0
         path = path_for(versions[vi])
-        out: list[tuple[int, int, str]] = []
         off, retried, busy, pages = 0, False, 0, 0
         while pages < max_pages:
+            blk = block_bytes if self._block_ok is not False else None
             headers = {"Accept": "application/json", "Content-Type": "application/json",
                        "NTNX-Request-Id": str(uuid.uuid4()), "Cookie": f"NTNX_IGW_SESSION={jwt}"}
             try:
-                r = self.s.request("POST", f"https://{ip}:9440{path}", json=compute_body(off, ref), headers=headers,
-                                   auth=JwtOnly(jwt), timeout=self.timeout)
+                with self._crt_lock:
+                    self._pace()
+                    r = self.s.request("POST", f"https://{ip}:9440{path}", json=compute_body(off, ref, blk),
+                                       headers=headers, auth=JwtOnly(jwt), timeout=self.timeout)
             except Exception as e:  # noqa: BLE001
                 raise TransientProviderError(f"CRT {ip}: {e}") from e
             if r.status_code == 401 and not retried:          # JWT expired (15 min): get a fresh one once
@@ -391,6 +457,10 @@ class PrismV4:
                 self._backoff(busy, (getattr(r, "headers", None) or {}).get("Retry-After"),
                               f"CRT {ip} HTTP {r.status_code}")
                 busy += 1
+                continue
+            if r.status_code in (400, 422) and blk:            # this cluster does not take blockSizeByte
+                log.info("CRT on %s refused blockSizeByte (HTTP %s); continuing without it", ip, r.status_code)
+                self._block_ok = False
                 continue
             if r.status_code == 404 and self._compute_ver is None and _route_missing(r) and vi + 1 < len(versions):
                 log.info("CRT compute-changed-regions not served under %s on %s; trying %s",
@@ -408,16 +478,19 @@ class PrismV4:
                                     f"discover-cluster) {r.text[:400]}")
             if r.status_code >= 400:
                 raise ProviderError(f"CRT {ip}: HTTP {r.status_code} {r.text[:600]}")
+            if blk and self._block_ok is None:
+                self._block_ok = True
             retried, busy = False, 0
             pages += 1
             body = r.json() if r.content else {}
-            for reg in body.get("data") or []:
-                out.append((int(_need(reg, "offset")), int(_need(reg, "length")),
-                            str(reg.get("regionType") or "REGULAR")))
+            regs = [(int(_need(reg, "offset")), int(_need(reg, "length")), str(reg.get("regionType") or "REGULAR"))
+                    for reg in body.get("data") or []]
             nxt = _extra(body.get("metadata"), "nextOffset")
             n = int(nxt) if nxt not in (None, "", "None") else 0
             if n <= off or n >= size:
-                return out
+                yield regs, None
+                return
+            yield regs, n
             off = n
         raise ProviderError(f"CRT: more than {max_pages} pages for disk recovery point {cur['disk_recovery_point']}")
 

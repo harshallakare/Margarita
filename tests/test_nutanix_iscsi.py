@@ -605,12 +605,14 @@ def test_v4_cleanup_is_safe_to_repeat_when_objects_are_already_gone():
 def test_full_copy_reads_only_allocated_regions(tmp_path):
     """CRT with no reference = the disk's written regions: a full copy skips everything else."""
     class AllocV4(CrtV4):
-        def changed_regions(self, cur, ref, size):
-            assert ref is None
-            self.log.append(f"alloc:{cur['disk_recovery_point']}")
+        covered = None
+
+        def allocated_regions(self, cur, size, *, block_bytes, budget_s, progress=None):
+            self.log.append(f"alloc:{cur['disk_recovery_point']}:{block_bytes}")
             if self.fail:
                 raise ProviderError(self.fail)
-            return [(1 << 20, 4096, "REGULAR"), (0, 8192, "ZEROED"), (2 << 20, 1 << 20, "REGULAR")]
+            return ([(1 << 20, 4096, "REGULAR"), (0, 8192, "ZEROED"), (2 << 20, 1 << 20, "REGULAR")],
+                    self.covered if self.covered is not None else size)
     fv4 = AllocV4()
     ctx, src, tgt, e = make(tmp_path, fv4, disks=2)
     snap = _snap(src, "run1")
@@ -618,6 +620,12 @@ def test_full_copy_reads_only_allocated_regions(tmp_path):
     with src.open_disk(snap, d0) as r:
         got = r.allocated_ranges()
     assert [(x.offset, x.length) for x in got] == [(1 << 20, 4096), (2 << 20, 1 << 20)]   # ZEROED dropped
+    assert f"alloc:{fv4.vg_map[0]}:{1 << 20}" in fv4.log or any(x.endswith(f":{1 << 20}") for x in fv4.log)
+    fv4.covered = 2 << 20                                         # map stopped early at 2 MiB
+    with src.open_disk(snap, d0) as r:
+        got = r.allocated_ranges()
+    assert [(x.offset, x.length) for x in got] == [(1 << 20, 4096), (2 << 20, SIZE - (2 << 20))]   # rest read
+    fv4.covered = None
     fv4.fail = "HTTP 500"
     with src.open_disk(snap, d0) as r:
         assert r.allocated_ranges() is None                       # falls back to reading everything
@@ -654,7 +662,7 @@ def test_crt_rate_limit_is_retried_and_queries_run_one_at_a_time():
                 state["active"] -= 1
     s = Session({("POST", DISCOVER): discover, ("POST", COMPUTE): compute})
     waits: list[float] = []
-    api = v4.PrismV4(s, "https://pc:9440", sleep=waits.append)
+    api = v4.PrismV4(s, "https://pc:9440", sleep=waits.append, crt_min_interval=0)
     assert api.changed_regions(CUR, None, 4 << 20) == [(0, 4096, "REGULAR")]
     assert waits == [7.0, 4.0]                       # Retry-After honoured, then exponential backoff
     results: list = []
@@ -663,9 +671,81 @@ def test_crt_rate_limit_is_retried_and_queries_run_one_at_a_time():
         t.start()
     for t in ts:
         t.join()
-    assert len(results) == 6 and state["max_active"] == 1       # one disk at a time against the cluster
+    assert len(results) == 6 and state["max_active"] == 1       # one request at a time against the cluster
     state["429"] = 99
     api2 = v4.PrismV4(Session({("POST", DISCOVER): discover, ("POST", COMPUTE): compute}), "https://pc:9440",
                       sleep=lambda x: None, crt_retries=3)
     with pytest.raises(TransientProviderError, match="rate-limited"):
         api2.changed_regions(CUR, None, 4 << 20)
+
+
+def _paged_session(pages: int, *, reject_block: bool = False, calls: list | None = None):
+    """A cluster whose disk map is `pages` pages of one 1 MiB region each."""
+    def discover(body):
+        return Resp(200, {"data": {"clusterIp": {"ipv4": {"value": "10.0.0.5"}}, "jwtToken": "jwt"}})
+
+    def compute(body):
+        if calls is not None:
+            calls.append(dict(body))
+        if reject_block and "blockSizeByte" in body:
+            return Resp(400, {"data": {"error": [{"message": "unknown field blockSizeByte"}]}})
+        i = body["offset"] >> 20
+        nxt = str((i + 1) << 20) if i + 1 < pages else "0"
+        return Resp(200, {"data": [{"offset": i << 20, "length": 1 << 20, "regionType": "REGULAR"}],
+                          "metadata": {"extraInfo": [{"name": "nextOffset", "value": nxt}]}})
+    return Session({("POST", DISCOVER): discover, ("POST", COMPUTE): compute})
+
+
+def test_allocation_map_budget_progress_and_block_size():
+    calls: list = []
+    t = [0.0]
+
+    def clock():
+        t[0] += 20                                                 # every page "takes" 20 s
+        return t[0]
+    api = v4.PrismV4(_paged_session(50, calls=calls), "https://pc:9440", sleep=lambda x: None, crt_min_interval=0)
+    seen: list = []
+    regs, covered = api.allocated_regions(CUR, 50 << 20, block_bytes=1 << 20, budget_s=100,
+                                          progress=lambda c, n: seen.append((c, n)), clock=clock)
+    assert 0 < covered < 50 << 20 and len(regs) == covered >> 20      # stopped by the budget, partial map
+    assert seen and all(c <= covered for c, _ in seen)                # progress reported while paging
+    assert calls[0]["blockSizeByte"] == 1 << 20
+    full, covered = v4.PrismV4(_paged_session(5), "https://pc:9440", sleep=lambda x: None,
+                               crt_min_interval=0).allocated_regions(CUR, 5 << 20, budget_s=1e9)
+    assert covered == 5 << 20 and len(full) == 5
+    rej: list = []
+    api2 = v4.PrismV4(_paged_session(3, reject_block=True, calls=rej), "https://pc:9440", sleep=lambda x: None,
+                      crt_min_interval=0)
+    regs, covered = api2.allocated_regions(CUR, 3 << 20, budget_s=1e9)
+    assert covered == 3 << 20 and len(regs) == 3 and api2._block_ok is False
+    assert "blockSizeByte" in rej[0] and all("blockSizeByte" not in c for c in rej[1:])   # dropped for good
+
+
+def test_disks_interleave_page_by_page_and_requests_are_paced():
+    import threading
+    order: list = []
+    sess = _paged_session(4)
+    inner = sess.request
+
+    def tracking(method, url, **kw):
+        if "compute-changed-regions" in url:
+            order.append(threading.current_thread().name)
+            if len(order) == 1:                                    # hold the first request until disk 2 queues
+                import time as _t
+                end = _t.monotonic() + 5
+                while len(api._crt_lock._queue) < 2 and _t.monotonic() < end:
+                    _t.sleep(0.01)
+        return inner(method, url, **kw)
+    sess.request = tracking
+    waits: list = []
+    api = v4.PrismV4(sess, "https://pc:9440", sleep=waits.append, crt_min_interval=0.2)
+    ts = [threading.Thread(target=lambda: api.allocated_regions(CUR, 4 << 20, budget_s=1e9), name=f"d{i}")
+          for i in range(2)]
+    for x in ts:
+        x.start()
+    for x in ts:
+        x.join()
+    assert sorted(order) == ["d0"] * 4 + ["d1"] * 4
+    switches = sum(1 for a, b in zip(order, order[1:]) if a != b)
+    assert switches >= 2                                           # not one whole map after the other
+    assert waits and all(0 < w <= 0.2 for w in waits)              # paced between requests
