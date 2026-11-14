@@ -38,11 +38,17 @@ def tag(pool_name: str) -> str:
 
 
 def members(pool: Mapping[str, Any], workers: list[Mapping[str, Any]], alive_after: float) -> list[dict[str, Any]]:
+    """A member is a worker host: an autoscaling supervisor or a single worker. A supervisor's per-job
+    processes are not counted separately (they come and go with the jobs)."""
     t = tag(pool["name"])
+
+    def busy(w: Mapping[str, Any]) -> bool:
+        info = w.get("info") or {}
+        return int(info.get("running") or 0) > 0 if info.get("role") == "supervisor" else bool(w.get("current_execution"))
     return [{"id": w["id"], "hostname": w.get("hostname"), "region": w.get("region"),
-             "busy": bool(w.get("current_execution")), "heartbeat_at": w.get("heartbeat_at")}
+             "busy": busy(w), "heartbeat_at": w.get("heartbeat_at")}
             for w in workers if t in (w.get("capabilities") or []) and (w.get("heartbeat_at") or 0) >= alive_after
-            and "export-agent" not in (w.get("capabilities") or [])]
+            and "export-agent" not in (w.get("capabilities") or []) and (w.get("info") or {}).get("role") != "job"]
 
 
 def user_data(api_url: str, token: str, *, repo: str = DEFAULT_REPO, branch: str = "main", full: bool = False) -> str:

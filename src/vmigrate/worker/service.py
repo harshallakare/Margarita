@@ -1,7 +1,8 @@
 """Purpose: the worker — claims QUEUED executions, builds the providers from the endpoint rows
 (credentials decrypted only here, in memory), runs the task DAG, and streams task status,
-progress, logs and events into the DB. One execution at a time per worker process; scale out by
-running more workers. A heartbeat thread renews the lease; if the lease is lost (conductor
+progress, logs and events into the DB. One execution at a time per worker process. Normally the
+autoscaling supervisor (autoscale.py) starts one `worker --once` process per job; `worker --single`
+keeps the old single long-running worker. A heartbeat thread renews the lease; if the lease is lost (conductor
 re-queued it), the run is cancelled locally so two workers never drive the same migration.
 
 Usage:
@@ -83,13 +84,22 @@ class Worker:
         self.id = worker_id or f"{self.host}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
         self._stop = threading.Event()
         self.current: str | None = None
+        parent = os.environ.get("VMIGRATE_WORKER_PARENT")
+        self.info: dict[str, Any] = {"role": "job", "parent": parent} if parent else {"role": "single"}
 
     def stop(self) -> None:
         self._stop.set()
 
     def heartbeat(self) -> None:
         self.repo.worker_heartbeat(self.id, self.host, os.getpid(), self.current, region=self.region,
-                                   capabilities=sorted(self.capabilities))
+                                   capabilities=sorted(self.capabilities), info=self.info)
+
+    def run_once(self) -> str | None:
+        """Claim and run at most one execution, then leave (a supervisor's job process)."""
+        try:
+            return self.tick()
+        finally:
+            self.repo.remove_worker(self.id)
 
     def tick(self) -> str | None:
         self.heartbeat()

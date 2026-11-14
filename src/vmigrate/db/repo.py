@@ -57,6 +57,39 @@ class Repo:
         with self.engine.connect() as c:
             return _row(c.execute(select(s.users).where(s.users.c.username == username)).first())
 
+    def get_user(self, uid: str) -> dict[str, Any] | None:
+        with self.engine.connect() as c:
+            return _row(c.execute(select(s.users).where(s.users.c.id == uid)).first())
+
+    def set_password(self, uid: str, password_hash: str, *, enable: bool = False) -> bool:
+        vals: dict[str, Any] = {"password_hash": password_hash}
+        if enable:
+            vals["disabled"] = False
+        with self.engine.begin() as c:
+            return c.execute(update(s.users).where(s.users.c.id == uid).values(**vals)).rowcount == 1
+
+    def update_user(self, uid: str, *, role: str | None = None, disabled: bool | None = None) -> bool:
+        vals = {k: v for k, v in (("role", role), ("disabled", disabled)) if v is not None}
+        if not vals:
+            return True
+        with self.engine.begin() as c:
+            return c.execute(update(s.users).where(s.users.c.id == uid).values(**vals)).rowcount == 1
+
+    def revoke_user_tokens(self, uid: str, *, keep_hash: str | None = None) -> int:
+        """Sign the user out everywhere (except the session `keep_hash`, when given)."""
+        q = delete(s.api_tokens).where(s.api_tokens.c.user_id == uid)
+        if keep_hash:
+            q = q.where(s.api_tokens.c.token_hash != keep_hash)
+        with self.engine.begin() as c:
+            return int(c.execute(q).rowcount or 0)
+
+    def count_admins(self, *, enabled_only: bool = True) -> int:
+        q = select(func.count()).select_from(s.users).where(s.users.c.role == "admin")
+        if enabled_only:
+            q = q.where(s.users.c.disabled.is_(False))
+        with self.engine.connect() as c:
+            return int(c.execute(q).scalar_one())
+
     def list_users(self) -> list[dict[str, Any]]:
         with self.engine.connect() as c:
             return [_row(r) for r in c.execute(select(s.users).order_by(s.users.c.username))]  # type: ignore[misc]
@@ -681,10 +714,11 @@ class Repo:
     # ------------------------------------------------------------------ workers
     def worker_heartbeat(self, wid: str, hostname: str, pid: int, current: str | None, *,
                          region: str | None = None, capabilities: list[str] | None = None,
-                         export_url: str | None = None, export_fp: str | None = None) -> None:
+                         export_url: str | None = None, export_fp: str | None = None,
+                         info: dict[str, Any] | None = None) -> None:
         now = time.time()
         vals = {"heartbeat_at": now, "current_execution": current, "region": region, "capabilities": capabilities,
-                "export_url": export_url, "export_fp": export_fp}
+                "export_url": export_url, "export_fp": export_fp, "info": info}
         with self.engine.begin() as c:
             r = c.execute(update(s.workers).where(s.workers.c.id == wid).values(**vals))
             if r.rowcount == 0:
@@ -697,6 +731,42 @@ class Repo:
     def remove_worker(self, wid: str) -> None:
         with self.engine.begin() as c:
             c.execute(delete(s.workers).where(s.workers.c.id == wid))
+
+    def get_worker(self, wid: str) -> dict[str, Any] | None:
+        with self.engine.connect() as c:
+            return _row(c.execute(select(s.workers).where(s.workers.c.id == wid)).first())
+
+    def claimable_count(self, region: str | None, caps: set[str] | None) -> int:
+        """QUEUED executions a worker with this region + capabilities could claim (autoscaling)."""
+        from ..core.routing import can_run
+        with self.engine.connect() as c:
+            rows = c.execute(select(s.executions.c.required_caps)
+                             .where(s.executions.c.status == ExecStatus.QUEUED.value).limit(500)).all()
+        return sum(1 for (req,) in rows if can_run(region, caps, req)[0])
+
+    # ------------------------------------------------------------------ platform settings (key -> JSON)
+    def get_setting(self, key: str) -> Any:
+        with self.engine.connect() as c:
+            r = c.execute(select(s.platform_settings.c.value).where(s.platform_settings.c.key == key)).first()
+        return r[0] if r else None
+
+    def settings_with_prefix(self, prefix: str) -> dict[str, Any]:
+        with self.engine.connect() as c:
+            rows = c.execute(select(s.platform_settings.c.key, s.platform_settings.c.value)
+                             .where(s.platform_settings.c.key.like(prefix + "%"))).all()
+        return {k: v for k, v in rows}
+
+    def set_setting(self, key: str, value: Any, by: str | None = None) -> None:
+        now = time.time()
+        with self.engine.begin() as c:
+            r = c.execute(update(s.platform_settings).where(s.platform_settings.c.key == key)
+                          .values(value=value, updated_at=now, updated_by=by))
+            if r.rowcount == 0:
+                c.execute(insert(s.platform_settings).values(key=key, value=value, updated_at=now, updated_by=by))
+
+    def delete_setting(self, key: str) -> bool:
+        with self.engine.begin() as c:
+            return c.execute(delete(s.platform_settings).where(s.platform_settings.c.key == key)).rowcount == 1
 
 
 class DbSharedDisks:

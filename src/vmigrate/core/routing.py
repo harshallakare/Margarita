@@ -117,6 +117,10 @@ def waiting_reason(workers: list[Mapping[str, Any]], req: Mapping[str, Any] | No
         return "no live worker (start one: vmigrate-platform worker)"
     reasons = []
     for w in live:
+        info = w.get("info") or {}
+        if info.get("role") == "supervisor" and info.get("paused"):
+            reasons.append(f"{w.get('id')}: paused (Settings -> Workers)")
+            continue
         ok, why = can_run(w.get("region"), set(w.get("capabilities") or []) if w.get("capabilities") is not None
                           else None, req)
         if ok:

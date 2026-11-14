@@ -33,6 +33,34 @@ class UserCreate(BaseModel):
     project: str = "default"
 
 
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=12, max_length=1024)
+
+
+class PasswordSet(BaseModel):
+    new_password: str = Field(min_length=12, max_length=1024)
+    sign_out: bool = True                # end the user's other sessions
+
+
+class UserUpdate(BaseModel):
+    role: Literal["viewer", "operator", "admin"] | None = None
+    disabled: bool | None = None
+
+
+class WorkerSettings(BaseModel):
+    """Worker settings; a missing or null field inherits (host -> defaults -> built-in)."""
+    mode: Literal["auto", "manual"] | None = None
+    manual_slots: int | None = None
+    min_slots: int | None = None
+    max_slots: int | None = None
+    cpu_max_pct: float | None = None
+    mem_min_free_pct: float | None = None
+    staging_min_free_gib: float | None = None
+    spawn_interval_s: int | None = None
+    paused: bool | None = None
+
+
 class PoolProvision(BaseModel):
     endpoint_id: str = Field(..., description="VHI/OpenStack endpoint whose project hosts the minions")
     image: str

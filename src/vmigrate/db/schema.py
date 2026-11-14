@@ -225,6 +225,15 @@ workers = Table(
     Column("capabilities", JSON, nullable=True),
     Column("export_url", String(512), nullable=True),      # export agents: https URL other sites call
     Column("export_fp", String(128), nullable=True),       # export agents: pinned TLS cert SHA-256
+    Column("info", JSON, nullable=True),                   # supervisor: {role, slots, limits, load}; child: {parent}
+)
+
+platform_settings = Table(                # small admin-editable settings (e.g. worker autoscaling), key -> JSON
+    "platform_settings", metadata,
+    Column("key", String(191), primary_key=True),
+    Column("value", JSON, nullable=True),
+    Column("updated_at", Float, nullable=False),
+    Column("updated_by", String(128), nullable=True),
 )
 
 
@@ -319,7 +328,7 @@ _ADDED_COLUMNS = [("executions", "params", "JSON"), ("executions", "region", "VA
                   ("executions", "required_caps", "JSON"), ("executions", "waiting_reason", "TEXT"),
                   ("endpoints", "region", "VARCHAR(64)"), ("endpoints", "required_tags", "JSON"),
                   ("workers", "region", "VARCHAR(64)"), ("workers", "capabilities", "JSON"),
-                  ("workers", "export_url", "VARCHAR(512)"), ("workers", "export_fp", "VARCHAR(128)"),
+                  ("workers", "export_url", "VARCHAR(512)"), ("workers", "export_fp", "VARCHAR(128)"), ("workers", "info", "JSON"),
                   ("task_logs", "logger", "VARCHAR(128)"),
                   ("migrations", "deleted_at", "FLOAT"), ("migrations", "deleted_by", "VARCHAR(64)")]
 

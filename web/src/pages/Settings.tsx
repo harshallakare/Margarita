@@ -1,15 +1,14 @@
 // Purpose: Settings — notification channels (admin: email alerts with provider presets: Gmail,
 // Microsoft 365 via Graph or SMTP, Outlook.com, Yahoo, iCloud, Zoho, SES, SendGrid, ...; save-time
-// login check, and a test send before or after saving), users (admin: list + create), worker pool status, secret store status, and the live
+// login check, and a test send before or after saving), your account (change password), users (admin: list, create,
+// role / disable / set password), workers (autoscaling, WorkersCard.tsx), worker pools, secret store status, and the live
 // provider support matrix.
 
 import { useState } from "react";
 import { api, fmt, type Channel, type EmailConfig, type EmailProvider, type Providers } from "../api";
 import { ErrorBox, Modal, Status, Toast, errText, useAuth, useLoad } from "../ui";
-
-interface User { id: string; username: string; role: string; project: string; disabled: boolean; created_at: number }
-interface WorkerRow { id: string; hostname: string; pid: number; heartbeat_at: number; current_execution: string | null;
-  alive: boolean; region?: string | null; capabilities?: string[] | null }
+import { AccountCard, UserEdit, type User } from "./Account";
+import WorkersCard from "./WorkersCard";
 
 interface Pool { id: string; name: string; region: string | null; description: string | null; min_size: number;
   max_size: number; tag: string; busy: number; last_error: string | null; provision: Record<string, unknown> | null;
@@ -269,10 +268,10 @@ export default function Settings() {
   const { can } = useAuth();
   const admin = can("admin");
   const users = useLoad(() => (admin ? api.get<User[]>("/users") : Promise.resolve([] as User[])), [admin]);
-  const workers = useLoad(() => api.get<WorkerRow[]>("/workers"), [], 5000);
   const secrets = useLoad(() => (admin ? api.get<Record<string, unknown>>("/secrets/status") : Promise.resolve(null)), [admin]);
   const prov = useLoad(() => api.get<Providers>("/providers"));
   const [add, setAdd] = useState(false);
+  const [editUser, setEditUser] = useState<User | null>(null);
   const pools = useLoad(() => api.get<Pool[]>("/pools"), [], 5000);
   const [addPool, setAddPool] = useState(false);
   const [join, setJoin] = useState<Pool | null>(null);
@@ -283,28 +282,14 @@ export default function Settings() {
       <div className="page-head"><div><h1>Settings</h1><div className="sub">Alert notifications, users, workers, secrets and platform support.</div></div></div>
       <div className="grid cols-2" style={{ alignItems: "start" }}>
         {admin && <Notifications onToast={setToast} />}
-        <div className="card">
-          <div className="spread" style={{ marginBottom: 12 }}><h2 style={{ margin: 0 }}>Workers</h2>
-            <span className="muted small">{(workers.data ?? []).filter((w) => w.alive).length} alive</span></div>
-          <ErrorBox error={workers.error} />
-          {(workers.data ?? []).length === 0 ? <p className="muted">No workers have checked in. Start one with <code>vmigrate-platform worker</code>.</p> : (
-            <div className="table-wrap"><table>
-              <thead><tr><th>Worker</th><th>Region</th><th>State</th><th>Heartbeat</th></tr></thead>
-              <tbody>{workers.data!.map((w) => (
-                <tr key={w.id}><td className="mono small">{w.id}
-                  <div className="muted small" title={(w.capabilities ?? []).join("\n")}>
-                    {(w.capabilities ?? []).filter((c) => !c.startsWith("provider:")).join(" · ") || "—"}</div></td>
-                  <td className="small">{w.region || <span className="muted">any</span>}</td>
-                  <td>{!w.alive ? <Status s="failed" label="stale" /> : w.current_execution ? <Status s="running" label="busy" /> : <Status s="ok" label="idle" />}</td>
-                  <td className="small muted">{fmt.ago(w.heartbeat_at)}</td></tr>))}</tbody>
-            </table></div>)}
-        </div>
+        <AccountCard onToast={setToast} />
         <div className="card">
           <div className="spread" style={{ marginBottom: 12 }}><h2 style={{ margin: 0 }}>Worker pools</h2>
             {admin && <button className="btn small" onClick={() => setAddPool(true)}>Add pool</button>}</div>
           <ErrorBox error={pools.error} />
-          {(pools.data ?? []).length === 0 ? <p className="muted">No pools. Without pools any capable worker runs any job; with them a
-            migration can be pinned to a pool (wizard, Options).</p> : (
+          {(pools.data ?? []).length === 0 ? <p className="muted">No pools. Without pools any capable worker runs any job. A pool groups
+            worker hosts (for example one per site or network): a migration or endpoint pinned to a pool runs only on its hosts, and a
+            pool can start worker VMs on VHI/OpenStack by itself to keep a minimum number of hosts.</p> : (
             <div className="table-wrap"><table>
               <thead><tr><th>Pool</th><th>Members</th><th></th></tr></thead>
               <tbody>{pools.data!.map((p) => (
@@ -327,16 +312,19 @@ export default function Settings() {
         </div>
       </div>
 
+      <WorkersCard admin={admin} onToast={setToast} />
+
       {admin && (
         <div className="card">
           <div className="spread" style={{ marginBottom: 12 }}><h2 style={{ margin: 0 }}>Users</h2>
             <button className="btn sm primary" onClick={() => setAdd(true)}>Add user</button></div>
           <ErrorBox error={users.error} />
           <div className="table-wrap"><table>
-            <thead><tr><th>User</th><th>Role</th><th>Project</th><th>Created</th></tr></thead>
+            <thead><tr><th>User</th><th>Role</th><th>Project</th><th>Created</th><th /></tr></thead>
             <tbody>{(users.data ?? []).map((u) => (
               <tr key={u.id}><td><b>{u.username}</b>{u.disabled && <span className="muted"> (disabled)</span>}</td>
-                <td><span className="tag">{u.role}</span></td><td>{u.project}</td><td className="small muted">{fmt.time(u.created_at)}</td></tr>))}</tbody>
+                <td><span className="tag">{u.role}</span></td><td>{u.project}</td><td className="small muted">{fmt.time(u.created_at)}</td>
+                <td style={{ textAlign: "right" }}><button className="btn sm" onClick={() => setEditUser(u)}>Edit</button></td></tr>))}</tbody>
           </table></div>
         </div>
       )}
@@ -353,6 +341,8 @@ export default function Settings() {
         </div>
       </div>
       {add && <NewUser onClose={() => setAdd(false)} onDone={(m) => { setAdd(false); setToast(m); users.reload(); }} />}
+      {editUser && <UserEdit user={editUser} onClose={() => setEditUser(null)}
+                             onDone={(m) => { setEditUser(null); setToast(m); users.reload(); }} />}
       {addPool && <NewPool onClose={() => setAddPool(false)} onDone={(m) => { setAddPool(false); setToast(m); pools.reload(); }} />}
       {join && <JoinToken pool={join} onClose={() => setJoin(null)} />}
       <Toast msg={toast} onDone={() => setToast(null)} />
