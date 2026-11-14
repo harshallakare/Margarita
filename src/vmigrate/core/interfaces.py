@@ -70,6 +70,8 @@ class DiskHints:
     storage_pool: str | None = None
     order: int = 0
     shared: bool = False             # multi-attach volume (cluster shared disk)
+    firmware: str | None = None      # "bios" | "uefi": targets that fix the boot disk's generation at create (Azure)
+    os_family: str | None = None     # "linux" | "windows" | None
 
 
 @dataclass
@@ -114,6 +116,9 @@ class DiskWriter(ABC):
     #: True when unwritten regions are guaranteed to read back as zeros (new sparse file /
     #: freshly created thin volume). Lets the copier skip all-zero chunks.
     prezeroed: bool = False
+    #: False when a new writer starts from scratch (e.g. a new EBS snapshot): an interrupted copy must
+    #: then restart at offset 0 instead of resuming at its watermark.
+    resumable: bool = True
 
     @property
     @abstractmethod
@@ -342,6 +347,11 @@ class TargetProvider(_Provider):
         """(local path, format) of the committed disk for offline OSMorph, or None if the target
         cannot expose it (OSMorph then degrades to manual)."""
         return None
+
+    def morph_options(self) -> dict[str, Any]:
+        """OSMorph options this target implies (e.g. the VMware SCSI controller); the job's own
+        osmorph options win over these."""
+        return {}
 
     def prepare_boot_disk(self, disk: TargetDiskRef, spec: VmSpec, bus: DiskBus) -> None:
         """Called before create_vm: platform metadata the boot disk needs (bus, firmware)."""

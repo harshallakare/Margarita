@@ -55,12 +55,18 @@ TARGETS: dict[str, tuple[str | None, str, str]] = {
     "fake": ("vmigrate.providers.fake.provider:FakeTarget", "implemented", "file-staged, for tests/demos"),
     "vhi": ("vmigrate.providers.vhi.target:VhiTarget", "implemented",
             "Cinder VMDS volume, direct qcow2 backing write, hw_disk_bus=scsi"),
-    "openstack": (None, "planned", "generic Cinder/Nova (non-VHI) — reuse vhi auth, upload via volume attach"),
-    "proxmox": (None, "planned", "qm create + importdisk / direct storage write"),
-    "nutanix": (None, "planned", "Prism v3/v4 VM + disk from image"),
-    "vmware": (None, "planned", "CreateVM_Task + VDDK/ovftool, pvscsi"),
-    "aws": (None, "planned", "PutSnapshotBlock -> register AMI"),
-    "azure": (None, "planned", "managed disk page-blob upload -> VM"),
+    "openstack": ("vmigrate.providers.openstack.target:OpenStackTarget", "implemented",
+                  "generic Keystone/Cinder/Nova: volumes written through a temporary helper VM (NBD over SSH)"),
+    "proxmox": ("vmigrate.providers.proxmox.target:ProxmoxTarget", "implemented",
+                "disks allocated on a PVE storage and written over SSH (NBD agent); holder VM becomes the VM"),
+    "nutanix": ("vmigrate.providers.nutanix.target:NutanixTarget", "implemented",
+                "disks written over iSCSI into volume groups (PC v4); VM created by cloning them (PE v2)"),
+    "vmware": ("vmigrate.providers.vmware.target:VmwareTarget", "implemented",
+               "holder VM with thin disks written through nbdkit-vddk (write mode), then configured + powered on"),
+    "aws": ("vmigrate.providers.aws.target:AwsTarget", "implemented",
+            "EBS direct APIs write snapshots (child snapshots for replicas) -> AMI -> instance; no helper"),
+    "azure": ("vmigrate.providers.azure.target:AzureTarget", "implemented",
+              "managed disks uploaded (Put Page + VHD footer) -> VM with NICs; migrations only (no replicas)"),
 }
 
 
@@ -348,6 +354,87 @@ FIELDS: dict[str, list[dict[str, Any]]] = {
         {"name": "persist", "label": "Persist registry", "kind": "bool", "default": True},
     ],
 }
+
+
+# Settings used only when the endpoint is a migration TARGET (an endpoint type can be both a source and a
+# target; the form shows these after the shared connection fields).
+_T = "Target: "
+TARGET_FIELDS: dict[str, list[dict[str, Any]]] = {
+    "openstack": [
+        {"name": "volume_type", "label": "Target volume type", "kind": "text", "resource": "storage",
+         "help": _T + "Cinder volume type for new disks (empty: the cloud's default)"},
+        {"name": "helper_image", "label": "Helper VM image", "kind": "text", "resource": "images",
+         "help": _T + "Linux cloud image with python3 + cloud-init; the disks are written through this temporary VM"},
+        {"name": "helper_network", "label": "Helper VM network", "kind": "text", "resource": "networks",
+         "help": _T + "network for the helper VM; the worker must reach it over SSH (port 22)"},
+        {"name": "helper_floating_network", "label": "Helper floating-IP network", "kind": "text",
+         "resource": "external_networks", "help": _T + "optional: allocate a floating IP from this network"},
+        {"name": "helper_flavor", "label": "Helper VM flavor", "kind": "text", "resource": "flavors",
+         "help": _T + "optional: default is the smallest flavor with 2 vCPU / 2 GiB"},
+        {"name": "helper_security_groups", "label": "Helper security group", "kind": "text", "default": "default",
+         "resource": "security_groups", "help": _T + "must allow SSH from the Margarita worker"},
+        {"name": "staging_dir", "label": "Work directory", "kind": "text", "default": "/var/lib/vmigrate/staging",
+         "help": _T + "holds the helper VM's SSH keys"},
+        {"name": "availability_zone", "label": "Availability zone", "kind": "text", "help": _T + "optional"},
+    ],
+    "proxmox": [
+        {"name": "target_node", "label": "Target node", "kind": "text",
+         "help": _T + "node that runs the migrated VMs (empty: the first online node)"},
+        {"name": "target_storage", "label": "Target storage", "kind": "text", "resource": "storage",
+         "help": _T + "images storage on that node (lvmthin, zfspool, rbd, dir, nfs, lvm)"},
+        {"name": "default_bridge", "label": "Default bridge", "kind": "text", "resource": "networks",
+         "help": _T + "bridge for source networks not in the migration's network map (e.g. vmbr0, or vmbr0:120 "
+                      "for a VLAN tag)"},
+        {"name": "cpu_type", "label": "CPU type", "kind": "text", "help": _T + "optional, e.g. host or x86-64-v2-AES"},
+    ],
+    "nutanix": [
+        {"name": "target_container", "label": "Target storage container", "kind": "text", "resource": "storage",
+         "help": _T + "container for the new disks (needs Prism Central for the v4 volume groups)"},
+        {"name": "default_network", "label": "Default AHV network", "kind": "text", "resource": "networks",
+         "help": _T + "for source networks not in the migration's network map"},
+    ],
+    "vmware": [
+        {"name": "target_datacenter", "label": "Target datacenter", "kind": "text", "help": _T + "datacenter name"},
+        {"name": "target_cluster", "label": "Target cluster", "kind": "text",
+         "help": _T + "cluster name (or set Target host instead)"},
+        {"name": "target_host", "label": "Target host", "kind": "text", "help": _T + "ESXi host name, if no cluster"},
+        {"name": "target_resource_pool", "label": "Target resource pool", "kind": "text", "help": _T + "optional"},
+        {"name": "target_folder", "label": "Target VM folder", "kind": "text", "help": _T + "optional"},
+        {"name": "target_datastore", "label": "Target datastore", "kind": "text", "resource": "storage",
+         "help": _T + "datastore for the new thin disks"},
+        {"name": "scsi_controller", "label": "SCSI controller", "kind": "select", "default": "lsilogic-sas",
+         "options": ["lsilogic-sas", "pvscsi", "lsilogic"],
+         "help": _T + "lsilogic-sas works for Windows without extra drivers; pvscsi is faster"},
+        {"name": "default_network", "label": "Default port group", "kind": "text", "resource": "networks",
+         "help": _T + "for source networks not in the migration's network map"},
+    ],
+    "aws": [
+        {"name": "default_subnet", "label": "Default subnet", "kind": "text", "resource": "networks",
+         "help": _T + "subnet ID for source networks not in the migration's network map"},
+        {"name": "security_group_ids", "label": "Security group IDs", "kind": "json", "resource": "security_groups",
+         "help": _T + 'optional, e.g. ["sg-0abc"] (default: the VPC default group)'},
+        {"name": "instance_type", "label": "Instance type", "kind": "text",
+         "help": _T + "optional: else the smallest m6i size with enough vCPU / RAM"},
+        {"name": "volume_type", "label": "EBS volume type", "kind": "text", "default": "gp3", "help": _T + "gp3, gp2, io2 ..."},
+        {"name": "kms_key_id", "label": "KMS key", "kind": "text", "help": _T + "optional: encrypt the new volumes"},
+    ],
+    "azure": [
+        {"name": "location", "label": "Region", "kind": "text", "help": _T + "e.g. westeurope"},
+        {"name": "target_resource_group", "label": "Target resource group", "kind": "text",
+         "help": _T + "existing resource group for the new disks, NICs and VMs"},
+        {"name": "default_subnet", "label": "Default subnet", "kind": "text", "resource": "networks",
+         "help": _T + "subnet resource ID for source networks not in the migration's network map"},
+        {"name": "nsg_id", "label": "Network security group", "kind": "text", "help": _T + "optional resource ID"},
+        {"name": "vm_size", "label": "VM size", "kind": "text",
+         "help": _T + "optional: else the smallest Standard_D*s_v5 with enough vCPU / RAM"},
+        {"name": "disk_sku", "label": "Disk SKU", "kind": "select", "default": "Premium_LRS",
+         "options": ["Premium_LRS", "StandardSSD_LRS", "Standard_LRS", "Premium_ZRS", "StandardSSD_ZRS"],
+         "help": _T + "managed disk type"},
+    ],
+}
+for _k, _extra in TARGET_FIELDS.items():
+    _have = {f["name"] for f in FIELDS.get(_k, [])}
+    FIELDS.setdefault(_k, []).extend(f for f in _extra if f["name"] not in _have)
 
 
 def _load(table: dict[str, tuple[str | None, str, str]], kind: str, type_name: str) -> type:
