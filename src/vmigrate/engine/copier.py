@@ -35,6 +35,7 @@ from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
+from ..core.allocation import AllocationTracker
 from ..core.interfaces import DiskReader, DiskWriter
 from ..core.ranges import ByteRange, clip, split
 
@@ -190,12 +191,29 @@ def analyze(buf: bytes, block: int | None) -> Analysis:
     return Analysis(False, [hashlib.sha256(view[o:o + block]).digest() for o in range(0, n, block)])
 
 
-def _prefetch(reader: DiskReader, pieces: list[ByteRange], depth: int,
-              stop: threading.Event) -> Iterator[tuple[ByteRange, bytes]]:
-    """Yield (piece, data) in order while a background thread reads ahead `depth` chunks."""
+def _read_piece(reader: DiskReader, p: ByteRange,
+                alloc: AllocationTracker | None) -> tuple[bytes | None, list[ByteRange] | None]:
+    """(data, parts). parts None: the whole piece was read. [] : nothing written there (data None).
+    Otherwise only `parts` were read; the rest of `data` is zeros (a fresh target already reads zeros)."""
+    parts = alloc.parts(p.offset, p.length) if alloc is not None else None
+    if parts is None:
+        return reader.read(p.offset, p.length), None
+    if not parts:
+        return None, []
+    if len(parts) == 1 and parts[0].offset == p.offset and parts[0].length == p.length:
+        return reader.read(p.offset, p.length), None
+    buf = bytearray(p.length)
+    for r in parts:
+        buf[r.offset - p.offset:r.end - p.offset] = reader.read(r.offset, r.length)
+    return bytes(buf), parts
+
+
+def _prefetch(reader: DiskReader, pieces: list[ByteRange], depth: int, stop: threading.Event,
+              alloc: AllocationTracker | None = None) -> Iterator[tuple[ByteRange, bytes | None, list | None]]:
+    """Yield (piece, data, parts) in order while a background thread reads ahead `depth` chunks."""
     if depth <= 0:
         for p in pieces:
-            yield p, reader.read(p.offset, p.length)
+            yield (p, *_read_piece(reader, p, alloc))
         return
     q: queue.Queue = queue.Queue(maxsize=depth)
 
@@ -204,10 +222,10 @@ def _prefetch(reader: DiskReader, pieces: list[ByteRange], depth: int,
             for p in pieces:
                 if stop.is_set():
                     return
-                buf = reader.read(p.offset, p.length)
+                buf, parts = _read_piece(reader, p, alloc)
                 while not stop.is_set():
                     try:
-                        q.put((p, buf), timeout=0.5)
+                        q.put((p, buf, parts), timeout=0.5)
                         break
                     except queue.Full:
                         continue
@@ -245,6 +263,7 @@ def copy_disk(
     compare_block: int = 64 << 10,
     hashes: BlockHashes | None = None,
     prefetch: int = 2,
+    alloc: AllocationTracker | None = None,
 ) -> CopyStats:
     if writer.size < reader.size:
         raise ValueError(f"target disk ({writer.size} B) smaller than source ({reader.size} B)")
@@ -260,6 +279,8 @@ def copy_disk(
         work = [ByteRange(max(r.offset, start_offset), r.end - max(r.offset, start_offset)) for r in work]
     pieces = split(work, chunk_size)
     by_hash = hashes is not None and hashes.has_base and ranges is None
+    if alloc is not None and not (writer.prezeroed and compare is None and not by_hash):
+        alloc = None                      # skipping unwritten space is only right onto a fresh, zeroed target
 
     stats = CopyStats(bytes_total=size, resumed_from=start_offset)
     t0 = time.monotonic()
@@ -268,29 +289,36 @@ def copy_disk(
     stop = threading.Event()
     hblock = hashes.block if hashes is not None else None
     pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="disk-hash")
-    ahead: deque[tuple[ByteRange, bytes, Future]] = deque()
+    ahead: deque[tuple[ByteRange, bytes | None, list | None, Future | Analysis]] = deque()
 
-    def chunks() -> Iterator[tuple[ByteRange, bytes, Analysis]]:
+    def empty(n: int) -> Analysis:
+        return Analysis(True, [_zero_digest(min(hblock, n - o)) for o in range(0, n, hblock)] if hblock else None)
+
+    def chunks() -> Iterator[tuple[ByteRange, bytes | None, list | None, Analysis]]:
         """Chunks in order with their analysis; the next chunk's analysis runs while this one is written."""
-        src = _prefetch(reader, pieces, prefetch, stop)
-        for p, buf in src:
-            ahead.append((p, buf, pool.submit(analyze, buf, hblock)))
+        src = _prefetch(reader, pieces, prefetch, stop, alloc)
+        for p, buf, parts in src:
+            ahead.append((p, buf, parts, empty(p.length) if buf is None else pool.submit(analyze, buf, hblock)))
             if len(ahead) > 1:                 # chunk N is written while chunk N+1 is analysed
-                q, b, f = ahead.popleft()
-                yield q, b, f.result()
+                q, b, pa, f = ahead.popleft()
+                yield q, b, pa, f if isinstance(f, Analysis) else f.result()
         while ahead:
-            q, b, f = ahead.popleft()
-            yield q, b, f.result()
+            q, b, pa, f = ahead.popleft()
+            yield q, b, pa, f if isinstance(f, Analysis) else f.result()
 
     try:
-        for p, buf, an in chunks():
+        for p, buf, parts, an in chunks():
             if cancel is not None and cancel.is_set():
                 stop.set()
                 raise CopyCancelled()
-            if len(buf) != p.length:
+            if buf is not None and len(buf) != p.length:
                 raise IOError(f"short read at {p.offset}: wanted {p.length}, got {len(buf)}")
-            high, since_ckpt = _apply(p, buf, an, stats=stats, writer=writer, hashes=hashes, by_hash=by_hash,
-                                      compare=compare, compare_block=compare_block, since_ckpt=since_ckpt)
+            if parts is not None:              # the allocation map knows this chunk: only written parts move
+                high, since_ckpt = _apply_sparse(p, buf, parts, an, stats=stats, writer=writer, hashes=hashes,
+                                                 since_ckpt=since_ckpt)
+            else:
+                high, since_ckpt = _apply(p, buf, an, stats=stats, writer=writer, hashes=hashes, by_hash=by_hash,
+                                          compare=compare, compare_block=compare_block, since_ckpt=since_ckpt)
             if on_progress:
                 on_progress(high, size)
             if on_checkpoint and since_ckpt >= checkpoint_every:
@@ -305,6 +333,27 @@ def copy_disk(
         on_checkpoint(size)
     stats.seconds = time.monotonic() - t0
     return stats
+
+
+def _apply_sparse(p: ByteRange, buf: bytes | None, parts: list[ByteRange], an: Analysis, *, stats: CopyStats,
+                  writer: DiskWriter, hashes: BlockHashes | None, since_ckpt: int) -> tuple[int, int]:
+    """A chunk the allocation map covers, onto a zeroed target: write only the written parts that hold data.
+    Checksums come from the whole chunk (unwritten gaps are zeros, as on the target)."""
+    read = sum(r.length for r in parts)
+    stats.bytes_read += read
+    stats.bytes_zero_skipped += p.length - read
+    view = memoryview(buf) if buf is not None else None
+    for r in parts:
+        piece = view[r.offset - p.offset:r.end - p.offset]  # type: ignore[index]
+        if _is_zero(piece):
+            stats.bytes_zero_skipped += r.length
+            continue
+        writer.write(r.offset, piece)
+        stats.bytes_written += r.length
+    if hashes is not None:
+        for k, o in enumerate(range(0, p.length, hashes.block)):
+            hashes.set((p.offset + o) // hashes.block, an.digests[k])  # type: ignore[index]
+    return p.end, since_ckpt + p.length
 
 
 def _apply(p: ByteRange, buf: bytes, an: Analysis, *, stats: CopyStats, writer: DiskWriter,

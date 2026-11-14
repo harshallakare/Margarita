@@ -731,19 +731,18 @@ Secrets: use `${VAR}` / `${VAR:-default}`. `validate` warns about literal secret
 
 **Copy speed (Nutanix to VHI, helper VM).** Seen live: about 125 MB/s per disk while the network, SSH and the
 helper were mostly idle, and full syncs of 10 TiB disks reading every byte.
-- **Only written data is read.** Full syncs over iSCSI ask Prism for the disk's written regions (CRT with no
-  reference) and read only those. The task log shows progress ("allocation map 40% …") and the result ("reading
-  1800 GiB of 10240 GiB").
-  - **Pacing.** Prism rate-limits this API (seen live: HTTP 429 `PLAT-10003` when six disks asked at once). So
-    disks take turns **per request**, at most one every 0.2 s (`crt_min_interval`). A 429 or 5xx is retried with
-    backoff (`Retry-After` when given, up to 10 retries).
-  - **Time budget.** A fragmented disk can need thousands of pages (at most 10,000 regions each). After
-    `crt_allocation_budget_s` (600 s) the disk copies with what is known and reads the unscanned rest in full.
-    Seen live: an early version paged one 10 TiB disk for many minutes while the other disks waited.
-  - **Coarser regions.** The map is asked for at 1 MiB granularity (`crt_block_bytes`; `blockSizeByte` in the
-    API), which means far fewer pages. A cluster that rejects the field gets the request without it.
-  - **Fallback.** A disk reads in full only if the map can't be obtained at all.
-  - **Off switch.** `crt_allocation: false` on the endpoint turns all of this off.
+- **Only written data is read, and the copy never waits for that.** Over iSCSI, Prism's written-regions map (CRT
+  with no reference) is read **in the background** while the copy runs. It is not read first.
+  - Seen live: a 10 TiB disk's map scans at about 1.6 GiB/s with roughly 250 regions per GiB, and Prism refused
+    the coarser `blockSizeByte`. Waiting for the map held every disk back for minutes.
+  - The copy starts at once. A chunk the map has already covered is skipped if nothing was written there;
+    otherwise only its written parts are read and sent. A chunk the map hasn't reached yet is read in full, as
+    without a map. The map normally stays far ahead, since it scans faster than the copy moves.
+  - **Pacing.** Requests to Prism are paced to one every 0.2 s across disks (`crt_min_interval`), disks take
+    turns per request, and HTTP 429 / 5xx are retried with backoff. The map stops when the copy finishes.
+  - **Logs.** The task log says when the map starts, its progress every minute, and at the end how much was
+    written ("allocation map complete: 1800 GiB of 10240 GiB written").
+  - **Off switch.** `crt_allocation: false` on the endpoint turns it off.
 - **The copy steps overlap.** Each disk's copy loop no longer sends, checksums and copies in sequence: zero checks
   and SHA-256 run on a small thread pool, and the NBD client sends from its own thread straight from the read
   buffer, through a 1 MiB pipe to `ssh` on Linux. In a local benchmark (real NBD agent over a pipe) one disk went

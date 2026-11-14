@@ -17,6 +17,7 @@ import pytest
 from vmigrate.config.loader import EngineConfig, MigrationConfig
 from vmigrate.core.context import RunContext
 from vmigrate.core.errors import ProviderError, SafetyGateError, TransientProviderError
+from vmigrate.core.ranges import ByteRange
 from vmigrate.engine import MigrationRunner, StateStore
 from vmigrate.providers.fake.provider import FakeTarget, PatternDisk
 from vmigrate.providers.nutanix import iscsi, v4
@@ -749,3 +750,38 @@ def test_disks_interleave_page_by_page_and_requests_are_paced():
     switches = sum(1 for a, b in zip(order, order[1:]) if a != b)
     assert switches >= 2                                           # not one whole map after the other
     assert waits and all(0 < w <= 0.2 for w in waits)              # paced between requests
+
+
+def test_background_allocation_tracker_never_blocks_and_fills(tmp_path):
+    import threading
+    gate = threading.Event()
+
+    class PagedV4(CrtV4):
+        def _pages(self, cur, ref, size, *, block_bytes=None, max_pages=100000):
+            assert ref is None and block_bytes == 1 << 20
+            yield [(1 << 20, 4096, "REGULAR"), (0, 4096, "ZEROED")], 2 << 20
+            gate.wait(5)                                             # the cluster is slow for the rest
+            yield [(SIZE - 4096, 4096, "REGULAR")], None
+    fv4 = PagedV4()
+    ctx, src, tgt, e = make(tmp_path, fv4, disks=1)
+    snap = _snap(src, "run1")
+    d0 = src.inspect_vm(src.find_vm("RIS-Sainath")).disks[0]
+    with src.open_disk(snap, d0) as r:
+        t = r.allocation_tracker()                                   # returns at once
+        import time as _t
+        end = _t.monotonic() + 5
+        while t.covered < (2 << 20) and _t.monotonic() < end:
+            _t.sleep(0.01)
+        assert t.parts(0, 2 << 20) == [ByteRange(1 << 20, 1 << 20)]  # first page known (ZEROED dropped)
+        assert t.parts(0, SIZE) is None                              # the rest not yet: read in full
+        gate.set()
+        end = _t.monotonic() + 5
+        while t.covered < SIZE and _t.monotonic() < end:
+            _t.sleep(0.01)
+        assert t.covered == SIZE and t.parts(2 << 20, SIZE - (2 << 20)) == [ByteRange(SIZE - (1 << 20), 1 << 20)]
+    off = make(tmp_path / "off", PagedV4(), disks=1, crt_allocation=False)[1]
+    s = _snap(off, "run2")
+    with off.open_disk(s, off.inspect_vm(off.find_vm("RIS-Sainath")).disks[0]) as r:
+        assert r.allocation_tracker() is None
+    src.close()
+    off.close()

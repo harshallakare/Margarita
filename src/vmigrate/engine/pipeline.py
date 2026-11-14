@@ -355,11 +355,17 @@ class MigrationRunner:
                     start = 0
                 # sources that know their allocation (e.g. VMware CBT "*") let a fresh, zeroed target skip
                 # never-written regions entirely
-                alloc = reader.allocated_ranges() if writer.prezeroed else None
-                stats = copy_disk(reader, writer, chunk_size=self.engine.chunk_size, start_offset=start, ranges=alloc,
-                                  prefetch=self.engine.prefetch_chunks,
-                                  checkpoint_every=self.engine.checkpoint_every, on_progress=progress,
-                                  on_checkpoint=checkpoint)
+                start_map = getattr(reader, "allocation_tracker", None) if writer.prezeroed else None
+                tracker = start_map() if start_map is not None else None    # background map: never waited for
+                alloc = reader.allocated_ranges() if writer.prezeroed and tracker is None else None
+                try:
+                    stats = copy_disk(reader, writer, chunk_size=self.engine.chunk_size, start_offset=start,
+                                      ranges=alloc, prefetch=self.engine.prefetch_chunks,
+                                      checkpoint_every=self.engine.checkpoint_every, on_progress=progress,
+                                      on_checkpoint=checkpoint, alloc=tracker)
+                finally:
+                    if tracker is not None:
+                        tracker.close()
                 staged = writer.staged_path
             verify: dict[str, Any] = {"size": check_size(d.size_bytes, ref.size_bytes)[1]}
             if staged is not None:

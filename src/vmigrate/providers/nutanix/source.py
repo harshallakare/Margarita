@@ -52,6 +52,7 @@ The source VM itself is never modified, powered off, or deleted.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -75,12 +76,16 @@ from .mapping import disks_v2, disks_v3, to_vmspec
 class LunReader(RawFileReader):
     """An iSCSI LUN of the recovery point; knows which regions the guest wrote (via `allocated`)."""
 
-    def __init__(self, path: str, size: int, allocated: Any):
+    def __init__(self, path: str, size: int, allocated: Any, tracker: Any = None):
         super().__init__(path, size=size)
-        self._allocated = allocated
+        self._allocated, self._tracker = allocated, tracker
 
     def allocated_ranges(self) -> list[ByteRange] | None:
         return self._allocated()
+
+    def allocation_tracker(self) -> Any:
+        """The written-regions map, filled in the background while the copy runs (None: not available)."""
+        return self._tracker() if self._tracker else None
 
 
 PAGE = 250
@@ -507,7 +512,8 @@ class NutanixSource(SourceProvider):
             size = self._size_of(path)
             if size < disk.size_bytes:
                 raise SafetyGateError(f"{path}: {size} bytes < disk {disk.address} {disk.size_bytes}")
-            return LunReader(path, size=disk.size_bytes, allocated=lambda: self._allocated(snapshot, disk))
+            return LunReader(path, size=disk.size_bytes, allocated=lambda: self._allocated(snapshot, disk),
+                             tracker=lambda: self._start_tracker(snapshot, disk))
         paths = snapshot.data.get("disk_paths") or {}
         ndfs = paths.get(disk.id)
         if not ndfs:
@@ -518,6 +524,52 @@ class NutanixSource(SourceProvider):
         if not local.exists():
             raise ProviderError(f"snapshot disk file not visible over NFS: {local}")
         return RawFileReader(local, size=disk.size_bytes)
+
+    def _start_tracker(self, snapshot: SnapshotRef, disk: DiskSpec) -> Any:
+        """Start reading the disk's written regions from Prism (CRT with no reference) on a background thread.
+        The copy starts at once and skips only chunks the map has already covered, so the map never delays it
+        (seen live: waiting for the map of a 10 TiB disk, scanned at ~1.6 GiB/s, held each disk back for up to
+        10 minutes). The thread stops when the copy is done or the map is complete."""
+        from ...core.allocation import AllocationTracker
+        d = snapshot.data
+        drp = (d.get("disk_rps") or {}).get(disk.id)
+        if not (self.supports_cbt() and self.config.get("crt_allocation", True) and drp and d.get("recovery_point")
+                and d.get("vm_recovery_point")):
+            return None
+        cur = {"recovery_point": d["recovery_point"], "vm_recovery_point": d["vm_recovery_point"],
+               "disk_recovery_point": drp}
+        size = disk.size_bytes
+        t = AllocationTracker(size)
+        block = int(self.config.get("crt_block_bytes", 1 << 20)) or None
+        log = self.ctx.logger
+
+        def run() -> None:
+            last = time.monotonic()
+            try:
+                for regs, nxt in self.v4._pages(cur, None, size, block_bytes=block):
+                    t.add([(o, n) for o, n, kind in regs if kind != "ZEROED"], size if nxt is None else nxt)
+                    if t.closed.is_set():
+                        break
+                    if time.monotonic() - last >= 60:
+                        last = time.monotonic()
+                        log.info("disk %s: allocation map %d%% scanned (%d GiB written so far), ahead of the copy",
+                                 disk.address, t.covered * 100 // max(size, 1), t.written_bytes >> 30)
+                else:
+                    t.finish()
+                if t.covered >= size:
+                    log.info("disk %s: allocation map complete: %d GiB of %d GiB written; the rest is skipped",
+                             disk.address, t.written_bytes >> 30, size >> 30)
+                else:
+                    log.info("disk %s: allocation map stopped at %d GiB of %d GiB (the copy got there first)",
+                             disk.address, t.covered >> 30, size >> 30)
+            except Exception as e:  # noqa: BLE001 - the copy simply reads whatever the map has not covered
+                t.fail(str(e))
+                log.warning("disk %s: allocation map stopped at %d GiB of %d GiB (%s); the rest is read in full",
+                            disk.address, t.covered >> 30, size >> 30, e)
+
+        log.info("disk %s: copy starts now; Prism's allocation map is read alongside it", disk.address)
+        threading.Thread(target=run, name=f"alloc-map-{disk.address}", daemon=True).start()
+        return t
 
     def _allocated(self, snapshot: SnapshotRef, disk: DiskSpec) -> list[ByteRange] | None:
         """Written regions of a disk in the recovery point (CRT with no reference), so a FULL copy reads only
