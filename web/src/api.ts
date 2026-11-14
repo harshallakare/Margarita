@@ -170,10 +170,13 @@ export const api = {
 export interface StreamEvent { id: number; type: string; data: Record<string, unknown> }
 
 /** Subscribe to /events (SSE). EventSource cannot send headers, so the token goes in the query. */
+/** Live events from now on (after=-1: no replay of the run's history; the caller loads the current state
+ *  itself). `onOpen` runs on every (re)connect, so the caller can refetch what it may have missed. */
 export function subscribe(filter: { execution_id?: string; migration_id?: string },
-                          onEvent: (e: StreamEvent) => void): () => void {
-  const q = new URLSearchParams({ ...filter, access_token: token.get() ?? "" } as Record<string, string>);
+                          onEvent: (e: StreamEvent) => void, onOpen?: () => void): () => void {
+  const q = new URLSearchParams({ ...filter, after: "-1", access_token: token.get() ?? "" } as Record<string, string>);
   const es = new EventSource(`/events?${q}`);
+  if (onOpen) es.addEventListener("open", () => onOpen());
   const types = ["execution.created", "execution.queued", "execution.running", "execution.completed",
     "execution.failed", "execution.canceled", "task.started", "task.progress", "task.completed",
     "task.failed", "task.canceled", "task.retry"];

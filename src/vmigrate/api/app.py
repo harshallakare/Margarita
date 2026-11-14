@@ -1366,11 +1366,21 @@ def create_app(services: Services | None = None) -> FastAPI:
         if migration_id:
             scoped(repo.get_migration(migration_id, include_deleted=True), p, "migration")
         allowed = None if p.role == "admin" else {x["id"] for x in repo.list_migrations(p.project, deleted=None)}
-        cursor = int(last_event_id) if last_event_id and last_event_id.isdigit() else after
+        # after=-1: only events from now on (a page that has just loaded the current state). Without it a
+        # long run's whole history was replayed, and the live view rewound and climbed back (seen live).
+        if last_event_id and last_event_id.isdigit():
+            cursor = int(last_event_id)
+        elif after < 0:
+            cursor = await run_in_threadpool(repo.last_event_id)
+        else:
+            cursor = after
+        start = cursor if after < 0 else None
 
         async def gen() -> AsyncIterator[str]:
             nonlocal cursor
             idle = 0.0
+            if start is not None:
+                yield f"id: {start}\n\n"          # sets the client's Last-Event-ID, so a reconnect resumes here
             while True:
                 rows = await run_in_threadpool(repo.get_events, after=cursor, execution_id=execution_id,
                                                migration_id=migration_id)
