@@ -559,6 +559,10 @@ class Repo:
         with self.engine.connect() as c:
             return [_row(r) for r in c.execute(q.order_by(s.events.c.id).limit(limit))]  # type: ignore[misc]
 
+    def last_event_id(self) -> int:
+        with self.engine.connect() as c:
+            return int(c.execute(select(func.max(s.events.c.id))).scalar() or 0)
+
     # ------------------------------------------------------------------ alerts
     def firing_alerts(self) -> list[dict[str, Any]]:
         with self.engine.connect() as c:

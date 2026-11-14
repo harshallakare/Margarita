@@ -173,6 +173,14 @@ def test_full_13_disk_execution_through_api_conductor_worker(plat):
     sse = plat.c.get(f"/events?execution_id={xid}&follow=false", headers=plat.viewer)
     assert sse.headers["content-type"].startswith("text/event-stream")
     assert "event: execution.completed" in sse.text and "event: task.progress" in sse.text
+    # after=-1 (the web UI): no replay of the run's history, only the current position for reconnects
+    last = plat.svc.repo.last_event_id()
+    tail = plat.c.get(f"/events?execution_id={xid}&follow=false&after=-1", headers=plat.viewer).text
+    assert tail.strip() == f"id: {last}"
+    plat.svc.repo.add_event("task.progress", {"task_id": "t", "progress": 50}, execution_id=xid, migration_id=mid)
+    resumed = plat.c.get(f"/events?execution_id={xid}&follow=false&after=-1",
+                         headers={**plat.viewer, "Last-Event-ID": str(last)}).text
+    assert resumed.count("event: ") == 1 and '"progress": 50' in resumed
     assert plat.c.post(f"/migrations/{mid}/start", headers=plat.admin, json={"dry_run": False}).status_code == 409
 
 

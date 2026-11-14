@@ -57,7 +57,7 @@ export default function Execution() {
         tasks.setData((cur) => cur?.map((x) => x.id === d.task_id
           ? { ...x, progress: d.progress ?? x.progress, message: d.message ?? x.message, status: "running" } : x) ?? cur);
       } else refetch();
-    });
+    }, refetch);                                   // (re)connected: catch up on anything missed meanwhile
     return () => { off(); if (t) clearTimeout(t); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
