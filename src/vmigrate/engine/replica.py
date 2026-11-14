@@ -314,6 +314,7 @@ class ReplicaRunner:
                                     distro=g.get("distro", spec.guest_os.distro),
                                     version=g.get("version", spec.guest_os.version), bits=int(g.get("bits", 64)))
         spec.extra["target_options"] = dict(self.job.target_options)
+        spec.extra["osmorph"] = dict(self.job.osmorph)     # targets that cannot morph check prerequisites early
         spec.extra["max_parallel_disks"] = self.engine.max_parallel_disks
         spec.validate()
         counts = safety.check_disk_counts(spec, self.source.disk_count_crosscheck(vm))
@@ -384,7 +385,8 @@ class ReplicaRunner:
             name = self._disk_name(d)
             ref = self.target.find_disk(name) or self.target.create_disk(
                 name, d.size_bytes, DiskHints(bus=d.bus, is_boot=d.is_boot, order=d.order,
-                                              storage_pool=self.job.target_options.get("storage_pool")))
+                                              storage_pool=self.job.target_options.get("storage_pool"),
+                                              firmware=s.firmware.value, os_family=s.guest_os.family.value))
             ok, msg = check_size(d.size_bytes, ref.size_bytes)
             if not ok:
                 raise VerificationError(f"{name}: {msg}")

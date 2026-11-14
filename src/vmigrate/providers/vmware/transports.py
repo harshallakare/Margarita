@@ -211,3 +211,76 @@ class OpenVixReader(DiskReader):
 
     def close(self) -> None:
         self._stack.close()
+
+
+def vddk_write_argv(*, nbdkit: str, sock: str, libdir: str, server: str, user: str, password_file: str,
+                    thumbprint: str, vm_moref: str, file_name: str, transports: str,
+                    extra: list[str] | None = None) -> list[str]:
+    """nbdkit-vddk WRITABLE export of one disk of a powered-off VM (target side: no snapshot)."""
+    return [nbdkit, "--foreground", "--exit-with-parent", "--unix", sock, *(extra or []),
+            "vddk", f"libdir={libdir}", f"server={server}", f"user={user}", f"password=+{password_file}",
+            f"thumbprint={thumbprint}", f"vm=moref={vm_moref}", f"transports={transports}", f"file={file_name}"]
+
+
+class VddkWriteExport:
+    """One writable nbdkit-vddk process for one target disk. `client()` gives a pipelined NBD client
+    (the same one the VHI helper path writes with); `uri` serves guestfish / virt-v2v for OSMorph."""
+
+    def __init__(self, *, nbdkit: str, libdir: str, server: str, user: str, password: str, thumbprint: str,
+                 vm_moref: str, file_name: str, transports: str = "nbdssl:nbd", start_timeout: float = 120.0,
+                 popen: Callable[..., Any] = subprocess.Popen):
+        problems = vddk_problems(nbdkit, libdir)
+        if problems:
+            raise ConfigError("; ".join(problems))
+        self._dir = tempfile.mkdtemp(prefix="vmigrate-vddkw-")
+        os.chmod(self._dir, 0o700)
+        pw = Path(self._dir) / "pw"
+        fd = os.open(pw, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(password)
+        self.sock = str(Path(self._dir) / "nbd.sock")
+        argv = vddk_write_argv(nbdkit=nbdkit, sock=self.sock, libdir=libdir, server=server, user=user,
+                               password_file=str(pw), thumbprint=thumbprint, vm_moref=vm_moref, file_name=file_name,
+                               transports=transports)
+        self._proc = popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + start_timeout
+        while not Path(self.sock).exists():
+            if self._proc.poll() is not None:
+                err = (self._proc.stderr.read() if self._proc.stderr else "")[-2000:]
+                shutil.rmtree(self._dir, ignore_errors=True)
+                raise ProviderError(f"nbdkit-vddk (write) exited ({self._proc.returncode}) for {file_name}: {err}")
+            if time.monotonic() > deadline:
+                self.close()
+                raise TransientProviderError(f"nbdkit-vddk did not open its socket within {start_timeout}s")
+            time.sleep(0.2)
+        pw.unlink(missing_ok=True)
+
+    @property
+    def uri(self) -> str:
+        return f"nbd://?socket={self.sock}"
+
+    def client(self) -> Any:
+        import socket
+
+        from ..vhi.nbd import NbdClient
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(self.sock)
+        r, w = s.makefile("rb"), s.makefile("wb")
+
+        def close() -> None:
+            for f in (r, w):
+                try:
+                    f.close()
+                except OSError:
+                    pass
+            s.close()
+        return NbdClient(r, w, close)
+
+    def close(self) -> None:
+        if self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        shutil.rmtree(self._dir, ignore_errors=True)

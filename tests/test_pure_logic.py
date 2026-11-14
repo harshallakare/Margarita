@@ -196,4 +196,9 @@ def test_osmorph_registry_and_policy():
     for d in s.disks:
         d.controller = "virtio-scsi"
     assert resolve(OsFamily.WINDOWS, "kvm").run(MorphRequest(s, "kvm", DiskBus.SCSI, []), ctx).status == "planned"
-    assert resolve(OsFamily.LINUX, "aws").name == "manual"
+    # cloud targets: the disks are not editable there -> blocked until the operator confirms the drivers
+    cloud = resolve(OsFamily.LINUX, "aws").run(MorphRequest(s, "aws", DiskBus.NVME, []), ctx)
+    assert cloud.strategy == "linux-aws" and cloud.status == "manual_required"
+    ok = resolve(OsFamily.LINUX, "aws").run(MorphRequest(s, "aws", DiskBus.NVME, [], {"cloud_drivers_ready": True}), ctx)
+    assert ok.status == "planned"
+    assert resolve(OsFamily.UNKNOWN, "kvm").name == "manual"         # unregistered cells stay manual

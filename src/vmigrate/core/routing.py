@@ -36,8 +36,12 @@ TOOLS = ("qemu-img", "iscsiadm", "nbdkit", "guestfish", "mount.nfs", "ssh", "vir
 PROVIDER_NEEDS: dict[tuple[str, str], set[str]] = {
     ("vhi", "target"): {"tool:qemu-img", "root"},          # writes VMDS qcow2 backings on the node
     ("physical", "source"): {"tool:ssh"},                   # disks stream over ssh pipes
-    ("proxmox", "source"): {"tool:ssh"},
-    ("libvirt", "source"): {"tool:ssh"},                    # virsh + NBD over ssh                    # qemu-nbd on the node, socket forwarded over ssh
+    ("proxmox", "source"): {"tool:ssh"},                    # qemu-nbd on the node, socket forwarded over ssh
+    ("libvirt", "source"): {"tool:ssh"},                    # virsh + NBD over ssh
+    ("openstack", "target"): {"tool:ssh"},                  # volumes written through a helper VM over ssh
+    ("proxmox", "target"): {"tool:ssh"},                    # NBD agent on the target node over ssh
+    ("nutanix", "target"): {"tool:iscsiadm", "root"},       # volume-group LUNs written over iSCSI
+    ("vmware", "target"): {"tool:nbdkit"},                  # nbdkit-vddk in write mode (+ VDDK in vddk_libdir)
 }
 
 

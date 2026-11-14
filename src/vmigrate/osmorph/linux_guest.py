@@ -244,6 +244,22 @@ systemctl enable --now qemu-guest-agent 2>/dev/null || systemctl start qemu-gues
 """
 
 
+def vmware_tools_script(info: OsInfo) -> str:
+    """First-boot: install + enable open-vm-tools (VMware's recommended tools for Linux guests)."""
+    return """#!/bin/sh
+# Margarita: install open-vm-tools on the new VMware platform (needs package repositories).
+set -e
+if command -v apt-get >/dev/null 2>&1; then
+  DEBIAN_FRONTEND=noninteractive apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q open-vm-tools
+elif command -v dnf >/dev/null 2>&1; then dnf -y install open-vm-tools
+elif command -v yum >/dev/null 2>&1; then yum -y install open-vm-tools
+elif command -v zypper >/dev/null 2>&1; then zypper -n install open-vm-tools
+else echo "no supported package manager"; exit 1
+fi
+systemctl enable --now vmtoolsd 2>/dev/null || systemctl start vmtoolsd || true
+"""
+
+
 # ----------------------------------------------------------------------------- selinux
 def selinux_enabled(config_text: str | None) -> bool:
     if not config_text:

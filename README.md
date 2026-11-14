@@ -433,6 +433,86 @@ API: `GET /workers`, `GET /workers/settings`, `PUT /workers/settings/defaults`, 
 The supervisor was tested with unit tests and in the local demo, on a Mac without `/proc`. CPU and memory sampling
 from `/proc` is unit-tested only. It has not run on the template server yet.
 
+## Targets
+
+Every target writes the migrated disks, runs OSMorph where it can reach the disks, creates the VM and runs a
+boot check. Only resources Margarita created and tagged are ever changed or deleted. **None of the new targets
+has run against a real platform yet**; the tests drive each one end to end against a faithful fake.
+
+| Target | How disks are written | Replicas | Restore points | OSMorph | Boot check |
+|---|---|---|---|---|---|
+| VHI | vStorage qcow2 backing, or helper VM (NBD over SSH) | yes | no | yes (KVM) | serial console |
+| OpenStack | helper VM in the project (NBD over SSH) | yes | no | yes (KVM) | serial console |
+| Proxmox VE | NBD agent over SSH on the target node (`pvesm path`, `rbd map`) | yes | no | yes (KVM) | qemu guest agent / grace |
+| Nutanix AHV | volume group per disk, written over iSCSI | yes (deploy = instant clone) | no | yes (KVM) | power state / grace |
+| VMware vSphere | nbdkit-vddk in write mode into a holder VM's thin disks | yes | no | yes (VMware strategies) | VMware Tools / grace |
+| AWS EC2 | EBS direct APIs into a snapshot (no helper instance) | yes (child snapshots) | yes (EBS snapshots) | prerequisites only | EC2 status checks |
+| Azure | managed-disk upload (Put Page + VHD footer) | **no** (see below) | no | prerequisites only | VM agent / serial log |
+
+**OpenStack.** The VHI target without the vStorage path. Set `helper_image` (python3 + cloud-init) and
+`helper_network` (reachable from the worker on TCP 22). Boot volumes get `hw_disk_bus=scsi` and
+`hw_scsi_model=virtio-scsi`, which libvirt/KVM clouds honour.
+
+**Proxmox VE.**
+- **Holder VM.** The first disk of a run creates an empty, stopped `vmigrate-holder-<run>` VM, because PVE
+  volumes must belong to a VM ID. The disks are allocated on `target_storage` under it, and the holder then
+  becomes the migrated VM: scsi0..N in source order, `virtio-scsi-pci`, OVMF + q35 + efidisk for UEFI,
+  tpmstate for Windows with secure boot, NICs on the mapped bridges.
+- **Writing.** Disks are written on `target_node` over SSH by the same NBD agent the VHI helper uses. Zero
+  chunks are skipped on thin storages; thick LVM is written in full.
+- **Endpoint settings.** The token needs VM.Allocate, VM.Config.*, VM.PowerMgmt, Datastore.AllocateSpace and
+  Datastore.Audit. SSH uses the same key and pinned host keys as the Proxmox source.
+
+**Nutanix AHV.**
+- **Writing.** Each disk is a `vmigrate-disk-<name>` volume group with one empty disk on `target_container`.
+  The worker's iSCSI initiator writes it directly, on the same path the iSCSI source uses live.
+- **The VM.** It's created with Prism v2 `vm_disk_clone` from those disks (instant, copy-on-write). After a
+  migration the volume groups are removed; a replica keeps them, and a deploy clones them with no copy.
+- **Needs.** Prism Central (v4 volume groups), open-iscsi and root on the worker.
+- **To check on the first live run:** the v4 empty-disk body, the volume-group disk ID as the v2 `vmdisk_uuid`,
+  and secure-boot fields. These shapes are isolated in `nutanix/target_api.py`.
+
+**VMware vSphere.**
+- **Holder VM.** The first disk creates a powered-off holder VM with an **LSI Logic SAS** controller (default;
+  Windows has the driver inbox) or `pvscsi`. Thin disks are added in source order (15 per controller, up to
+  4 controllers). Each disk is written through **nbdkit's VDDK plugin in write mode**, so it needs nbdkit +
+  VDDK on the worker, as the VMware source does.
+- **The VM.** The holder is renamed, given the source CPU/RAM/firmware/secure boot, NICs on the mapped port
+  groups (VMXNET3 for Linux, E1000E for Windows), then powered on. Only MACs in 00:50:56 can be kept.
+- **OSMorph.** Linux gets the controller and VMXNET3 drivers in every initramfs, and open-vm-tools at first
+  boot. Windows gets `LSI_SAS` made boot-start in the SYSTEM hive via `hivexregedit`; install VMware Tools
+  afterwards.
+
+**AWS EC2.**
+- **Writing.** Disks are written straight into EBS snapshots with `StartSnapshot` / `PutSnapshotBlock`
+  (512 KiB, SHA-256, parallel) / `CompleteSnapshot`. No helper instance; works from an on-prem worker over
+  HTTPS. The snapshots are registered as an AMI (ENA, UEFI or BIOS as the source), and an instance is launched
+  in the mapped subnets. After launch the AMI and migration snapshots are removed.
+- **Replicas.** Each sync writes a child snapshot of the previous one (only changes), and restore points keep
+  snapshots. An interrupted upload restarts that disk from the beginning (a pending EBS snapshot can't be
+  resumed).
+
+**Azure.**
+- **Writing.** Disks are uploaded into managed disks created for upload (write SAS, Put Page of up to 4 MiB,
+  fixed-VHD footer). The boot disk gets `osType` and Gen1/Gen2 at creation. The VM attaches them, with one NIC
+  per source NIC in the mapped subnets and boot diagnostics on.
+- **No replicas.** Azure accepts uploads only into a disk that was never finalised, so a replica can't be
+  resynced in place. Use Azure for migrations, and AWS or a KVM target for DR replicas.
+
+**Cloud OSMorph (AWS, Azure).** The disks are never block-accessible to the worker, so the guest can't be
+changed. The run therefore stops at **preflight, before any upload**, until you prepare the source and set
+`osmorph.cloud_drivers_ready: true`:
+- **Linux to AWS:** `nvme` + `ena` in every initramfs.
+- **Windows to AWS:** the AWS NVMe and ENA drivers.
+- **Linux to Azure:** `hv_vmbus`, `hv_storvsc`, `hv_netvsc` in every initramfs, plus waagent.
+- **Windows to Azure:** DHCP and RDP enabled.
+
+**Worker needs (routing).**
+- OpenStack and Proxmox targets need `ssh`.
+- The Nutanix target needs `iscsiadm` and root.
+- The VMware target needs `nbdkit`.
+Workers without these don't get those jobs.
+
 ## Alert notifications (email)
 
 Settings → Alert notifications → **Add email**. Pick your provider; Margarita fills in the server, port and
@@ -929,7 +1009,12 @@ Volumes the guest attached itself over **iSCSI** (listed in the IR as `extra.oci
 | source | Google Cloud Compute Engine | **implemented** (worker must run on GCE). Tested against a fake API only; not yet run in a project. |
 | source | Oracle Cloud Infrastructure | **implemented** (worker must run on OCI). Tested against a fake API only; not yet run in a tenancy. |
 | target | Virtuozzo VHI | **implemented** (reference) |
-| target | OpenStack, Proxmox VE, Nutanix AHV, VMware vSphere, AWS, Azure | planned |
+| target | OpenStack (generic Cinder/Nova, helper VM) | **implemented** (fakes only) |
+| target | Proxmox VE (storage volumes written over SSH) | **implemented** (fakes only) |
+| target | Nutanix AHV (volume groups over iSCSI, VM cloned from them) | **implemented** (fakes only) |
+| target | VMware vSphere (holder VM, nbdkit-vddk writes) | **implemented** (fakes only) |
+| target | AWS EC2 (EBS direct snapshot writes -> AMI -> instance) | **implemented** (fakes only) |
+| target | Azure (managed disk upload -> VM; migrations only) | **implemented** (fakes only) |
 
 | OSMorph | KVM family | VMware | AWS | Azure |
 |---|---|---|---|---|

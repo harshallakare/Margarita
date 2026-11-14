@@ -134,6 +134,7 @@ class MigrationRunner:
                                     bits=int(g.get("bits", spec.guest_os.bits)))
         spec.extra["target_name"] = self.job.target_name or spec.name
         spec.extra["target_options"] = dict(self.job.target_options)
+        spec.extra["osmorph"] = dict(self.job.osmorph)     # targets that cannot morph check prerequisites early
         spec.extra["max_parallel_disks"] = self.engine.max_parallel_disks  # for target headroom checks
         spec.validate()
         self._check_shared(spec)
@@ -274,7 +275,8 @@ class MigrationRunner:
             ref = self.target.find_disk(name) or self.target.create_disk(
                 name, d.size_bytes, DiskHints(bus=d.bus, is_boot=d.is_boot, order=d.order,
                                               storage_pool=self.job.target_options.get("storage_pool"),
-                                              shared=bool(d.shared_id))
+                                              shared=bool(d.shared_id), firmware=spec.firmware.value,
+                                              os_family=spec.guest_os.family.value)
             )
             ok, msg = check_size(d.size_bytes, ref.size_bytes)
             if not ok:
@@ -348,6 +350,9 @@ class MigrationRunner:
                     self.target.open_disk_writer(ref, resume=start > 0) as writer:
                 if reader.size != d.size_bytes:
                     raise SafetyGateError(f"disk {d.id}: snapshot size {reader.size} != inspected size {d.size_bytes}")
+                if start and not writer.resumable:
+                    self.log.info("disk %s: the target cannot resume a partial write; copying from the start", d.address)
+                    start = 0
                 # sources that know their allocation (e.g. VMware CBT "*") let a fresh, zeroed target skip
                 # never-written regions entirely
                 alloc = reader.allocated_ranges() if writer.prezeroed else None
@@ -427,7 +432,7 @@ class MigrationRunner:
 
     def _morph_options(self) -> dict:
         """OSMorph options plus the target facts a strategy needs (MACs kept on the target?)."""
-        o = dict(self.job.osmorph)
+        o = {**self.target.morph_options(), **self.job.osmorph}
         o.setdefault("preserve_mac", bool(self.job.target_options.get("preserve_mac", False)))
         return o
 

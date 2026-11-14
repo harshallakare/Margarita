@@ -93,3 +93,41 @@ class RawFileWriter(DiskWriter):
     @property
     def staged_path(self) -> Path:
         return self.path
+
+
+class BlockDeviceWriter(DiskWriter):
+    """Writes into an existing block device (an iSCSI LUN, a mapped volume). Never truncates; the device
+    must be at least `size` bytes. `prezeroed` is the caller's knowledge (a fresh thin LUN reads as zeros).
+    staged_path is None: the data is already on the target, nothing is converted afterwards."""
+
+    def __init__(self, path: str | os.PathLike[str], size: int, *, prezeroed: bool):
+        self.path = Path(path)
+        self._size = size
+        self._fd = os.open(self.path, os.O_RDWR)
+        dev = os.lseek(self._fd, 0, os.SEEK_END)
+        if dev < size:
+            os.close(self._fd)
+            raise ValueError(f"{self.path} is {dev} bytes, smaller than the disk ({size})")
+        self.prezeroed = prezeroed
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def write(self, offset: int, buf: bytes) -> None:
+        if offset + len(buf) > self._size:
+            raise ValueError(f"write past end: {offset}+{len(buf)} > {self._size}")
+        view = memoryview(buf)
+        done = 0
+        while done < len(buf):
+            done += os.pwrite(self._fd, view[done:], offset + done)
+
+    def flush(self) -> None:
+        if self._fd >= 0:
+            os.fsync(self._fd)
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            self.flush()
+            os.close(self._fd)
+            self._fd = -1

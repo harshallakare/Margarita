@@ -116,3 +116,64 @@ class PveApi:
             return
         upid = self._call("DELETE", f"/nodes/{node}/qemu/{vmid}/snapshot/{urllib.parse.quote(name)}")
         self.wait_task(node, upid, f"delete snapshot {name} of VM {vmid}")
+
+    # ------------------------------------------------------------------ target side (VM + disk create)
+    def post(self, path: str, **data: Any) -> Any:
+        return self._call("POST", path, data=data)
+
+    def put(self, path: str, **data: Any) -> Any:
+        return self._call("PUT", path, data=data)
+
+    def delete(self, path: str, **params: Any) -> Any:
+        return self._call("DELETE", path, params=params or None)
+
+    def nodes(self) -> list[dict[str, Any]]:
+        return self.get("/nodes") or []
+
+    def next_vmid(self) -> int:
+        return int(self.get("/cluster/nextid"))
+
+    def all_vms(self) -> list[dict[str, Any]]:
+        """Every qemu VM in the cluster, templates included (name lookups)."""
+        return [r for r in self.get("/cluster/resources", type="vm") or [] if r.get("type") == "qemu"]
+
+    def create_vm(self, node: str, vmid: int, **cfg: Any) -> None:
+        upid = self.post(f"/nodes/{node}/qemu", vmid=vmid, **cfg)
+        self.wait_task(node, upid, f"create VM {vmid}")
+
+    def set_config(self, node: str, vmid: int, **cfg: Any) -> None:
+        """POST (async) config update; waits for the task when PVE returns one."""
+        upid = self.post(f"/nodes/{node}/qemu/{vmid}/config", **cfg)
+        if upid:
+            self.wait_task(node, upid, f"configure VM {vmid}")
+
+    def delete_vm(self, node: str, vmid: int) -> None:
+        upid = self.delete(f"/nodes/{node}/qemu/{vmid}", purge=1, **{"destroy-unreferenced-disks": 1})
+        self.wait_task(node, upid, f"delete VM {vmid}")
+
+    def start(self, node: str, vmid: int) -> None:
+        upid = self.post(f"/nodes/{node}/qemu/{vmid}/status/start")
+        self.wait_task(node, upid, f"start VM {vmid}")
+
+    def alloc_disk(self, node: str, storage: str, vmid: int, filename: str, size_kib: int, fmt: str = "raw") -> str:
+        """Allocate a volume owned by `vmid`; returns its volid (storage:name)."""
+        return str(self.post(f"/nodes/{node}/storage/{urllib.parse.quote(storage)}/content", vmid=vmid,
+                             filename=filename, size=f"{size_kib}K", format=fmt))
+
+    def delete_volume(self, node: str, storage: str, volid: str) -> None:
+        upid = self.delete(f"/nodes/{node}/storage/{urllib.parse.quote(storage)}/content/{urllib.parse.quote(volid)}")
+        if upid:
+            self.wait_task(node, upid, f"delete volume {volid}")
+
+    def storage_status(self, node: str, storage: str) -> dict[str, Any]:
+        return self.get(f"/nodes/{node}/storage/{urllib.parse.quote(storage)}/status") or {}
+
+    def node_networks(self, node: str) -> list[dict[str, Any]]:
+        return self.get(f"/nodes/{node}/network") or []
+
+    def agent_ping(self, node: str, vmid: int) -> bool:
+        try:
+            self.post(f"/nodes/{node}/qemu/{vmid}/agent/ping")
+            return True
+        except ProviderError:
+            return False

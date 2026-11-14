@@ -60,6 +60,12 @@ def needs_virtio(src_controller: str | None, src_bus: DiskBus, target_bus: DiskB
 
 def inject_virtio(gf: Guestfish) -> str:
     """Make sure every installed kernel can boot from virtio. Raises on failure (required step)."""
+    return inject_drivers(gf, VIRTIO_DRIVERS, ("virtio_scsi", "virtio_blk", "virtio_pci"), "virtio")
+
+
+def inject_drivers(gf: Guestfish, drivers: list[str], check: tuple[str, ...], label: str) -> str:
+    """Make sure every installed kernel has `check` modules (built in or in its initramfs); otherwise add
+    `drivers` and rebuild the initramfs. Raises on failure (required step)."""
     ids = _os_release(gf.cat("/etc/os-release")) if gf.exists("/etc/os-release") else set()
     kvers = sorted(f[len("vmlinuz-"):] for f in gf.ls("/boot") if f.startswith("vmlinuz-") and "rescue" not in f)
     if not kvers:
@@ -69,37 +75,58 @@ def inject_virtio(gf: Guestfish) -> str:
 
     def present(k: str) -> bool:
         builtin = f"/lib/modules/{k}/modules.builtin"
-        if gf.exists(builtin) and all(f"/{m}.ko" in gf.cat(builtin) for m in ("virtio_scsi", "virtio_blk", "virtio_pci")):
+        if gf.exists(builtin) and all(f"/{m}.ko" in gf.cat(builtin) for m in check):
             return True
         lister = f"lsinitramfs /boot/initrd.img-{k}" if debian else f"lsinitrd --kver {k}"
         try:
             out = gf.command(lister, rw=False)
         except Exception:  # noqa: BLE001 - no initramfs yet / tool missing -> rebuild
             return False
-        return all(m in out for m in ("virtio_scsi", "virtio_blk"))
+        return all(m in out for m in check[:2])
 
     todo = [k for k in kvers if not present(k)]
     if not todo:
-        return f"virtio already available for kernels {kvers}"
+        return f"{label} already available for kernels {kvers}"
     if debian:
         mods = gf.cat("/etc/initramfs-tools/modules") if gf.exists("/etc/initramfs-tools/modules") else ""
-        add = [m for m in VIRTIO_DRIVERS if m not in mods.split()]
+        add = [m for m in drivers if m not in mods.split()]
         if add:
             gf.upload_text(mods.rstrip("\n") + "\n" + "\n".join(add) + "\n", "/etc/initramfs-tools/modules")
         for k in todo:
             gf.command(f"update-initramfs -u -k {k}")
     else:
         for k in todo:
-            gf.command(f"dracut -f --kver {k} --add-drivers '{' '.join(VIRTIO_DRIVERS)}'")
+            gf.command(f"dracut -f --kver {k} --add-drivers '{' '.join(drivers)}'")
     still = [k for k in todo if not present(k)]
     if still:
-        raise RuntimeError(f"virtio drivers still missing from the initramfs of {still} after rebuild")
+        raise RuntimeError(f"{label} drivers still missing from the initramfs of {still} after rebuild")
     done = todo
-    return f"virtio added to initramfs of {done} ({'update-initramfs' if debian else 'dracut'})"
+    return f"{label} added to initramfs of {done} ({'update-initramfs' if debian else 'dracut'})"
 
 
 class LinuxKvmStrategy(MorphStrategy):
     name = "linux-kvm"
+    # what the target presents; subclasses (VMware) override these four
+    platform_label = "virtio"
+    nic_label = "virtio-net"
+
+    def needs_drivers(self, req: MorphRequest) -> bool:
+        boot = req.spec.boot_disk()
+        return needs_virtio(boot.controller, boot.bus, req.target_boot_bus)
+
+    def driver_step(self, gf: Guestfish, can_edit: bool, why: str) -> MorphStep:
+        return MorphStep("inject-virtio-initramfs",
+                         f"{why}: virtio_blk/virtio_scsi/virtio_pci/virtio_net must be in every kernel's initramfs",
+                         required=True, run=(lambda: inject_virtio(gf)) if can_edit else None)
+
+    remove_tools_default = True                # VMware/Hyper-V/Azure tools are useless on KVM
+    agent_name = "10-qemu-guest-agent"
+
+    def agent_script(self, info: lg.OsInfo) -> str:
+        return lg.guest_agent_script(info)
+
+    def nic_changes(self, req: MorphRequest) -> bool:
+        return any(n.model and not n.model.startswith("virtio") for n in req.spec.nics)
 
     def __init__(self, guestfish_factory=Guestfish):
         self._gf_factory = guestfish_factory
@@ -116,15 +143,11 @@ class LinuxKvmStrategy(MorphStrategy):
                                run=(lambda: self._detect(gf)) if can_edit else None))
 
         boot = req.spec.boot_disk()
-        if needs_virtio(boot.controller, src_bus, req.target_boot_bus):
+        if self.needs_drivers(req):
             why = (f"boot bus changes {src_bus.value} -> {req.target_boot_bus.value}" if src_bus != req.target_boot_bus
-                   else f"guest booted from a {boot.controller or 'unknown'} controller, the target presents virtio")
-            steps.append(MorphStep(
-                "inject-virtio-initramfs",
-                f"{why}: virtio_blk/virtio_scsi/virtio_pci/virtio_net must be in every kernel's initramfs",
-                required=True,
-                run=(lambda: inject_virtio(gf)) if can_edit else None,
-            ))
+                   else f"guest booted from a {boot.controller or 'unknown'} controller, the target presents "
+                        f"{self.platform_label}")
+            steps.append(self.driver_step(gf, can_edit, why))
         if opts.get("network", True):
             src_macs = [n.mac for n in req.spec.nics if n.mac]
             mac_map = dict(opts.get("mac_map") or {})
@@ -135,15 +158,15 @@ class LinuxKvmStrategy(MorphStrategy):
             steps.append(MorphStep("network-config", what, required=False,
                                    run=(lambda: self._network(gf, mac_map, opts.get("net_rename") or {}))
                                    if can_edit else None))
-        if any(n.model and not n.model.startswith("virtio") for n in req.spec.nics):
+        if self.nic_changes(req):
             models = sorted({n.model for n in req.spec.nics if n.model})
             steps.append(MorphStep(
                 "network-naming",
-                f"NIC model changes ({', '.join(models)} -> virtio-net): interface names may change; check the "
+                f"NIC model changes ({', '.join(models)} -> {self.nic_label}): interface names may change; check the "
                 "network-config step above, or use DHCP/cloud-init, or set osmorph.net_rename",
                 required=False, run=None))
 
-        if opts.get("remove_hypervisor_tools", True):
+        if opts.get("remove_hypervisor_tools", self.remove_tools_default):
             steps.append(MorphStep("remove-hypervisor-tools",
                                    "remove VMware / Hyper-V / Azure guest tools (or disable their services)",
                                    required=False, run=(lambda: self._remove_tools(gf)) if can_edit else None))
@@ -188,7 +211,7 @@ class LinuxKvmStrategy(MorphStrategy):
                                    run=(lambda b=body: (gf.run_script(b).strip()[-500:] or "ok")) if can_edit else None))
         fb = list(firstboot)
         if opts.get("install_guest_agent", True):
-            fb.insert(0, ("10-qemu-guest-agent", lg.guest_agent_script(self._info)))
+            fb.insert(0, (self.agent_name, self.agent_script(self._info)))
         if fb:
             steps.append(MorphStep(
                 "firstboot-scripts",
