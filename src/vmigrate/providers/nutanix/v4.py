@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 import uuid
 from urllib.parse import quote
@@ -153,9 +154,11 @@ def _route_missing(r: Any) -> bool:
 
 class PrismV4:
     def __init__(self, session: Any, pc_url: str, *, timeout: float = 60, task_timeout: float = 3600,
-                 poll: float = 2, sleep: Any = cancel.sleep, crt_version: str = "v4.0"):
+                 poll: float = 2, sleep: Any = cancel.sleep, crt_version: str = "v4.0", crt_retries: int = 10):
         self.crt_version = crt_version
         self._compute_ver: str | None = None    # API version the cluster answered compute-changed-regions on
+        self._crt_lock = threading.Lock()        # one CRT query at a time: the cluster rate-limits them
+        self.crt_retries = crt_retries
         self.s, self.base = session, pc_url.rstrip("/")
         self.timeout, self.task_timeout, self.poll, self.sleep = timeout, task_timeout, poll, sleep
 
@@ -330,8 +333,34 @@ class PrismV4:
     def changed_regions(self, cur: dict[str, str], ref: dict[str, str] | None, size: int,
                         *, max_pages: int = 100000) -> list[tuple[int, int, str]]:
         """All regions of `cur` that differ from `ref` (None: everything allocated), as
-        (offset, length, REGULAR|ZEROED). Pages with nextOffset; re-discovers when the JWT expires."""
-        ip, jwt = self._discover(cur, ref)
+        (offset, length, REGULAR|ZEROED). Pages with nextOffset; re-discovers when the JWT expires.
+        One disk at a time per client, and HTTP 429 / 5xx are retried with backoff: seen live, six disks
+        starting together hit PLAT-10003 RATE_LIMIT_EXCEEDED and every one fell back to a full read."""
+        with self._crt_lock:
+            return self._changed_regions(cur, ref, size, max_pages=max_pages)
+
+    def _backoff(self, attempt: int, retry_after: Any, what: str) -> None:
+        if attempt >= self.crt_retries:
+            raise TransientProviderError(f"{what}: still rate-limited / unavailable after {attempt} retries")
+        try:
+            wait = float(retry_after)
+        except (TypeError, ValueError):
+            wait = min(60.0, 2.0 * 2 ** attempt)
+        wait = max(1.0, min(wait, 120.0))
+        log.info("%s: busy (attempt %d); retrying in %.0fs", what, attempt + 1, wait)
+        self.sleep(wait)
+
+    def _discover_retry(self, cur: dict[str, str], ref: dict[str, str] | None) -> tuple[str, str]:
+        for attempt in range(self.crt_retries + 1):
+            try:
+                return self._discover(cur, ref)
+            except TransientProviderError as e:
+                self._backoff(attempt, None, f"CRT discover-cluster ({e})")
+        raise AssertionError("unreachable")
+
+    def _changed_regions(self, cur: dict[str, str], ref: dict[str, str] | None, size: int,
+                         *, max_pages: int) -> list[tuple[int, int, str]]:
+        ip, jwt = self._discover_retry(cur, ref)
         # Seen live: the cluster answered compute-changed-regions under v4.0 with a bare web-server 404
         # ("The requested URL was not found on the server"); the Nutanix SDK uses v4.4. Try versions until
         # one has the route, then stick to it. A JSON 404 from the API itself is a real error.
@@ -345,8 +374,8 @@ class PrismV4:
         vi = 0
         path = path_for(versions[vi])
         out: list[tuple[int, int, str]] = []
-        off, retried = 0, False
-        for _ in range(max_pages):
+        off, retried, busy, pages = 0, False, 0, 0
+        while pages < max_pages:
             headers = {"Accept": "application/json", "Content-Type": "application/json",
                        "NTNX-Request-Id": str(uuid.uuid4()), "Cookie": f"NTNX_IGW_SESSION={jwt}"}
             try:
@@ -355,8 +384,13 @@ class PrismV4:
             except Exception as e:  # noqa: BLE001
                 raise TransientProviderError(f"CRT {ip}: {e}") from e
             if r.status_code == 401 and not retried:          # JWT expired (15 min): get a fresh one once
-                ip, jwt = self._discover(cur, ref)
+                ip, jwt = self._discover_retry(cur, ref)
                 retried = True
+                continue
+            if r.status_code == 429 or r.status_code in (502, 503, 504):   # rate limit / overload: wait, same page
+                self._backoff(busy, (getattr(r, "headers", None) or {}).get("Retry-After"),
+                              f"CRT {ip} HTTP {r.status_code}")
+                busy += 1
                 continue
             if r.status_code == 404 and self._compute_ver is None and _route_missing(r) and vi + 1 < len(versions):
                 log.info("CRT compute-changed-regions not served under %s on %s; trying %s",
@@ -374,7 +408,8 @@ class PrismV4:
                                     f"discover-cluster) {r.text[:400]}")
             if r.status_code >= 400:
                 raise ProviderError(f"CRT {ip}: HTTP {r.status_code} {r.text[:600]}")
-            retried = False
+            retried, busy = False, 0
+            pages += 1
             body = r.json() if r.content else {}
             for reg in body.get("data") or []:
                 out.append((int(_need(reg, "offset")), int(_need(reg, "length")),
