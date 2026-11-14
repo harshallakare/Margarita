@@ -33,6 +33,11 @@ class UserCreate(BaseModel):
     project: str = "default"
 
 
+class ForceDelete(BaseModel):
+    confirm: str = ""                     # must equal the replica's name (unless dry_run)
+    dry_run: bool = False                 # only list what would be left behind
+
+
 class PasswordChange(BaseModel):
     current_password: str
     new_password: str = Field(min_length=12, max_length=1024)

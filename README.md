@@ -190,7 +190,7 @@ to simulate guest writes between replica syncs. Then open http://127.0.0.1:8080/
 | New migration (wizard) | source → VMs from inventory, each one inspected (**true disk count**, per-disk bus and size, and the disk-count gate; a mismatch blocks the wizard) → target → network/storage/flavor mapping → options → review. Creating a migration starts a dry-run. |
 | Migration | phase, disk-count cross-check, run history, and controls: **Run migration** is enabled only after a successful dry-run and asks you to type the name. Also cancel, delete (the record only), and the per-disk verification report with .md/.json download |
 | Execution | live task graph (one bar per disk, MB/s), streamed per-task logs, task details, the dry-run plan, cancel and retry (resume) |
-| Replicas | list with consistency, last sync and next scheduled run. Detail page: sync now (typed confirm), deploy from the latest sync or a restore point, sync history with bytes read/written/unchanged per mode, restore points, deployments, a schedule editor with live cron preview, and delete-disks |
+| Replicas | list with consistency, last sync and next scheduled run. Detail page: sync now (typed confirm), deploy from the latest sync or a restore point, sync history with bytes read/written/unchanged per mode, restore points, deployments, a schedule editor with live cron preview, delete-disks, and (admins) force delete |
 | Settings | workers, secret-store status, users (admin), and the platform support matrix |
 
 Develop the UI with hot reload against a running API:
@@ -374,6 +374,24 @@ attached. A dry-run never creates a helper.
 
 Not yet verified on a real VHI cluster: the virtio serial lookup inside the helper, cloud-init host key
 injection on your image, and throughput over SSH (expect lower speeds than `vstorage` mode).
+
+## Stopping and deleting jobs
+
+- **Cancel** (any run page) asks the worker to stop; steps end at their next check, about a second.
+- **Force cancel** marks the run cancelled at once, without waiting for the worker. Use it when a cancel is stuck.
+  The worker still winds down in the background and removes its helper VM. API: `POST
+  /executions/{id}/cancel?force=true` (also `/migrations/{id}/cancel` and `/replicas/{id}/cancel`).
+- **Delete** a migration once no run is active. Its runs and logs are kept.
+- **Delete a replica** in two steps: **Delete replica disks** removes its volumes and restore points on the
+  target, then **Delete replica** removes the record.
+- **Force delete** (admins, replica page) is for when *Delete replica disks* can't work: the target endpoint is
+  gone, its credentials no longer work, or the volumes were removed by hand.
+  - It removes the replica record **without deleting anything** on the target or the source.
+  - Before you confirm, it lists everything that stays behind: target disks, restore-point snapshots, a kept
+    helper VM, and the source base snapshot / change-tracking reference. You type the replica's name to confirm.
+  - The list is saved in the audit trail (`replica.force_delete_leftovers`).
+  - A running or still-stopping run is refused: force-cancel it first.
+  - API: `POST /replicas/{id}/force-delete` with `{"dry_run": true}` to preview, or `{"confirm": "<name>"}`.
 
 ## Workers: autoscaling, pools and accounts
 

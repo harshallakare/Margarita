@@ -251,6 +251,37 @@ function CutoverDialog({ r, onClose, onStarted }: { r: Replica; onClose: () => v
   );
 }
 
+interface Leftovers { target_disks: { disk: string; id: string; name: string; size_bytes: number }[];
+  restore_point_snapshots: { restore_point: string; disk: string; snapshot: string }[]; helper_vm: string | null;
+  source_base: string[] }
+
+/** Admin: remove a replica WITHOUT deleting its disks on the target; lists everything left behind first. */
+function ForceDelete({ r, onClose, onDone }: { r: Replica; onClose: () => void; onDone: () => void }) {
+  const left = useLoad(() => api.post<{ leftovers: Leftovers }>(`/replicas/${r.id}/force-delete`, { dry_run: true }), [r.id]);
+  const lo = left.data?.leftovers;
+  const none = lo && !lo.target_disks.length && !lo.restore_point_snapshots.length && !lo.helper_vm && !lo.source_base.length;
+  return (
+    <ConfirmTyped title={`Force delete ${r.name}`} word={r.name} action="Force delete" onClose={onClose}
+      onConfirm={async () => { await api.post(`/replicas/${r.id}/force-delete`, { confirm: r.name }); onDone(); }}
+      body={<>Removes the replica record <b>without deleting anything</b> on the target or the source. Use it only when
+        "Delete replica disks" cannot work (the target endpoint is gone, its credentials no longer work, or you removed
+        the volumes by hand). Everything below stays behind and must be removed by hand; the list is also kept in the
+        audit trail.</>}>
+      <ErrorBox error={left.error} title="Could not list what is left behind" />
+      {!lo ? <p className="muted small">Listing what would be left behind…</p> : none
+        ? <p className="small">Nothing is recorded on the target or the source for this replica.</p> : <div className="small">
+          {lo.target_disks.length > 0 && <><b>Target disks ({lo.target_disks.length})</b>
+            <ul>{lo.target_disks.map((d) => <li key={d.id} className="mono">{d.name} · {d.id}{d.size_bytes ? ` · ${fmt.bytes(d.size_bytes)}` : ""}</li>)}</ul></>}
+          {lo.restore_point_snapshots.length > 0 && <><b>Restore-point snapshots ({lo.restore_point_snapshots.length})</b>
+            <ul>{lo.restore_point_snapshots.map((x) => <li key={x.snapshot} className="mono">{x.snapshot}</li>)}</ul></>}
+          {lo.helper_vm && <p><b>Kept helper VM:</b> <span className="mono">{lo.helper_vm}</span></p>}
+          {lo.source_base.length > 0 && <p><b>On the source</b> (base snapshot / change-tracking reference):{" "}
+            <span className="mono">{lo.source_base.join(", ")}</span>. Source recovery points kept for change tracking expire on
+            their own (crt_base_keep_hours).</p>}
+        </div>}
+    </ConfirmTyped>);
+}
+
 export default function ReplicaDetail() {
   const { id } = useParams();
   const nav = useNavigate();
@@ -258,7 +289,7 @@ export default function ReplicaDetail() {
   const rep = useLoad(() => api.get<Replica>(`/replicas/${id}`), [id], 3000);
   const execs = useLoad(() => api.get<Execution[]>(`/executions?migration_id=${id}`), [id], 3000);
   const eps = useLoad(() => api.get<Endpoint[]>("/endpoints"));
-  const [modal, setModal] = useState<null | "sync" | "deploy" | "cutover" | "deldisks" | "delete" | "sched" | Schedule>(null);
+  const [modal, setModal] = useState<null | "sync" | "deploy" | "cutover" | "deldisks" | "delete" | "force" | "sched" | Schedule>(null);
   const [err, setErr] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
@@ -406,6 +437,8 @@ export default function ReplicaDetail() {
           <div className="small">{hasDisks ? "Delete the replica disks and restore points on the target and the base snapshot on the source. Deployed VMs are kept." : "No replica disks exist on the target."}</div>
           <div className="row">
             {hasDisks && <button className="btn danger" onClick={() => setModal("deldisks")}>Delete replica disks…</button>}
+            {hasDisks && can("admin") && <button className="btn danger" onClick={() => setModal("force")}
+              title="Remove the replica without deleting its disks (when Delete replica disks cannot work)">Force delete…</button>}
             <button className="btn danger" disabled={hasDisks} title={hasDisks ? "Delete the replica disks first" : ""} onClick={() => setModal("delete")}>Delete replica</button>
           </div>
         </div>
@@ -421,6 +454,7 @@ export default function ReplicaDetail() {
         onConfirm={() => start("delete-disks", { dry_run: false })}
         body={<>Permanently deletes this replica's {r.disks} disks and {r.restore_points.length} restore points on the target,
           and its base snapshot on the source. VMs already deployed from it are <b>not</b> deleted. This cannot be undone.</>} />}
+      {modal === "force" && <ForceDelete r={r} onClose={() => setModal(null)} onDone={() => nav("/replicas")} />}
       {modal === "delete" && <Modal title={`Delete ${r.name}?`} onClose={() => setModal(null)} footer={<>
         <button className="btn" onClick={() => setModal(null)}>Cancel</button>
         <button className="btn danger solid" onClick={() => act(async () => { await api.del(`/replicas/${r.id}`); nav("/replicas"); })}>Delete record</button></>}>

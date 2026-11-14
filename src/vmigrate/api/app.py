@@ -1260,6 +1260,46 @@ def create_app(services: Services | None = None) -> FastAPI:
                                      "(or they would be orphaned)")
         repo.delete_migration(rid, p.username)
 
+    def replica_leftovers(r: dict[str, Any]) -> dict[str, Any]:
+        """What a force delete leaves behind, so it can be removed by hand: target disks, restore-point
+        snapshots, a kept helper VM, and the source-side base snapshot / change-tracking reference."""
+        st = r.get("state") or {}
+        disks = [{"disk": did, "id": (d.get("target") or {}).get("id"), "name": (d.get("target") or {}).get("name"),
+                  "size_bytes": (d.get("target") or {}).get("size_bytes")}
+                 for did, d in (st.get("disks") or {}).items() if d.get("target")]
+        rps = [{"restore_point": rp.get("id"), "disk": did, "snapshot": sid}
+               for rp in st.get("restore_points") or [] for did, sid in (rp.get("disks") or {}).items()]
+        src = [x for x in ((st.get("base_snapshot") or {}).get("id"), (st.get("base_checkpoint") or {}).get("id")) if x]
+        helper = (st.get("helper") or {}).get("name")
+        return {"target_disks": disks, "restore_point_snapshots": rps, "helper_vm": helper,
+                "source_base": sorted(set(src)), "target_endpoint": r.get("target_endpoint_id"),
+                "source_endpoint": r.get("source_endpoint_id")}
+
+    @app.post("/replicas/{rid}/force-delete", tags=["replicas"])
+    def force_delete_replica(rid: str, body: m.ForceDelete, p: Principal = Depends(admin)) -> dict[str, Any]:
+        """Admin: remove a replica WITHOUT deleting its disks on the target (e.g. the target endpoint is gone or
+        its credentials no longer work, or the volumes were removed by hand). Nothing on the source or target is
+        touched; everything left behind is returned, recorded in the audit trail, and must be removed by hand.
+        dry_run: only list it. A running or still-stopping run is refused: force-cancel it first."""
+        r = rep_scoped(rid, p)
+        left = replica_leftovers(r)
+        if body.dry_run:
+            return {"deleted": False, "leftovers": left}
+        if body.confirm != r["name"]:
+            raise HTTPException(422, f"type the replica's name ({r['name']!r}) to confirm")
+        if repo.active_execution(rid):
+            raise HTTPException(409, "the replica has an active run; force-cancel it first")
+        stopping = repo.stopping_execution(rid)
+        if stopping:
+            raise HTTPException(409, f"a worker is still stopping the force-canceled run {stopping}; try again in a minute")
+        repo.delete_migration(rid, p.username)
+        repo.add_event("replica.force_deleted", {"by": p.username, "leftovers": left}, migration_id=rid)
+        repo.add_audit({"actor": p.username, "actor_id": p.user_id, "actor_role": p.role,
+                        "action": "replica.force_delete_leftovers", "object_type": "replica", "object_id": rid,
+                        "object_name": r["name"], "project": r.get("project"), "outcome": "success",
+                        "details": aud.clip({"leftovers": left})})
+        return {"deleted": True, "leftovers": left}
+
     @app.post("/replicas/{rid}/execute", response_model=m.ExecutionOut, status_code=202, tags=["replicas"])
     def execute_replica(rid: str, body: m.StartRequest | None = None, p: Principal = Depends(operator)) -> m.ExecutionOut:
         return start_kind(rep_scoped(rid, p), "replica_sync", (body or m.StartRequest()).dry_run, p)

@@ -332,3 +332,30 @@ def test_helper_vm_kept_between_syncs_released_for_deploy_and_reaped_when_idle(r
     assert rep.run("execute")["status"] == "completed"
     assert helpers()["live"] == {} and rep.get()["helper"] is None
     assert all(rep.replica_bytes(i) == _expected(i, 5) for i in range(3))
+
+
+def test_force_delete_leaves_the_target_alone_and_lists_what_is_left(rep):
+    c, h, rid = rep.c, rep.admin, rep.rid
+    assert rep.run("execute")["status"] == "completed"
+    assert c.delete(f"/replicas/{rid}", headers=h).status_code == 409             # normal delete: disks first
+    assert c.post(f"/replicas/{rid}/force-delete", headers=rep.viewer, json={"dry_run": True}).status_code == 403
+    pre = c.post(f"/replicas/{rid}/force-delete", headers=h, json={"dry_run": True}).json()
+    assert pre["deleted"] is False and len(pre["leftovers"]["target_disks"]) == 3
+    assert {d["name"] for d in pre["leftovers"]["target_disks"]} == {"ris-dr-r00", "ris-dr-r01", "ris-dr-r02"}
+    assert c.get(f"/replicas/{rid}", headers=h).status_code == 200                # dry run deleted nothing
+    assert c.post(f"/replicas/{rid}/force-delete", headers=h, json={"confirm": "wrong"}).status_code == 422
+    r = c.post(f"/replicas/{rid}/force-delete", headers=h, json={"confirm": "ris-dr"})
+    assert r.status_code == 200 and r.json()["deleted"] and len(r.json()["leftovers"]["target_disks"]) == 3
+    assert c.get(f"/replicas/{rid}", headers=h).status_code == 404
+    assert all(rep.replica_bytes(i) for i in range(3))                            # nothing deleted on the target
+    audit = c.get("/audit", headers=h).json()
+    row = next(a for a in audit if a["action"] == "replica.force_delete_leftovers")
+    assert row["object_name"] == "ris-dr" and len(row["details"]["leftovers"]["target_disks"]) == 3
+
+
+def test_force_delete_refuses_an_active_run(rep):
+    c, h, rid = rep.c, rep.admin, rep.rid
+    x = c.post(f"/replicas/{rid}/execute", headers=h, json={"dry_run": False})
+    assert x.status_code == 202
+    r = c.post(f"/replicas/{rid}/force-delete", headers=h, json={"confirm": "ris-dr"})
+    assert r.status_code == 409 and "force-cancel" in r.text
