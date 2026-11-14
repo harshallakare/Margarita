@@ -16,7 +16,7 @@ import pytest
 
 from vmigrate.config.loader import EngineConfig, MigrationConfig
 from vmigrate.core.context import RunContext
-from vmigrate.core.errors import ProviderError, SafetyGateError
+from vmigrate.core.errors import ProviderError, SafetyGateError, TransientProviderError
 from vmigrate.engine import MigrationRunner, StateStore
 from vmigrate.providers.fake.provider import FakeTarget, PatternDisk
 from vmigrate.providers.nutanix import iscsi, v4
@@ -627,3 +627,45 @@ def test_full_copy_reads_only_allocated_regions(tmp_path):
     with off.open_disk(s, off.inspect_vm(off.find_vm("RIS-Sainath")).disks[0]) as r:
         assert r.allocated_ranges() is None
     off.close()
+
+
+def test_crt_rate_limit_is_retried_and_queries_run_one_at_a_time():
+    """Seen live: six disks asking for their allocation maps at once -> HTTP 429 PLAT-10003 for every one."""
+    import threading
+    state = {"429": 2, "active": 0, "max_active": 0}
+    lock = threading.Lock()
+
+    def discover(body):
+        return Resp(200, {"data": {"clusterIp": {"ipv4": {"value": "10.0.0.5"}}, "jwtToken": "jwt"}})
+
+    def compute(body):
+        with lock:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+        try:
+            if state["429"]:
+                state["429"] -= 1
+                return Resp(429, {"data": {"error": [{"code": "PLAT-10003"}]}},
+                            headers={"Retry-After": "7"} if state["429"] else {})
+            return Resp(200, {"data": [{"offset": 0, "length": 4096, "regionType": "REGULAR"}],
+                              "metadata": {"extraInfo": [{"name": "nextOffset", "value": "0"}]}})
+        finally:
+            with lock:
+                state["active"] -= 1
+    s = Session({("POST", DISCOVER): discover, ("POST", COMPUTE): compute})
+    waits: list[float] = []
+    api = v4.PrismV4(s, "https://pc:9440", sleep=waits.append)
+    assert api.changed_regions(CUR, None, 4 << 20) == [(0, 4096, "REGULAR")]
+    assert waits == [7.0, 4.0]                       # Retry-After honoured, then exponential backoff
+    results: list = []
+    ts = [threading.Thread(target=lambda: results.append(api.changed_regions(CUR, None, 4 << 20))) for _ in range(6)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len(results) == 6 and state["max_active"] == 1       # one disk at a time against the cluster
+    state["429"] = 99
+    api2 = v4.PrismV4(Session({("POST", DISCOVER): discover, ("POST", COMPUTE): compute}), "https://pc:9440",
+                      sleep=lambda x: None, crt_retries=3)
+    with pytest.raises(TransientProviderError, match="rate-limited"):
+        api2.changed_regions(CUR, None, 4 << 20)
