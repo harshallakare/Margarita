@@ -476,16 +476,22 @@ class ReplicaRunner:
                 grown = sum(r.length for r in align_ranges(ranges, HASH_BLOCK, d.size_bytes))
                 slack = min(64 << 20, d.size_bytes // 50)       # small fixed allowance, at most 2% of the disk
                 align = grown <= changed * 1.5 + slack
+            tracker = None
             if mode == "full" and writer.prezeroed:
                 hashes.fill_zero()                       # untouched blocks of a fresh volume are zeros
-                ranges = reader.allocated_ranges()   # skip never-written regions when the source knows them
+                start_map = getattr(reader, "allocation_tracker", None)
+                tracker = start_map() if start_map is not None else None   # background map: never waited for
+                if tracker is None:
+                    ranges = reader.allocated_ranges()   # skip never-written regions when the source knows them
             try:
                 stats = copy_disk(reader, writer, chunk_size=self.engine.chunk_size, ranges=ranges,
                                   checkpoint_every=self.engine.checkpoint_every, on_progress=progress, compare=compare,
-                                  hashes=hashes if align else None, prefetch=self.engine.prefetch_chunks)
+                                  hashes=hashes if align else None, prefetch=self.engine.prefetch_chunks, alloc=tracker)
             finally:
                 if compare is not None:
                     compare.close()
+                if tracker is not None:
+                    tracker.close()
         verify: dict[str, Any] = {}
         if staged is not None:
             ctx.progress(100, "copied; verifying samples against the source", force=True)
