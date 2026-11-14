@@ -1,5 +1,6 @@
-"""Purpose: OSMorph for the public-cloud targets (AWS, Azure), where the migrated disks are uploaded straight into
-the cloud and are never block-accessible to this worker, so nothing can be changed inside the guest.
+"""Purpose: OSMorph for the public-cloud targets (AWS, Azure). When the disks are uploaded straight into the cloud
+they are never block-accessible to this worker, so nothing can be changed inside the guest. The Azure target's
+helper_vm mode serves the disks over NBD instead; then LinuxAzureStrategy / WindowsAzureStrategy edit the guest.
 
 These strategies state exactly what the guest needs BEFORE migration and block the run (manual_required) until
 the operator confirms it with osmorph.cloud_drivers_ready: true. Nothing is silently assumed.
@@ -17,8 +18,14 @@ Usage: resolved by the engine for target platforms "aws" and "azure".
 
 from __future__ import annotations
 
+import shutil
+
 from ..ir import OsFamily
+from . import linux_guest as lg
 from .base import MorphRequest, MorphStep, MorphStrategy, register
+from .guestfs import Guestfish
+from .linux_kvm import LinuxKvmStrategy, inject_drivers
+from .vmware import enable_boot_services
 
 NEEDS = {
     (OsFamily.LINUX, "aws"): "nvme and ena kernel modules in every kernel's initramfs (Nitro instances boot from NVMe "
@@ -32,12 +39,58 @@ NEEDS = {
 }
 
 
+class LinuxAzureStrategy(LinuxKvmStrategy):
+    """Azure with editable disks (the target's helper_vm mode): Hyper-V drivers into every initramfs, the Azure
+    Linux agent at first boot; Hyper-V tools and the agent are kept, VMware tools / qemu agent removed."""
+    name = "linux-azure"
+    platform_label = "Hyper-V storage (storvsc)"
+    nic_label = "hv_netvsc"
+    keep_tool_families = ("hyperv", "azure")
+    agent_name = "10-azure-linux-agent"
+
+    def needs_drivers(self, req: MorphRequest) -> bool:
+        return (req.spec.boot_disk().controller or "") != "storvsc"
+
+    def driver_step(self, gf: Guestfish, can_edit: bool, why: str) -> MorphStep:
+        mods = ["hv_vmbus", "hv_storvsc", "hv_netvsc", "hv_utils"]
+        return MorphStep("inject-hyperv-initramfs", f"{why}: {', '.join(mods)} must be in every kernel's initramfs",
+                         required=True,
+                         run=(lambda: inject_drivers(gf, mods, ("hv_storvsc", "hv_vmbus"), "Hyper-V")) if can_edit else None)
+
+    def agent_script(self, info: lg.OsInfo) -> str:
+        return lg.azure_agent_script(info)
+
+    def nic_changes(self, req: MorphRequest) -> bool:
+        return any(n.model and n.model != "netvsc" for n in req.spec.nics)
+
+
+class WindowsAzureStrategy(MorphStrategy):
+    """Azure with editable disks: storvsc and vmbus made boot-start in the SYSTEM hive (they normally are), plus
+    the operator notes Azure needs (DHCP, RDP, VM agent)."""
+    name = "windows-azure"
+
+    def __init__(self, which=shutil.which, guestfish_factory=Guestfish):
+        self._which, self._gf = which, guestfish_factory
+
+    def plan(self, req: MorphRequest) -> list[MorphStep]:
+        gf = self._gf(req.images, binary=req.options.get("guestfish", "guestfish"))
+        can = gf.available() and self._which("hivexregedit") is not None
+        return [MorphStep("enable-hyperv-storage", "make storvsc and vmbus boot-start in the SYSTEM hive (Azure boots "
+                                                   "from Hyper-V storage)", required=False,
+                          run=(lambda: enable_boot_services(gf, ["storvsc", "vmbus"])) if can else None),
+                MorphStep("azure-windows-notes", "use DHCP on the NICs and keep RDP enabled; install the Azure VM agent "
+                                                 "after the first boot", required=False, run=None)]
+
+
 class CloudPrepStrategy(MorphStrategy):
     def __init__(self, family: OsFamily, platform: str):
         self.family, self.platform = family, platform
         self.name = f"{family.value}-{platform}"
 
     def plan(self, req: MorphRequest) -> list[MorphStep]:
+        if self.platform == "azure" and req.images and req.options.get("azure_disks_editable"):
+            inner = LinuxAzureStrategy() if self.family == OsFamily.LINUX else WindowsAzureStrategy()
+            return inner.plan(req)
         need = NEEDS[(self.family, self.platform)]
         ready = bool(req.options.get("cloud_drivers_ready"))
         steps = [MorphStep(

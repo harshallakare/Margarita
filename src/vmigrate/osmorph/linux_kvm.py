@@ -120,6 +120,7 @@ class LinuxKvmStrategy(MorphStrategy):
                          required=True, run=(lambda: inject_virtio(gf)) if can_edit else None)
 
     remove_tools_default = True                # VMware/Hyper-V/Azure tools are useless on KVM
+    keep_tool_families: tuple[str, ...] = ()   # tool families the target still needs (Azure: hyperv, azure)
     agent_name = "10-qemu-guest-agent"
 
     def agent_script(self, info: lg.OsInfo) -> str:
@@ -265,7 +266,8 @@ class LinuxKvmStrategy(MorphStrategy):
         if self._info.family == "unknown":
             return "unknown distribution: skipped"
         try:
-            pkgs = lg.tools_to_remove(gf.command(lg.query_cmd(self._info), rw=False).splitlines())
+            pkgs = lg.tools_to_remove(gf.command(lg.query_cmd(self._info), rw=False).splitlines(),
+                                      keep=self.keep_tool_families)
         except Exception as ex:  # noqa: BLE001
             pkgs, err = [], str(ex)
         else:
@@ -280,6 +282,8 @@ class LinuxKvmStrategy(MorphStrategy):
         if gf.is_dir("/etc/systemd/system"):
             for w in [f for f in gf.ls("/etc/systemd/system") if f.endswith(".wants")]:
                 for u in lg.HYPERVISOR_UNITS:
+                    if lg.UNIT_FAMILY.get(u) in self.keep_tool_families:
+                        continue
                     p = f"/etc/systemd/system/{w}/{u}"
                     if gf.exists(p):
                         gf.rm_f(p)

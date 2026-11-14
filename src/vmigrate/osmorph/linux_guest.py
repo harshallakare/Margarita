@@ -218,9 +218,16 @@ def query_cmd(info: OsInfo) -> str:
     return "dpkg-query -W -f=${Package}\\n" if info.family == "debian" else "rpm -qa --qf %{NAME}\\n"
 
 
-def tools_to_remove(installed: list[str]) -> list[str]:
+UNIT_FAMILY = {"vmtoolsd.service": "vmware", "vgauthd.service": "vmware", "vmware-tools.service": "vmware",
+               "hv-kvp-daemon.service": "hyperv", "hv-vss-daemon.service": "hyperv", "hv-fcopy-daemon.service": "hyperv",
+               "hypervkvpd.service": "hyperv", "hypervvssd.service": "hyperv", "waagent.service": "azure",
+               "walinuxagent.service": "azure"}
+
+
+def tools_to_remove(installed: list[str], keep: tuple[str, ...] = ()) -> list[str]:
+    """Hypervisor tool packages present in the guest, minus the families the target still needs (`keep`)."""
     have = {p.strip() for p in installed if p.strip()}
-    return sorted({p for pkgs in HYPERVISOR_TOOLS.values() for p in pkgs if p in have})
+    return sorted({p for fam, pkgs in HYPERVISOR_TOOLS.items() if fam not in keep for p in pkgs if p in have})
 
 
 def remove_cmd(info: OsInfo, pkgs: list[str]) -> str:
@@ -257,6 +264,22 @@ elif command -v zypper >/dev/null 2>&1; then zypper -n install open-vm-tools
 else echo "no supported package manager"; exit 1
 fi
 systemctl enable --now vmtoolsd 2>/dev/null || systemctl start vmtoolsd || true
+"""
+
+
+def azure_agent_script(info: OsInfo) -> str:
+    """First-boot: install + enable the Azure Linux agent (provisioning, extensions, the VM agent status)."""
+    return """#!/bin/sh
+# Margarita: install the Azure Linux agent on the new Azure VM (needs package repositories).
+set -e
+if command -v apt-get >/dev/null 2>&1; then
+  DEBIAN_FRONTEND=noninteractive apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q walinuxagent
+elif command -v dnf >/dev/null 2>&1; then dnf -y install WALinuxAgent
+elif command -v yum >/dev/null 2>&1; then yum -y install WALinuxAgent
+elif command -v zypper >/dev/null 2>&1; then zypper -n install python-azure-agent
+else echo "no supported package manager"; exit 1
+fi
+systemctl enable --now walinuxagent 2>/dev/null || systemctl enable --now waagent 2>/dev/null || true
 """
 
 
