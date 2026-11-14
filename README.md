@@ -711,6 +711,17 @@ Secrets: use `${VAR}` / `${VAR:-default}`. `validate` warns about literal secret
 
 ## Operational notes (pitfalls proven on the reference path)
 
+**Copy speed (Nutanix to VHI, helper VM).** Seen live: about 125 MB/s per disk while the network, SSH and the
+helper were mostly idle, and full syncs of 10 TiB disks reading every byte.
+- **Only written data is read.** Full syncs over iSCSI ask Prism for the disk's written regions (CRT with no
+  reference) and read only those. If that call fails they read the whole disk. Set `crt_allocation: false` on
+  the endpoint to turn this off.
+- **The copy steps overlap.** Each disk's copy loop no longer sends, checksums and copies in sequence: zero checks
+  and SHA-256 run on a small thread pool, and the NBD client sends from its own thread straight from the read
+  buffer, through a 1 MiB pipe to `ssh` on Linux. In a local benchmark (real NBD agent over a pipe) one disk went
+  from about 850 to 1,590 MB/s. The ceiling on a live helper is then one SSH stream (311 MB/s measured on the
+  template server).
+
 1. **The disk count is never capped.** v3 `disk_list` and v2 `vm_disk_info` must agree on the
    exact address set and on sizes. The materialized snapshot clone must expose the same count, and
    so must the target attachment list. Volume-group disks fail loudly instead of being dropped.

@@ -14,14 +14,16 @@ The agent source is sent inline (`python3 -c`), so nothing is installed on the h
 from __future__ import annotations
 
 import os
+import queue
 import shlex
 import socket
 import struct
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 from ...core.errors import ProviderError, TransientProviderError
 from ...core.interfaces import DiskReader, DiskWriter
@@ -36,6 +38,29 @@ def agent_command(device: str, *, writable: bool, python: str = "python3", sudo:
     """Remote shell command that serves `device` over NBD on stdin/stdout."""
     cmd = f"{python} -c {shlex.quote(_AGENT_SRC)} {shlex.quote(device)} {'rw' if writable else 'ro'}"
     return f"sudo -n {cmd}" if sudo else cmd
+
+
+def _write_all(f: Any, data: Any) -> None:
+    """write() on a raw pipe may write less than asked (e.g. interrupted); keep going."""
+    view = memoryview(data)
+    while view:
+        n = f.write(view)
+        if n is None:                                 # non-blocking raw stream with a full buffer
+            time.sleep(0.001)
+            continue
+        view = view[n:]
+
+
+def _grow_pipe(f: Any, size: int = 1 << 20) -> None:
+    """Linux: a 1 MiB pipe to ssh instead of 64 KiB, so the sender rarely waits on ssh (best effort)."""
+    import fcntl
+    setsz = getattr(fcntl, "F_SETPIPE_SZ", None)
+    if setsz is None or f is None:
+        return
+    try:
+        fcntl.fcntl(f.fileno(), setsz, size)
+    except OSError:
+        pass
 
 
 class NbdError(ProviderError):
@@ -60,7 +85,10 @@ class _Pending:
 class NbdClient:
     """NBD client with pipelined requests: up to `window` commands in flight, replies matched by
     handle on a receiver thread. Writes do not wait for their reply (the round trip to the helper
-    used to stall every 32 MiB); errors from them surface on the next call or at flush/close."""
+    used to stall every 32 MiB); errors from them surface on the next call or at flush/close.
+    Requests go out on a sender thread, in submission order, so a caller never blocks on the pipe
+    (seen live: the copy thread waited for SSH to drain each 64 MiB chunk before it could checksum the
+    next one); payloads are sent as views of the caller's buffer, never copied."""
 
     def __init__(self, rfile: IO[bytes], wfile: IO[bytes], closer: Callable[[], None] | None = None,
                  *, window: int = 16):
@@ -76,6 +104,9 @@ class NbdClient:
         self.size, self.flags = self._handshake()
         self._rx = threading.Thread(target=self._recv_loop, name="nbd-rx", daemon=True)
         self._rx.start()
+        self._sendq: queue.Queue = queue.Queue(maxsize=window + 4)
+        self._tx = threading.Thread(target=self._send_loop, name="nbd-tx", daemon=True)
+        self._tx.start()
 
     @classmethod
     def over_process(cls, proc: subprocess.Popen) -> NbdClient:
@@ -91,6 +122,7 @@ class NbdClient:
                 proc.wait(timeout=60)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        _grow_pipe(proc.stdin)
         try:
             return cls(proc.stdout, proc.stdin, close)
         except (EOFError, OSError, ValueError) as e:
@@ -114,8 +146,47 @@ class NbdClient:
         return bytes(buf)
 
     def _send(self, data: bytes) -> None:
-        self.w.write(data)
+        _write_all(self.w, data)
         self.w.flush()
+
+    def _send_loop(self) -> None:
+        try:
+            while True:
+                item = self._sendq.get()
+                if item is None:
+                    return
+                header, payload = item
+                _write_all(self.w, header)
+                if payload:
+                    _write_all(self.w, payload)
+                if self._sendq.empty():
+                    self.w.flush()
+        except BaseException as e:  # noqa: BLE001 - fail every waiter, never hang
+            if not self._closing:
+                self._err = self._err or NbdConnectionLost(f"NBD send failed: {e}")
+            with self._plock:
+                left, self._pending = list(self._pending.values()), {}
+            for pend in left:
+                pend.err = self._err or NbdConnectionLost("NBD connection closed")
+                pend.done.set()
+                self._slots.release()
+            while True:                               # unblock submitters waiting on a full queue
+                try:
+                    if self._sendq.get_nowait() is None:
+                        return
+                except queue.Empty:
+                    return
+
+    def _enqueue(self, item: tuple[bytes, Any] | None) -> None:
+        while True:
+            self._check()
+            if not self._tx.is_alive():
+                raise NbdConnectionLost("NBD connection closed (sender stopped)")
+            try:
+                self._sendq.put(item, timeout=1)
+                return
+            except queue.Full:
+                continue
 
     def _handshake(self) -> tuple[int, int]:
         hello = self._read(18)
@@ -177,18 +248,18 @@ class NbdClient:
             if not self._rx.is_alive():
                 raise NbdError("NBD connection closed")
         pend = _Pending(ctype, ln, wait)
-        with self._lock:
+        with self._lock:                              # handle order == queue order == wire order
             self._handle += 1
             h = self._handle
             with self._plock:
                 self._pending[h] = pend
             try:
-                self._send(struct.pack(">IHHQQI", A.REQ_MAGIC, flags, ctype, h, off, ln) + data)
-            except (OSError, ValueError) as e:
+                self._enqueue((struct.pack(">IHHQQI", A.REQ_MAGIC, flags, ctype, h, off, ln), data))
+            except BaseException:
                 with self._plock:
                     self._pending.pop(h, None)
                 self._slots.release()
-                raise NbdError(f"NBD send failed: {e}") from e
+                raise
         if not wait:
             return b""
         pend.done.wait()
@@ -220,7 +291,7 @@ class NbdClient:
         view = memoryview(data)
         while view:
             n = min(len(view), MAX_REQ)
-            self._submit(A.CMD_WRITE, off, n, bytes(view[:n]), wait=False)
+            self._submit(A.CMD_WRITE, off, n, view[:n], wait=False)     # sent from the caller's buffer
             off, view = off + n, view[n:]
 
     def write_zeroes(self, off: int, ln: int) -> None:
@@ -237,12 +308,14 @@ class NbdClient:
         try:
             self._drain()
         finally:
-            self._closing = True
+            self._closing = True                      # the agent's exit after DISC is not an error
             try:
                 with self._lock:
-                    self._send(struct.pack(">IHHQQI", A.REQ_MAGIC, 0, A.CMD_DISC, 0, 0, 0))
-            except (OSError, ValueError):
+                    self._enqueue((struct.pack(">IHHQQI", A.REQ_MAGIC, 0, A.CMD_DISC, 0, 0, 0), b""))
+                    self._enqueue(None)
+            except (OSError, ValueError, NbdError):
                 pass
+            self._tx.join(timeout=60)
             if self._closer:
                 self._closer()
 
